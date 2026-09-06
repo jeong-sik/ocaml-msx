@@ -24,6 +24,12 @@ val set_pc : t -> int -> unit
 (** 하네스가 TPA 시작(0x100)을 강제하는 자리. 이미지 헤더의 JP 를 믿지
     않는다 — CP/M 계약은 로드 주소가 시작 주소다. *)
 
+val interrupt : t -> bool
+(** INT 라인이 활성일 때 호출. IM1 이면 RST 38h 로 점프하고 IFF 를
+    끈다. [false] 는 인터럽트를 받지 않았음 (IFF1 꺼짐·EI 직후 지연) —
+    호출자는 라인을 유지해 다시 시도할 수 있다. HALT 중이면 깨운다.
+    NMI 는 아직 없다. *)
+
 val halted : t -> bool
 
 val t_states : t -> int

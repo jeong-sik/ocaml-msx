@@ -17,3 +17,7 @@
 (executable
  (name trace)
  (libraries z80core))
+
+(executable
+ (name boot)
+ (libraries msx))

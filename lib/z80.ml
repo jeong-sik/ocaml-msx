@@ -31,6 +31,7 @@ type t = {
   mutable iff2 : bool;
   mutable im : int;
   mutable halted : bool;
+  mutable after_ei : bool;
   mutable t : int;
   rb : int -> int;
   wb : int -> int -> unit;
@@ -49,6 +50,7 @@ let create ~read ~write ~port_in ~port_out =
     i = 0; r = 0;
     iff1 = false; iff2 = false; im = 0;
     halted = false;
+    after_ei = false;
     t = 0;
     rb = read;
     wb = write;
@@ -790,7 +792,12 @@ and main_exec z op p =
       z.l <- de land 0xff;
       add_t 4
     | 0xF3 -> z.iff1 <- false; z.iff2 <- false; add_t 4
-    | 0xFB -> z.iff1 <- true; z.iff2 <- true; add_t 4
+    | 0xFB ->
+    (* EI 다음 한 명령까지 INT 를 받지 않는다. *)
+    z.iff1 <- true;
+    z.iff2 <- true;
+    z.after_ei <- true;
+    add_t 4
     | 0xF9 -> z.sp <- pget z 2 p; add_t (if p <> No then 10 else 6)
     | 0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF ->
       push z z.pc;
@@ -805,6 +812,27 @@ let step z =
     z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
     let op = fetch z in
     exec z op No;
+    (* 이 명령이 EI 였으면 그 명령 자체는 INT 를 못 받는다 —
+       다음 step 에서 플래그를 소비한다. *)
+    if not (op = 0xFB) then z.after_ei <- false;
     z.t <- z.t + !dt;
     !dt
+  end
+
+let interrupt z =
+  (* HALT 는 인터럽트가 아니어도 깨어난다 (VBlank 대기 루프). *)
+  z.halted <- false;
+  if (not z.iff1) || z.after_ei then false
+  else begin
+    (match z.im with
+     | 0 | 1 ->
+       push z z.pc;
+       z.pc <- 0x38
+     | _ ->
+       (* IM2: I<<8 | 데이터 버스 0xFF — C-BIOS 는 IM1 만 쓴다. *)
+       push z z.pc;
+       z.pc <- ((z.i lsl 8) lor 0xff) land 0xffff);
+    z.iff1 <- false;
+    z.iff2 <- false;
+    true
   end

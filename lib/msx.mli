@@ -1,15 +1,11 @@
 (** ocaml-msx 코어 계약.
 
-    코어는 순수하다: 시간, 파일, 난수, 터미널을 스스로 읽지 않는다.
-    프레임은 {!step} 호출로만 진행한다. 그래서 같은 상태와 같은 입력
-    시퀀스는 항상 같은 프레임을 내고, {!serialize}/{!restore} 로 구간을
-    재현할 수 있다. 실시간 재생(60fps)은 클라이언트가 [step] 을 언제
-    부를지로 정하는 일이지 코어의 상태가 아니다.
+    코어는 순수하다: 시간·파일·난수를 스스로 읽지 않는다. 프레임은
+    {!step} 호출로만 진행한다. P0 의 Z80 과 P1 의 V9938(TMS 호환)·PPI·
+    RAM 매퍼를 배선한 MSX2 머신이다.
 
-    지금 구현은 스텁이다. Z80 과 V9938 은 아직 없고 {!frame_rgb} 는
-    테스트 패턴을 낸다. 함수 모양은 최종본과 같다: 클라이언트(masc TUI
-    탭, keeper 도구, bin/msx_demo)는 이 인터페이스를 대상으로 지금부터
-    붙는다. *)
+    지금 시점의 경계: 스프라이트 렌더·command engine·사운드 출력·
+    savestate 은 없다 (P2/P3). 인터럽트는 VBlank INT 하나만 나간다. *)
 
 type key =
   | Up
@@ -21,13 +17,15 @@ type key =
   | Trigger_b
   | Esc
   | Return
-  | Function of int  (** MSX 기능키 F1–F5 *)
-  | Char of char  (** 문자 키. 매트릭스 배선은 코어의 일 *)
+  | Function of int
+  | Char of char
 
 type machine = {
-  ram_kb : int;  (** 64 / 128 / 256 *)
-  vram_kb : int;  (** 128 (MSX2) *)
-  roms : string list;  (** 슬롯에 올릴 ROM 바이트. C-BIOS 등 *)
+  ram_kb : int;  (** 64 / 128 / 256 / 512 *)
+  vram_kb : int;  (** 128 (MSX2). 16 만 에뮬레이트됨 *)
+  roms : string list;
+      (** C-BIOS 순서: [main(32KB); logo(16KB); sub(16KB)] — 없는 것은
+          빈 문자열. 카트리지는 {!load_cartridge}. *)
 }
 
 type t
@@ -35,27 +33,27 @@ type t
 val create : machine:machine -> t
 
 val name : t -> string
-(** 기계명. UI 표시용. *)
 
 val load_cartridge : t -> string -> unit
-(** 카트리지 ROM 바이트를 슬롯에 올린다. *)
 
 val set_key : t -> key -> pressed:bool -> unit
-(** 논리 키를 누른다/뗀다. 여러 클라이언트가 같은 키를 함께 누를 수
-    있으므로 소유자 구분은 코어 밖의 집합이 관리하고, 코어는 최종
-    눌림 상태만 받는다. *)
 
 val step : t -> frames:int -> unit
-(** [frames] 프레임만큼 진행. 한 프레임은 1/60 초 상당의 기계 사이클. *)
+(** [frames] 프레임만큼 진행. 한 프레임 = 262 라인 × 228 사이클. *)
+
+val dump_pc : t -> int
+(** 현재 PC — 부트 하네스 판정용. *)
+
+val screen_text : t -> string
+(** name table 을 40×24 (또는 32×24) 문자 그리드로 — 부트 판정용. *)
+
+val debug_dump : t -> unit
+(** VDP 레지스터·VRAM 통계·PPI 를 stderr 로 — 부트 디버깅용. *)
 
 val frame_dims : t -> int * int
 val frame_rgb : t -> string
-(** 마지막 프레임의 네이티브 해상도 RGB (row-major, 채널 순서 R,G,B,
-    길이 [w * h * 3]). 다운샘플은 클라이언트 몫이다. *)
 
 val serialize : t -> string
-(** savestate. 버전 태그를 앞에 붙인다. *)
+(** 아직 없다 — P1 범위 밖. 호출하면 예외. *)
 
 val restore : state:string -> t
-(** {!serialize} 결과로 기계를 되살린다. 포맷이 다르면 실패한다 —
-    옛 포맷 변환기는 만들지 않는다 (하드컷). *)

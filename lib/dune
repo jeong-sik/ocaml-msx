@@ -4,6 +4,12 @@
  (modules z80))
 
 (library
+ (name vdpcore)
+ (wrapped false)
+ (modules vdp))
+
+(library
  (name msx)
  (wrapped false)
- (modules msx))
+ (modules msx)
+ (libraries z80core vdpcore))
