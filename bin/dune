@@ -1,0 +1,3 @@
+(executable
+ (name msx_demo)
+ (libraries msx unix))
