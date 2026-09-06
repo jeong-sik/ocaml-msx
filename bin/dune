@@ -1,3 +1,19 @@
 (executable
  (name msx_demo)
  (libraries msx unix))
+
+(executable
+ (name zex)
+ (libraries z80core))
+
+(executable
+ (name selftest)
+ (libraries z80core))
+
+(executable
+ (name vectors)
+ (libraries z80core))
+
+(executable
+ (name trace)
+ (libraries z80core))

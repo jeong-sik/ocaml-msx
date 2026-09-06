@@ -1,2 +1,9 @@
 (library
- (name msx))
+ (name z80core)
+ (wrapped false)
+ (modules z80))
+
+(library
+ (name msx)
+ (wrapped false)
+ (modules msx))
