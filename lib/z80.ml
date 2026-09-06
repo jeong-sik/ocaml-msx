@@ -500,13 +500,10 @@ and ed_exec z op =
     let addr = hl16 z in
     let v = z.rb addr in
     let res = m8 (z.a - v) in
-    (* 관측 규칙 (오라클 16케이스): H = H_in AND borrow(A_lo - v_lo).
-       F3/F5 는 결과의 bit3/bit1 — H 를 빼지 않는다. *)
-    let h_in = z.f land 0x10 in
-    let hh =
-      if h_in <> 0 && ((z.a land 15) - (v land 15)) < 0 then 0x10 else 0
-    in
-    let k = res in
+    (* 관측 규칙 (오라클 128케이스): H = borrow(A_lo - v_lo).
+       F3/F5 = result - H 의 bit3/bit1. *)
+    let hh = if ((z.a land 15) - (v land 15)) < 0 then 0x10 else 0 in
+    let k = res - (hh lsr 4) in
     let bc = m16 (((z.b lsl 8) lor z.c) - 1) in
     z.b <- bc lsr 8;
     z.c <- bc land 0xff;
