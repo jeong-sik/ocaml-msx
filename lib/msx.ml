@@ -33,7 +33,9 @@ let bars =
 
 let create ~machine = { frame = 0; rom = List.nth_opt machine.roms 0; keys = []; machine }
 
-let name _ = "MSX2 (stub)"
+let name t =
+  Printf.sprintf "MSX %dKB RAM / %dKB VRAM (stub)" t.machine.ram_kb
+    t.machine.vram_kb
 
 let load_cartridge t rom = t.rom <- Some rom
 
@@ -90,6 +92,8 @@ let frame_rgb t =
   for n = 0 to min kc 15 - 1 do
     fill (8 + n * 16) (native_h - 24) 12 12 (32, 32, 255)
   done;
+  (* 카트리지 표시: 슬롯에 ROM 이 있으면 우상단 흰 박스 *)
+  if Option.is_some t.rom then fill (native_w - 24) 8 16 8 (224, 224, 224);
   Bytes.to_string b
 
 let serialize t = Marshal.to_string t []
