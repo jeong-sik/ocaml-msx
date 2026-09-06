@@ -20,7 +20,7 @@ MSX2+ 를 OCaml 로 에뮬레이트한다. 최종 목표는 두 개다:
 
 | 단계 | 내용 | 완료 기준 |
 |---|---|---|
-| P0 | Z80 코어 + zexall/zexdoc 하네스 | zexall 통과 |
+| P0 | Z80 코어 + zexall/zexdoc 하네스 | **완료 (2026-09-07)** — zexall·zexdoc 전 그룹 PASS, 5.76B 명령 / 46.7G T-state. 하네스: `bin/zex.exe`, 단위 벡터 `bin/vectors.exe`, C 오라클 차등 `bin/trace.exe` + `test/zex/diff_driver.c` |
 | P1 | MSX1 — V9938 의 TMS 호환 모드, PPI, RAM, C-BIOS | MSX1 게임 플레이 |
 | P2 | MSX2 — command engine, 라인 인터럽트, 128KB VRAM, 팔레트 | 바리스 1·2 (사람이 TUI 로) |
 | P3 | 디스크·사운드 — FDC(.DSK), PSG, YM2413, PAC | 이스 II (FM 음악, 세이브) |

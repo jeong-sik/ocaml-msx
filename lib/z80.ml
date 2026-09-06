@@ -346,12 +346,14 @@ and cb_exec z op p dd_addr =
   let x = op lsr 6 and y = (op lsr 3) land 7 and r = op land 7 in
   (* 대상: 접두어가 없으면 r=6 만 (HL), 나머지는 레지스터. DDCB/FDCB 는
      항상 (IX+d)/(IY+d) 이고 r≠6 이면 그 레지스터에도 결과가 복사된다. *)
+  (* BIT 의 F3/F5 는 메모리 피연산자일 때 (주소+1) 의 상위바이트에서
+     온다 (MEMPTR quirk — zexall bit 그룹이 검사한다). *)
   let target =
     match p with
     | No ->
       if r = 6 then
         let a = ea z No in
-        (z.rb a, (fun nv -> z.wb a nv), None)
+        (z.rb a, (fun nv -> z.wb a nv), Some (((a + 1) lsr 8) land 0x28))
       else
         (rget z r No, (fun nv -> rset z r nv No), None)
     | IXp | IYp ->
@@ -360,7 +362,7 @@ and cb_exec z op p dd_addr =
         (fun nv ->
            z.wb a nv;
            if r <> 6 then rset z r nv No),
-        Some ((a lsr 8) land 0x28) )
+        Some (((a + 1) lsr 8) land 0x28) )
   in
   let v, writeback, f53_addr = target in
   if x = 1 then begin
