@@ -11,6 +11,9 @@ let () =
   let max_steps =
     if Array.length Sys.argv > 2 then int_of_string Sys.argv.(2) else 6000
   in
+  let skip =
+    if Array.length Sys.argv > 3 then int_of_string Sys.argv.(3) else 0
+  in
   Bytes.fill mem 0 0x10000 '\000';
   Bytes.set mem 0x00 '\xd3';
   Bytes.set mem 0x01 '\x00';
@@ -30,21 +33,19 @@ let () =
   Z80.set_pc z 0x0100;
   Z80.set_af z 0xffff;
   for n = 0 to max_steps - 1 do
-    if n = 7 then begin
-      Printf.printf "stack@7:";
-      for i = 0xc8e0 to 0xc90f do Printf.printf " %02x" (Char.code (Bytes.get mem i)) done;
-      print_newline ()
-    end;
+    if n < skip || (skip = 0 && n mod 1024 <> 0) then ignore (Z80.step z)
+    else begin
     let mchk = ref (2166136261 land 0xffffffff) in
     for i = 0x100 to 0xffff do
       mchk := (!mchk lxor Char.code (Bytes.get mem i)) land 0xffffffff;
       mchk := (!mchk * 16777619) land 0xffffffff
     done;
     Printf.printf "m %d %08x\n" n !mchk;
-    Printf.printf "%d pc=%04x af=%04x bc=%04x de=%04x hl=%04x ix=%04x iy=%04x sp=%04x\n%!"
-      n (Z80.dump_pc z)
+    Printf.printf "%d op=%02x pc=%04x af=%04x bc=%04x de=%04x hl=%04x ix=%04x iy=%04x sp=%04x\n%!"
+      n (mem_read (Z80.dump_pc z)) (Z80.dump_pc z)
       (((Z80.dump_a z) lsl 8) lor Z80.dump_f z)
       (Z80.dump_bc z) (Z80.dump_de z) (Z80.dump_hl z)
       (Z80.dump_ix z) (Z80.dump_iy z) (Z80.dump_sp z);
     ignore (Z80.step z)
+    end
   done
