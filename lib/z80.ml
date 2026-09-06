@@ -78,10 +78,11 @@ let dump_sp z = z.sp
 let dt = ref 0
 let add_t n = dt := !dt + n
 
+(* R 은 명령당 한 번만 오른다 (operand fetch 는 세지 않는다) —
+   step 에서 증가. *)
 let fetch z =
   let v = z.rb z.pc in
   z.pc <- m16 (z.pc + 1);
-  z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
   v
 
 let imm8 z = fetch z
@@ -144,27 +145,35 @@ let cond z = function
   | _ -> assert false
 
 let rget z i p =
-  match i with
-  | 0 -> z.b
-  | 1 -> z.c
-  | 2 -> z.d
-  | 3 -> z.e
-  | 4 -> z.h
-  | 5 -> z.l
-  | 6 -> z.rb (ea z p)
-  | 7 -> z.a
+  match i, p with
+  | 4, IXp -> z.ix lsr 8   (* IXH — undocumented *)
+  | 5, IXp -> z.ix land 0xff
+  | 4, IYp -> z.iy lsr 8
+  | 5, IYp -> z.iy land 0xff
+  | 0, _ -> z.b
+  | 1, _ -> z.c
+  | 2, _ -> z.d
+  | 3, _ -> z.e
+  | 4, _ -> z.h
+  | 5, _ -> z.l
+  | 6, _ -> z.rb (ea z p)
+  | 7, _ -> z.a
   | _ -> assert false
 
 let rset z i v p =
-  match i with
-  | 0 -> z.b <- v
-  | 1 -> z.c <- v
-  | 2 -> z.d <- v
-  | 3 -> z.e <- v
-  | 4 -> z.h <- v
-  | 5 -> z.l <- v
-  | 6 -> z.wb (ea z p) v
-  | 7 -> z.a <- v
+  match i, p with
+  | 4, IXp -> z.ix <- ((v land 0xff) lsl 8) lor (z.ix land 0xff)
+  | 5, IXp -> z.ix <- (z.ix land 0xff00) lor (v land 0xff)
+  | 4, IYp -> z.iy <- ((v land 0xff) lsl 8) lor (z.iy land 0xff)
+  | 5, IYp -> z.iy <- (z.iy land 0xff00) lor (v land 0xff)
+  | 0, _ -> z.b <- v
+  | 1, _ -> z.c <- v
+  | 2, _ -> z.d <- v
+  | 3, _ -> z.e <- v
+  | 4, _ -> z.h <- v
+  | 5, _ -> z.l <- v
+  | 6, _ -> z.wb (ea z p) v
+  | 7, _ -> z.a <- v
   | _ -> assert false
 
 let pget z i p =
@@ -254,10 +263,12 @@ let add16 z dst src adc =
   let f35 = (r lsr 8) land 0x28 in
   (* ADC HL: S,Z,PV 는 16비트 결과에서 — PV 는 부호있는 오버플로,
      패리티가 아니다. *)
+  (* S/F3/F5 는 상위 바이트에서, Z 는 16비트 전체 결과에서. *)
   let rest =
     if adc
     then
-      sz53 (r lsr 8)
+      ((r lsr 8) land 0xa8)
+      lor (if r = 0 then 0x40 else 0)
       lor
       (if ((lnot (dst lxor src)) land (dst lxor r) land 0x8000) <> 0
        then 0x04 else 0)
@@ -277,7 +288,8 @@ let sbc16 z dst src sbc =
   let pv =
     if ((dst lxor src) land (dst lxor r) land 0x8000) <> 0 then 0x04 else 0
   in
-  z.f <- sz53 (r lsr 8) lor pv lor 0x02 lor hh lor f35 lor cc;
+  z.f <- ((r lsr 8) land 0xa8) lor (if r = 0 then 0x40 else 0)
+         lor pv lor 0x02 lor hh lor f35 lor cc;
   r
 
 let rot op v c0 =
@@ -288,7 +300,7 @@ let rot op v c0 =
   | 3 -> ((v lsr 1) lor (c0 lsl 7), v land 1)
   | 4 -> ((v lsl 1) land 0xff, v lsr 7)
   | 5 -> ((v lsr 1) lor (v land 0x80), v land 1)
-  | 6 -> (((v lsl 1) land 0xff) lor 1, v land 1)
+  | 6 -> (((v lsl 1) land 0xff) lor 1, v lsr 7)  (* SLL: 캐리는 bit7 *)
   | 7 -> (v lsr 1, v land 1)
   | _ -> assert false
 
@@ -312,36 +324,57 @@ let daa z =
 let io_block_flags z =
   z.f <- (z.f land 0xfd) lor 0x02 lor (if z.b = 0 then 0x40 else 0)
 
+let inc_r z = z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f)
+
 let rec exec z op p =
   match op with
-  | 0xDD -> exec z (fetch z) IXp
-  | 0xFD -> exec z (fetch z) IYp
-  | 0xCB -> cb_exec z (fetch z) p
-  | 0xED -> ed_exec z (fetch z)
+  (* 접두어는 dispatch 와 실제 실행에 각각 R 을 올린다 (2). *)
+  | 0xDD -> inc_r z; exec z (fetch z) IXp
+  | 0xFD -> inc_r z; exec z (fetch z) IYp
+  | 0xCB ->
+    (* DDCB/FDCB 은 [CB d op]: 변위를 먼저 읽고 opcode 가 나중. *)
+    inc_r z;
+    (match p with
+     | No -> cb_exec z (fetch z) No None
+     | IXp | IYp ->
+       let a = m16 (idx_reg z p + disp8 z) in
+       cb_exec z (fetch z) p (Some a))
+  | 0xED -> inc_r z; ed_exec z (fetch z)
   | _ -> main_exec z op p
 
-and cb_exec z op p =
+and cb_exec z op p dd_addr =
   let x = op lsr 6 and y = (op lsr 3) land 7 and r = op land 7 in
-  (* DDCB/FDCB: 변위를 먼저 읹고 (IX+d) 를 대상으로. 결과는 r≠6 이면
-     그 레지스터에도 복사된다. *)
-  let addr =
+  (* 대상: 접두어가 없으면 r=6 만 (HL), 나머지는 레지스터. DDCB/FDCB 는
+     항상 (IX+d)/(IY+d) 이고 r≠6 이면 그 레지스터에도 결과가 복사된다. *)
+  let target =
     match p with
-    | No -> None
-    | q -> Some (m16 (idx_reg z q + disp8 z))
+    | No ->
+      if r = 6 then
+        let a = ea z No in
+        (z.rb a, (fun nv -> z.wb a nv), None)
+      else
+        (rget z r No, (fun nv -> rset z r nv No), None)
+    | IXp | IYp ->
+      let a = match dd_addr with Some a -> a | None -> assert false in
+      ( z.rb a,
+        (fun nv ->
+           z.wb a nv;
+           if r <> 6 then rset z r nv No),
+        Some ((a lsr 8) land 0x28) )
   in
-  let base = match addr with Some a -> a | None -> ea z No in
-  let v = z.rb base in
+  let v, writeback, f53_addr = target in
   if x = 1 then begin
+    (* BIT — F3/F5 는 (메모리 operands) 주소 상위바이트, 레지스터는 값. *)
     let t = v land (1 lsl y) in
     let zf = if t = 0 then 0x40 else 0 in
     let sf = if y = 7 && t <> 0 then 0x80 else 0 in
-    let f53 =
-      match addr with
-      | Some a -> (a lsr 8) land 0x28
-      | None -> v land 0x28
-    in
-    z.f <- (z.f land 1) lor f53 lor 0x12 lor zf lor sf lor (zf lsr 4);
-    add_t (match addr with Some _ -> 20 | None -> if r = 6 then 12 else 8)
+    let f53 = match f53_addr with Some x5 -> x5 | None -> v land 0x28 in
+    (* BIT: H=1, N=0 — N 를 세우지 않는다. *)
+    z.f <- (z.f land 1) lor f53 lor 0x10 lor zf lor sf lor (zf lsr 4);
+    add_t
+      (match p with
+       | No -> if r = 6 then 12 else 8
+       | _ -> 20)
   end
   else begin
     let v' =
@@ -352,11 +385,11 @@ and cb_exec z op p =
         z.f <- rot_flags nv c;
         nv
     in
-    z.wb base v';
-    (match addr with
-     | Some _ -> if r <> 6 then rset z r v' No
-     | None -> if r <> 6 then rset z r v' No);
-    add_t (match addr with Some _ -> 23 | None -> if r = 6 then 15 else 8)
+    writeback v';
+    add_t
+      (match p with
+       | No -> if r = 6 then 15 else 8
+       | _ -> 23)
   end
 
 and ed_exec z op =
@@ -365,7 +398,9 @@ and ed_exec z op =
   | 0x40 | 0x48 | 0x50 | 0x58 | 0x60 | 0x68 | 0x70 | 0x78 ->
     (* IN r,(C) — 0x70 은 IN F,(C): 플래그만 갱신. *)
     let v = z.pin ((z.b lsl 8) lor z.c) in
-    z.f <- sz53 v lor parity v;
+    (* F3/F5 와 C 는 불변 — S/Z/PV/H/N 만 갱신. *)
+    z.f <- (z.f land 0x29) lor (v land 0x80) lor (if v = 0 then 0x40 else 0)
+           lor parity v;
     if y <> 6 then rset z y v No;
     add_t 12
   | 0x41 | 0x49 | 0x51 | 0x59 | 0x61 | 0x69 | 0x71 | 0x79 ->
@@ -391,8 +426,8 @@ and ed_exec z op =
     let a = imm16 z in
     pset z ((op lsr 4) land 3) (rd16 z a) No;
     add_t 20
-  | 0x44 ->
-    (* NEG *)
+  | 0x44 | 0x4C | 0x54 | 0x5C | 0x64 | 0x6C | 0x74 | 0x7C ->
+    (* NEG — 변형 opcode 들도 같은 동작. *)
     let a0 = z.a in
     let r = m8 (-a0) in
     z.f <- sz53 r lor 0x02
@@ -401,7 +436,8 @@ and ed_exec z op =
            lor (if a0 = 0x80 then 0x04 else 0);
     z.a <- r;
     add_t 8
-  | 0x45 | 0x55 | 0x5D | 0x65 | 0x6D | 0x75 | 0x7D ->
+  | 0x45 | 0x4D | 0x55 | 0x5D | 0x65 | 0x6D | 0x75 | 0x7D ->
+    (* RETN/RETI — 인터럽트 없는 코어에선 둘 다 RET. *)
     z.pc <- pop z;
     add_t 14
   | 0x46 -> z.im <- 0; add_t 8
@@ -410,23 +446,28 @@ and ed_exec z op =
   | 0x47 -> z.i <- z.a; add_t 9
   | 0x4F -> z.r <- z.a; add_t 9
   | 0x57 ->
-    z.f <- sz53 z.i lor (if z.iff2 then 0x04 else 0);
+    (* F3/F5/C 불변. *)
+    z.f <- (z.f land 0x29) lor (z.i land 0x80) lor (if z.i = 0 then 0x40 else 0)
+           lor (if z.iff2 then 0x04 else 0);
     z.a <- z.i;
     add_t 9
   | 0x5F ->
-    z.f <- sz53 z.r lor (if z.iff2 then 0x04 else 0);
+    z.f <- (z.f land 0x29) lor (z.r land 0x80) lor (if z.r = 0 then 0x40 else 0)
+           lor (if z.iff2 then 0x04 else 0);
     z.a <- z.r;
     add_t 9
   | 0x67 | 0x6F ->
     let addr = hl16 z in
     let v = z.rb addr in
+    (* ED 67 = RRD: A_lo ← (HL)_hi, (HL) ← ((HL)_lo A_lo) 니블 우회전.
+       ED 6F = RLD: A_lo ← (HL)_lo, (HL) ← ((HL)_hi A_lo) 니블 좌회전. *)
     let a' =
-      if op = 0x67 then (z.a land 0xf0) lor (v lsr 4)
-      else (z.a land 0xf0) lor (v land 0x0f)
+      if op = 0x67 then (z.a land 0xf0) lor (v land 0x0f)
+      else (z.a land 0xf0) lor (v lsr 4)
     in
     let v' =
-      if op = 0x67 then ((v lsl 4) land 0xff) lor (z.a land 0x0f)
-      else (v lsr 4) lor ((z.a land 0x0f) lsl 4)
+      if op = 0x67 then ((v lsr 4) lor ((z.a land 0x0f) lsl 4))
+      else (((v lsl 4) land 0xff) lor (z.a land 0x0f))
     in
     z.wb addr v';
     z.a <- a';
@@ -437,7 +478,7 @@ and ed_exec z op =
     let dst = (z.d lsl 8) lor z.e in
     let value = z.rb src in
     z.wb dst value;
-    let bc = ((z.b lsl 8) lor z.c) - 1 in
+    let bc = m16 (((z.b lsl 8) lor z.c) - 1) in
     z.b <- bc lsr 8;
     z.c <- bc land 0xff;
     let dir = if op land 0x08 = 0 then 1 else -1 in
@@ -459,9 +500,14 @@ and ed_exec z op =
     let addr = hl16 z in
     let v = z.rb addr in
     let res = m8 (z.a - v) in
-    let hh = if ((z.a land 15) - (v land 15)) < 0 then 0x10 else 0 in
-    let k = res - (hh lsr 4) in
-    let bc = ((z.b lsl 8) lor z.c) - 1 in
+    (* 관측 규칙 (오라클 16케이스): H = H_in AND borrow(A_lo - v_lo).
+       F3/F5 는 결과의 bit3/bit1 — H 를 빼지 않는다. *)
+    let h_in = z.f land 0x10 in
+    let hh =
+      if h_in <> 0 && ((z.a land 15) - (v land 15)) < 0 then 0x10 else 0
+    in
+    let k = res in
+    let bc = m16 (((z.b lsl 8) lor z.c) - 1) in
     z.b <- bc lsr 8;
     z.c <- bc land 0xff;
     let dir = if op land 0x08 = 0 then 1 else -1 in
@@ -472,7 +518,7 @@ and ed_exec z op =
            lor ((if res = 0 then 0x40 else 0) lor (res land 0x80))
            lor 0x02
            lor hh
-           lor ((k land 2) lsl 3)
+           lor ((k land 2) lsl 4)
            lor (k land 0x08)
            lor (if bc <> 0 then 0x04 else 0);
     if op >= 0xB1 && bc <> 0 && res <> 0 then begin
@@ -518,8 +564,12 @@ and main_exec z op p =
   if x = 1 then begin
     if y = 6 && w = 6 then begin z.halted <- true; add_t 4 end
     else begin
-      let v = rget z w p in
-      rset z y v p;
+      (* 메모리 피연산자((IX+d)) 와 짝하는 H/L 은 일반 H/L — IXH/IXL 은
+         순수 레지스터 조합에서만 쓰인다. *)
+      let src_p = if y = 6 && (w = 4 || w = 5) then No else p in
+      let dst_p = if w = 6 && (y = 4 || y = 5) then No else p in
+      let v = rget z w src_p in
+      rset z y v dst_p;
       add_t
         (match p with
          | No -> if y = 6 || w = 6 then 7 else 4
@@ -542,6 +592,11 @@ and main_exec z op p =
   else
     match op with
     | 0x00 -> add_t 4
+    | 0x08 ->
+      (* EX AF,AF' — 접두어가 있어도 그대로 실행된다. *)
+      let t = z.a in z.a <- z.a2; z.a2 <- t;
+      let t = z.f in z.f <- z.f2; z.f2 <- t;
+      add_t 4
     | 0x10 ->
       let d = disp8 z in
       z.b <- m8 (z.b - 1);
@@ -596,16 +651,34 @@ and main_exec z op p =
       pset z i (m16 (pget z i p - 1)) p;
       add_t (if i = 2 && p <> No then 10 else 6)
     | 0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 | 0x3C ->
-      let v = rget z y p in
-      let nv, nf = inc8 v z.f in
-      rset z y nv p;
+      let read_v, write_v =
+        match y, p with
+        | 6, No ->
+          let a = hl16 z in
+          (z.rb a, fun nv -> z.wb a nv)
+        | 6, IXp | 6, IYp ->
+          let a = m16 (idx_reg z p + disp8 z) in
+          (z.rb a, fun nv -> z.wb a nv)
+        | _ -> (rget z y p, fun nv -> rset z y nv p)
+      in
+      let nv, nf = inc8 read_v z.f in
+      write_v nv;
       z.f <- nf;
       add_t
         (if y = 6 then (if p <> No then 23 else 11) else 4)
     | 0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D ->
-      let v = rget z y p in
-      let nv, nf = dec8 v z.f in
-      rset z y nv p;
+      let read_v, write_v =
+        match y, p with
+        | 6, No ->
+          let a = hl16 z in
+          (z.rb a, fun nv -> z.wb a nv)
+        | 6, IXp | 6, IYp ->
+          let a = m16 (idx_reg z p + disp8 z) in
+          (z.rb a, fun nv -> z.wb a nv)
+        | _ -> (rget z y p, fun nv -> rset z y nv p)
+      in
+      let nv, nf = dec8 read_v z.f in
+      write_v nv;
       z.f <- nf;
       add_t
         (if y = 6 then (if p <> No then 23 else 11) else 4)
@@ -633,8 +706,10 @@ and main_exec z op p =
       add_t 4
     | 0x37 -> z.f <- (z.f land 0xc5) lor (z.a land 0x28) lor 1; add_t 4
     | 0x3F ->
+      (* CCF: 캐리를 토글하고, 옛 캐리가 1이었으면 H 를 세운다. *)
       let c = z.f land 1 in
-      z.f <- (z.f land 0xc5) lor (z.a land 0x28) lor c lor (if c = 1 then 0x10 else 0);
+      z.f <- (z.f land 0xc4) lor (z.a land 0x28) lor (1 - c)
+             lor (if c = 1 then 0x10 else 0);
       add_t 4
     | 0xC0 | 0xC8 | 0xD0 | 0xD8 | 0xE0 | 0xE8 | 0xF0 | 0xF8 ->
       if cond z y then begin
@@ -728,6 +803,7 @@ let step z =
   dt := 0;
   if z.halted then begin z.t <- z.t + 4; 4 end
   else begin
+    z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
     let op = fetch z in
     exec z op No;
     z.t <- z.t + !dt;

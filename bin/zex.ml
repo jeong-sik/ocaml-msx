@@ -91,10 +91,12 @@ let run_test path =
      이미지 첫 바이트 JP 가 0x100 을 가리키는 zex 계열은 그대로
      진행된다. *)
   let steps = ref 0 in
-  let limit = 2_000_000_000 in
+  let limit = 12_000_000_000 in
   let trace = Array.make 64 (0, 0, 0, 0, 0) in
   let tidx = ref 0 in
   while not !finished && !steps < limit do
+    if !steps mod 500_000_000 = 0 && !steps > 0 then
+      Printf.printf "progress: steps=%d pc=%04x\n%!" !steps (Z80.dump_pc (z ()));
     let pc = Z80.dump_pc (z ()) in
     let zz = z () in
     trace.(!tidx land 63) <-
