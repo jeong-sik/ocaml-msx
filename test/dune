@@ -12,3 +12,8 @@
  (name g2_test)
  (modules g2_test)
  (libraries vdpcore))
+
+(test
+ (name mode_test)
+ (modules mode_test)
+ (libraries msx))

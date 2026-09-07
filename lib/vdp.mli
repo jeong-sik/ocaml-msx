@@ -50,3 +50,24 @@ val line_now : t -> int * int
 
 val write_log : t -> (int * int * int) list
 (** 최근 4096 포트 쓰기 (port, 래치주소, 값) — 부트 디버깅용. *)
+
+(** V9938 화면 모드 — R#0 bits1-3 (M3 M4 M5) 와 R#1 bits3-4 (M2 M1). 표에
+    없는 조합은 5비트 코드(M1=bit0 … M5=bit4)를 든 [Undefined]. *)
+type display_mode =
+  | Text1
+  | Text2
+  | Multicolor
+  | Graphic1
+  | Graphic2
+  | Graphic3
+  | Graphic4
+  | Graphic5
+  | Graphic6
+  | Graphic7
+  | Undefined of int
+
+val display_mode : t -> display_mode
+val display_mode_to_string : display_mode -> string
+
+val vram_read : t -> int -> int
+(** VRAM 한 바이트 (주소는 17비트로 감싼다) — 관측자용. *)
