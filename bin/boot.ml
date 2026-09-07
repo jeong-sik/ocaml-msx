@@ -8,7 +8,7 @@ let out_prefix = ref "/tmp/msxboot"
 let vlog = ref false
 let watch_mem = ref ""
 let cart = ref ""
-let tap_space = ref (-1)
+let tap_space : int list ref = ref []
 let assert_boot = ref false
 
 let contains_sub hay needle =
@@ -41,7 +41,10 @@ let () =
     [ ("--vlog", Arg.Set vlog, "  VDP 포트 쓰기 로그");
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
-      ("--tap-space", Arg.Set_int tap_space, "N  N 프레임에 스페이스 탭 (down 5프레임)");
+      ( "--tap-space",
+        Arg.String
+          (fun s -> tap_space := List.map int_of_string (String.split_on_char ',' s)),
+        "N[,N..]  해당 프레임마다 스페이스 탭 (down 5프레임)" );
       ("--watch-mem", Arg.Set_string watch_mem, "A,B,C  RAM 쓰기 감시 (hex, 콤마 구분)");
       ("--frames", Arg.Int (fun n -> frames := n), "N  실행할 프레임");
       ("--roms", Arg.String (fun s -> rom_dir := s), "DIR  C-BIOS roms 디렉터리");
@@ -98,10 +101,9 @@ let () =
              (int_of_string ("0x" ^ String.sub e (c + 1) (String.length e - c - 1)))
          end
        with Not_found -> ());
-      if !tap_space >= 0 then begin
-        if !ridx = !tap_space then Msx.set_key t Space ~pressed:true;
-        if !ridx = !tap_space + 5 then Msx.set_key t Space ~pressed:false
-      end;
+      if List.mem !ridx !tap_space then assert (Msx.set_key t Space ~pressed:true);
+      if List.exists (fun f -> f + 5 = !ridx) !tap_space then
+        assert (Msx.set_key t Space ~pressed:false);
       ring.(!ridx land 63) <- Msx.dump_pc t;
       incr ridx;
       let dlo, dhi =

@@ -10,22 +10,54 @@ type key =
   | Up | Down | Left | Right | Space | Trigger_a | Trigger_b
   | Esc | Return | Function of int | Char of char
 
-(* MSX 키보드 매트릭스: (행, 비트) *)
-let key_matrix = function
-  | Up -> 0, 5
-  | Down -> 0, 4
-  | Left -> 1, 4
-  | Right -> 1, 5
-  | Space -> 7, 3
-  | Esc -> 6, 2
-  | Return -> 8, 2
-  | Trigger_a -> 5, 4
-  | Trigger_b -> 5, 5
-  | Char 'Z' -> 3, 3
-  | Char 'X' -> 3, 4
-  | Char 'C' -> 3, 5
-  | Function n -> 8, 3 - (n mod 4)
-  | Char c -> (Char.code c land 0x77) mod 10, Char.code c land 7
+(* 논리 키가 닿는 자리. 키보드 매트릭스 (행 0-10, 비트 0-7) 의 정본은
+   openMSX share/unicodemaps/unicodemap.int (국제 배열, <ROW><COL>).
+   글자는 대소문자를 같은 키로 본다 — SHIFT 는 매트릭스의 다른 키다.
+   Trigger_a/b 는 조이스틱 1 의 버튼이라 PSG R#14 로 읽히고, 표에 없는
+   글자와 F6 이상은 Unmapped. *)
+type key_target = Matrix of int * int | Joy1_button of int | Unmapped
+
+let key_rows = 11
+
+let key_target = function
+  | Up -> Matrix (8, 5)
+  | Down -> Matrix (8, 6)
+  | Left -> Matrix (8, 4)
+  | Right -> Matrix (8, 7)
+  | Space -> Matrix (8, 0)
+  | Esc -> Matrix (7, 2)
+  | Return -> Matrix (7, 7)
+  | Function 1 -> Matrix (6, 5)
+  | Function 2 -> Matrix (6, 6)
+  | Function 3 -> Matrix (6, 7)
+  | Function 4 -> Matrix (7, 0)
+  | Function 5 -> Matrix (7, 1)
+  | Function _ -> Unmapped
+  | Trigger_a -> Joy1_button 4
+  | Trigger_b -> Joy1_button 5
+  | Char c -> (
+    match Char.uppercase_ascii c with
+    | '0' .. '7' as d -> Matrix (0, Char.code d - Char.code '0')
+    | '8' -> Matrix (1, 0)
+    | '9' -> Matrix (1, 1)
+    | '-' -> Matrix (1, 2)
+    | '=' -> Matrix (1, 3)
+    | '\\' -> Matrix (1, 4)
+    | '[' -> Matrix (1, 5)
+    | ']' -> Matrix (1, 6)
+    | ';' -> Matrix (1, 7)
+    | '\'' -> Matrix (2, 0)
+    | '`' -> Matrix (2, 1)
+    | ',' -> Matrix (2, 2)
+    | '.' -> Matrix (2, 3)
+    | '/' -> Matrix (2, 4)
+    | 'A' -> Matrix (2, 6)
+    | 'B' -> Matrix (2, 7)
+    | 'C' .. 'J' as l -> Matrix (3, Char.code l - Char.code 'C')
+    | 'K' .. 'R' as l -> Matrix (4, Char.code l - Char.code 'K')
+    | 'S' .. 'Z' as l -> Matrix (5, Char.code l - Char.code 'S')
+    | ' ' -> Matrix (8, 0)
+    | _ -> Unmapped)
 
 type machine = { ram_kb : int; vram_kb : int; roms : string list }
 
@@ -41,7 +73,10 @@ type t = {
   mutable ppi_a : int;
   mutable ppi_c : int;
   mutable slot3_sel : int;
-  keys : bool array;
+  keys : bool array;  (** key_rows × 8, 눌림=true *)
+  psg : int array;
+  mutable psg_latch : int;
+  mutable joy1 : int;  (** 조이스틱 1 입력 6비트, active low — 빈 포트 0x3F *)
   cpu_ref : t option ref;
 }
 
@@ -117,9 +152,18 @@ let mem_write m addr v =
     Bytes.set m.ram base (Char.chr (v land 0xff))
   end
 
-let psg = Array.make 16 0
-let psg_latch = ref 0
 let rtc_reg = ref 0
+
+(* PSG R#14 = 조이스틱 포트 입력. R#15 bit6 이 포트 선택(0 = 1번), 2번 포트는
+   비어 있다. bit6 = 키배열 점퍼(50on = 0), bit7 = 카세트 입력(0).
+   정본: openMSX MSXPSG::readA, DummyJoystick::read = 0x3F. *)
+let joystick_idle = 0x3f
+
+let psg_read m =
+  match m.psg_latch with
+  | 14 -> if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle
+  | r when r < 16 -> m.psg.(r)
+  | _ -> 0xff
 
 let port_read m port =
   match port land 0xff with
@@ -127,16 +171,19 @@ let port_read m port =
   | 0x99 -> Vdp.io_read m.vdp ~port:0x99
   | 0xA8 -> m.ppi_a
   | 0xA9 ->
-    (* 키보드 행: PPI C 하위 4비트가 행, B 가 데이터. *)
+    (* 키보드: PPI C 하위 4비트가 행(0-10), B 가 그 행의 8키 (눌림 = 0). *)
     let row = m.ppi_c land 0x0f in
-    let bits = ref 0xff in
-    Array.iteri
-      (fun i pressed -> if pressed && i / 8 = row then bits := !bits land lnot (1 lsl (i mod 8)))
-      (Array.sub m.keys 0 80);
-    !bits
+    if row >= key_rows then 0xff
+    else begin
+      let bits = ref 0xff in
+      for b = 0 to 7 do
+        if m.keys.((row * 8) + b) then bits := !bits land lnot (1 lsl b)
+      done;
+      !bits
+    end
   | 0xAA -> m.ppi_c
   | 0xFC | 0xFD | 0xFE | 0xFF -> m.mapper.(port land 3)
-  | 0xA2 -> if !psg_latch < 16 then psg.(!psg_latch) else 0xff
+  | 0xA2 -> psg_read m
   | _ -> 0xff
 
 let port_write m port v =
@@ -144,8 +191,8 @@ let port_write m port v =
   | 0x98 | 0x99 | 0x9A | 0x9B -> Vdp.io_write m.vdp ~port:(port land 0xff) v
   | 0xA8 -> m.ppi_a <- v land 0xff
   | 0xAA -> m.ppi_c <- v land 0xff
-  | 0xA0 -> psg_latch := v land 0xff
-  | 0xA1 -> if !psg_latch < 16 then psg.(!psg_latch) <- v land 0xff
+  | 0xA0 -> m.psg_latch <- v land 0xff
+  | 0xA1 -> if m.psg_latch < 16 then m.psg.(m.psg_latch) <- v land 0xff
   | 0xFC | 0xFD | 0xFE | 0xFF -> m.mapper.(port land 3) <- v land 0x3f
   | 0xB4 -> rtc_reg := v
   | _ -> ()
@@ -188,7 +235,10 @@ let create ~machine =
       ppi_a = 0x00;
       ppi_c = 0x00;
       slot3_sel = 0x00;
-      keys = Array.make 80 false;
+      keys = Array.make (key_rows * 8) false;
+      psg = Array.make 16 0;
+      psg_latch = 0;
+      joy1 = joystick_idle;
       cpu_ref = m_ref;
     }
   in
@@ -204,9 +254,18 @@ let load_cartridge t rom =
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
   t.ppi_a <- (t.ppi_a land 0xf3) lor 0x08
 
-let key_index k = let r, b = key_matrix k in r * 8 + b
+let set_key t k ~pressed =
+  match key_target k with
+  | Matrix (row, bit) ->
+    t.keys.((row * 8) + bit) <- pressed;
+    true
+  | Joy1_button b ->
+    t.joy1 <- (if pressed then t.joy1 land lnot (1 lsl b) else t.joy1 lor (1 lsl b));
+    true
+  | Unmapped -> false
 
-let set_key t k ~pressed = t.keys.(key_index k) <- pressed
+let port_in t port = port_read t port
+let port_out t port v = port_write t port v
 
 let ldirvm_log = ref false
 let ldirvm_calls = ref []

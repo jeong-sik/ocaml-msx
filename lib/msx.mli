@@ -36,7 +36,15 @@ val name : t -> string
 
 val load_cartridge : t -> string -> unit
 
-val set_key : t -> key -> pressed:bool -> unit
+val set_key : t -> key -> pressed:bool -> bool
+(** 논리 키를 누르거나 뗀다. 키보드 매트릭스 키와 조이스틱 1 버튼
+    (Trigger_a/b) 은 true. 자리가 없는 키(표 밖 글자, F6 이상) 는 아무것도
+    바꾸지 않고 false. 커서 키는 키보드 행 8 이고 조이스틱 방향은 배선하지
+    않는다 — BIOS GTSTCK(0)/GTTRIG(0) 경로. *)
+
+val port_in : t -> int -> int
+val port_out : t -> int -> int -> unit
+(** Z80 이 보는 I/O 포트를 직접 읽고 쓴다 — 키보드·PSG 계약 테스트용. *)
 
 val step : t -> frames:int -> unit
 (** [frames] 프레임만큼 진행. 한 프레임 = 262 라인 × 228 사이클. *)
