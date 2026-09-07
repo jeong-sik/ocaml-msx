@@ -136,6 +136,12 @@ let port_write m port v =
   | 0xB4 -> rtc_reg := v
   | _ -> ()
 
+(* 메모리 쓰기 감시 — write 클로저가 참조하므로 create 보다 앞에. *)
+let watch_mem_on = ref false
+let watch_mem_addrs : int list ref = ref []
+let watch_mem_log : (int * int * int * int) list ref = ref []
+let instr_count = ref 0
+
 let create ~machine =
   let main = match machine.roms with x :: _ -> x | [] -> "" in
   let logo = match machine.roms with _ :: x :: _ -> x | _ -> "" in
@@ -143,7 +149,16 @@ let create ~machine =
   let ram_kb = max 64 machine.ram_kb in
   let m_ref : t option ref = ref None in
   let read a = match !m_ref with Some m -> mem_read m a | None -> 0xff in
-  let write a v = match !m_ref with Some m -> mem_write m a v | None -> () in
+  let write a v =
+    match !m_ref with
+    | Some m ->
+      mem_write m a v;
+      (* 감시 주소 쓰기 기록 — 명령 경계가 아니라 폴링된 사이클 중이라
+         PC 는 근접 위치다. *)
+      if !watch_mem_on && List.mem a !watch_mem_addrs then
+        watch_mem_log :=
+          (!instr_count, a, v land 0xff, Z80.dump_pc m.cpu) :: !watch_mem_log
+    | None -> () in
   let pin p = match !m_ref with Some m -> port_read m p | None -> 0xff in
   let pout p v = match !m_ref with Some m -> port_write m p v | None -> () in
   let m =
@@ -211,7 +226,8 @@ let step t ~frames =
       (match !watch_enter with
        | Some (lo, hi) when pc >= lo && pc < hi ->
          watch_enter := None;
-         Printf.eprintf "== entered %04x-%04x; prev steps:\n%!" lo hi;
+         Printf.eprintf "== entered %04x-%04x at #%d; prev steps:\n%!" lo hi
+           !instr_count;
          for k = max 0 (!ri - 40) to !ri - 1 do
            Printf.eprintf "r %04x\n%!" ring.(k land 63)
          done
@@ -225,6 +241,7 @@ let step t ~frames =
           (Z80.dump_hl t.cpu, Z80.dump_de t.cpu, Z80.dump_bc t.cpu)
           :: !ldirvm_calls;
       let used = Z80.step t.cpu in
+      incr instr_count;
       ignore (Vdp.advance t.vdp ~cycles:used);
       budget := !budget - used
     done
@@ -266,12 +283,22 @@ let vram_hex t from len =
   done
 
 let set_ldirvm_log b = ldirvm_log := b
+
+let set_watch_mem addrs =
+  watch_mem_addrs := addrs;
+  watch_mem_log := [];
+  watch_mem_on := true
+
+let watch_mem_entries () = List.rev !watch_mem_log
 let set_pc_hist b = pc_hist_on := b
 let set_watch_enter lo hi = watch_enter := Some (lo, hi)
 let set_trace_from pc n = trace_from := Some (pc, n)
 let pc_histogram () = Array.copy pc_hist
 
 let ldirvm_log_calls () = List.rev !ldirvm_calls
+
+let tx_state t = Vdp.tx_state t.vdp
+let cmd_history t = Vdp.cmd_history t.vdp
 
 let debug_dump t =
   let v = t.vdp in

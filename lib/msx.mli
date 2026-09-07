@@ -63,11 +63,23 @@ val set_ldirvm_log : bool -> unit
 val ldirvm_log_calls : unit -> (int * int * int) list
 (** (HL=src, DE=dst, BC=len) — set_ldirvm_log true 후 step 에 수집. *)
 
+val set_watch_mem : int list -> unit
+(** RAM 쓰기 감시 주소 목록 — 부팅 중 시스템 변수 초기화 추적용. *)
+
+val watch_mem_entries : unit -> (int * int * int * int) list
+(** (명령 서수, 주소, 값, 근접 PC) — 시간 순. PC 는 폴링된 사이클
+    중간이라 정확한 명령 경계가 아니다. *)
+
 val vram_hex : t -> int -> int -> unit
 (** VRAM [from] 부터 [len] 바이트 hex 를 stderr 로. *)
 
 val vdp_write_log : t -> (int * int * int) list
 (** VDP 포트 쓰기 로그 — 부트 디버깅용. *)
+
+val tx_state : t -> bool * int * int * int * int
+(** (전송 중, transfer 횟수, 남은 줄, 줄 내 남은 바이트, 현재 Y). *)
+
+val cmd_history : t -> (int * int * int * int) list
 
 val debug_dump : t -> unit
 (** VDP 레지스터·VRAM 통계·PPI 를 stderr 로 — 부트 디버깅용. *)

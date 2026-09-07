@@ -1,6 +1,7 @@
-(** V9938 — P1 은 TMS9918 호환 표면: 텍스트/GRAPHIC1/GRAPHIC2 렌더,
-    레지스터·VRAM 래치, 팔레트, VBlank 인터럽트. command engine 과
-    나머지 스크린 모드는 P2 가 채운다. *)
+(** V9938 — TMS9918 호환 표면(텍스트/G1/G2) + SCREEN5(G4) 비트맵 렌더,
+    블록 명령(LMMV/HMMV/HMMM/YMMM/LMMM) 과 CPU 동기 전송(LMMC/HMMC),
+    레지스터·VRAM 래치, 팔레트, VBlank·라인 인터럽트.
+    SCREEN6-8·스프라이트·POINT/SRCH/LINE 은 아직 없다. *)
 
 type t
 
@@ -28,6 +29,12 @@ val frame_rgb : t -> string
 
 val vram : t -> Bytes.t
 (** VRAM 원본 — 하네스 검사용. *)
+
+val tx_state : t -> bool * int * int * int * int
+(** (전송 중, transfer 횟수, 남은 줄, 줄 내 남은 바이트, 현재 Y). *)
+
+val cmd_history : t -> (int * int * int * int) list
+(** 최근 명령 발행 (CMR, DX, DY, NY) 32개 — 시간 순. *)
 
 val regs : t -> int array
 (** 레지스터 0-46 — 하네스 검사용. *)

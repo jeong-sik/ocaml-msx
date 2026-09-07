@@ -6,6 +6,26 @@ let rom_dir = ref "roms/cbios/cbios-0.29a/roms"
 let frames = ref 60
 let out_prefix = ref "/tmp/msxboot"
 let vlog = ref false
+let watch_mem = ref ""
+let assert_boot = ref false
+
+let contains_sub hay needle =
+  let n = String.length needle and m = String.length hay in
+  n = 0
+  ||
+  let rec at i j = j = n || (hay.[i + j] = needle.[j] && at i (j + 1)) in
+  let rec go i = i + n <= m && (at i 0 || go (i + 1)) in
+  go 0
+
+let count_nonblack rgb =
+  let n = ref 0 in
+  String.iteri
+    (fun i c ->
+      let b = Char.code c in
+      if i mod 3 = 0 && (b > 8 || Char.code rgb.[i + 1] > 8 || Char.code rgb.[i + 2] > 8) then
+        incr n)
+    rgb;
+  !n
 
 let read_file p =
   let ic = open_in_bin p in
@@ -17,6 +37,8 @@ let read_file p =
 let () =
   Arg.parse
     [ ("--vlog", Arg.Set vlog, "  VDP 포트 쓰기 로그");
+      ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
+      ("--watch-mem", Arg.Set_string watch_mem, "A,B,C  RAM 쓰기 감시 (hex, 콤마 구분)");
       ("--frames", Arg.Int (fun n -> frames := n), "N  실행할 프레임");
       ("--roms", Arg.String (fun s -> rom_dir := s), "DIR  C-BIOS roms 디렉터리");
       ("--out", Arg.String (fun s -> out_prefix := s), "PREFIX  덤프 접두어") ]
@@ -32,6 +54,9 @@ let () =
   in
   Msx.set_ldirvm_log true;
   Msx.set_pc_hist true;
+  if !watch_mem <> "" then
+    Msx.set_watch_mem
+      (List.map (fun s -> int_of_string ("0x" ^ s)) (String.split_on_char ',' !watch_mem));
   (try Msx.set_watch_enter 0x8000 0xc000 with Not_found -> ());
 (try
    let v = Sys.getenv "TRACE_FROM" in
@@ -51,6 +76,29 @@ let () =
       run_frame (n - 1)
     end
   in
+  (* 부트 완주 자동 판정: 로고(SCREEN5 비트맵) → 페이드 → "No cartridge".
+     로고는 텍스트가 아니라 픽셀 수로, 최종 화면은 screen_text 로 잡는다. *)
+  if !assert_boot then begin
+    run_frame 30;
+    let nb_logo = count_nonblack (Msx.frame_rgb t) in
+    if nb_logo < 10_000 then begin
+      Printf.eprintf "assert boot FAIL: logo not rendered (f=30 nonblack=%d)\n%!" nb_logo;
+      exit 1
+    end;
+    run_frame 570;
+    let txt = Msx.screen_text t in
+    if not (contains_sub txt "No cartridge") then begin
+      Printf.eprintf "assert boot FAIL: no \"No cartridge\" at f=600\n%s\n%!" txt;
+      exit 1
+    end;
+    let nb_final = count_nonblack (Msx.frame_rgb t) in
+    if nb_final < 49_000 then begin
+      Printf.eprintf "assert boot FAIL: final screen dark (nonblack=%d)\n%!" nb_final;
+      exit 1
+    end;
+    Printf.printf "assert boot ok: logo=%d final=%d\n" nb_logo nb_final;
+    exit 0
+  end;
   run_frame !frames;
   Printf.printf "last pcs:";
   for i = !ridx - 16 to !ridx - 1 do
@@ -68,9 +116,18 @@ let () =
     rgb;
   Printf.printf "frames=%d pc=%04x nonblack=%d\n%!" !frames (Msx.dump_pc t) !nonblack;
   Msx.debug_dump t;
+  let (active, n, ny, anx, dy) = Msx.tx_state t in
+  Printf.printf "tx active=%b count=%d ny=%d anx=%d dy=%d\n" active n ny anx dy;
+  List.iter
+    (fun (c, dx, dy, ny) -> Printf.printf "cmd cmr=%02x dx=%d dy=%d ny=%d\n" c dx dy ny)
+    (Msx.cmd_history t);
   List.iter
     (fun (hl, de, bc) -> Printf.printf "ldirvm hl=%04x de=%04x bc=%04x\n" hl de bc)
     (Msx.ldirvm_log_calls ());
+  List.iter
+    (fun (n, a, v, pc) ->
+      Printf.printf "watch #%d %04x=%02x @%04x\n" n a v pc)
+    (Msx.watch_mem_entries ());
   let hist = Msx.pc_histogram () in
   Printf.printf "pc hist:";
   Array.iteri (fun i n -> if n > 1000 then Printf.printf " %02x:%d" i n) hist;
@@ -84,8 +141,8 @@ let () =
   print_string (Msx.screen_text t);
   (if !vlog then
      List.iter
-       (fun (p, a, v) -> Printf.printf "w %02x a=%04x v=%02x\n" p a v)
-       (List.filter (fun (p, _, _) -> p = 0x99 || p = 0x98)
+       (fun (p, a, v) -> Printf.printf "w %02x a=%05x v=%02x\n" p a v)
+       (List.filter (fun (p, _, _) -> p = 0x99 || p = 0x98 || p = 0x9B)
           (Msx.vdp_write_log t)));
   let oc = open_out_bin (!out_prefix ^ ".ppm") in
   Printf.fprintf oc "P6\n256 192\n255\n%s" rgb;

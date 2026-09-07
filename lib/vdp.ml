@@ -23,9 +23,25 @@ type t = {
   mutable cycle_in_line : int;
   mutable int_pending : bool;
   mutable cmd_ce : bool;
+  (* LMMC/HMMC 전송 상태 — CMR 를 쓰면 진입, R#44(CLR) 쓰기마다
+     1바이트가 흘러간다 (openMSX setCmdReg case 0x0C). *)
+  mutable tx_active : bool;
+  mutable tx_hm : bool;
+  mutable tx_dx : int;
+  mutable tx_adx : int;
+  mutable tx_anx : int;
+  mutable tx_nx : int;
+  mutable tx_dy : int;
+  mutable tx_ny : int;
+  mutable cmd_tr : bool;
+  (* CMR 발행 전 R#44 쓰기 — 명령 시작 시 첫 픽셀로 소비된다
+     (openMSX transfer 플래그는 명령 밖에서도 세운다). *)
+  mutable tx_pending : bool;
   (* 포트 쓰기 로그 — 부트 디버깅용 링버퍼. *)
   mutable wlog : (int * int * int) array;
   mutable wlog_i : int;
+  (* 최근 명령 발행 이력 — 부트 디버깅용. *)
+  mutable cmd_log : (int * int * int * int) list;
 }
 
 let lines_per_frame = 262
@@ -61,22 +77,36 @@ let create () =
     cycle_in_line = 0;
     int_pending = false;
     cmd_ce = false;
+    tx_active = false;
+    tx_hm = false;
+    tx_dx = 0;
+    tx_adx = 0;
+    tx_anx = 0;
+    tx_nx = 0;
+    tx_dy = 0;
+    tx_ny = 0;
+    cmd_tr = false;
+    tx_pending = false;
     wlog = Array.make 65536 (0, 0, 0);
     wlog_i = 0;
+    cmd_log = [];
   }
 
-(* 명령 레지스터 (R#32-46) 해석. 화면 모드에 따라 바이트 단위가
-   다르다: P2 는 NonBitmap(SCREEN1-3, 2px/바이트, 128바이트/줄) 와
-   G4/G5(1px/바이트, 128/256바이트/줄), G6/G7(512px) 를 구분한다. *)
+(* 명령 좌표계의 줄당 바이트 수. 모드 비트 (grauw): M5=R0 bit3,
+   M4=R0 bit2, M3=R0 bit1, M2=R1 bit3, M1=R1 bit4.
+   G4(=M4+M3, SCREEN4) 와 NonBitmap(SCREEN1-3) 은 2px/바이트 128,
+   G5(M4) 도 128(4bpp), G6(M5+M4)·G7(M5+M3)·G8(M5+M1) 은 256. *)
 let bytes_per_line t =
-  let m1 = t.regs.(0) land 0x0e and m2 = t.regs.(1) land 0x18 in
-  if m1 = 0x06 && m2 = 0x18 then 256 (* G7 *)
-  else if m1 = 0x04 && (m2 = 0x10 || m2 = 0x18) then 128 (* G6: 2px/byte *)
-  else if m1 = 0x0c then 128 (* G5 *)
-  else if m1 = 0x08 && (m2 = 0x10 || m2 = 0x18) then 128 (* G4 *)
-  else 128 (* NonBitmap: SCREEN1-3 *)
+  let m5 = t.regs.(0) land 0x08 <> 0 and m4 = t.regs.(0) land 0x04 <> 0 in
+  let m3 = t.regs.(0) land 0x02 <> 0 and m1 = t.regs.(1) land 0x10 <> 0 in
+  if m5 && (m4 || m3 || m1) then 256 else 128
 
-let reg16 t lo hi = (t.regs.(hi) land 1 lsl 8) lor t.regs.(lo)
+let reg16 t lo hi = ((t.regs.(hi) land 1) lsl 8) lor t.regs.(lo)
+
+(* 8bpp(한 픽셀이 한 바이트) 는 G8 뿐. *)
+let pixels_per_byte t =
+  let m5 = t.regs.(0) land 0x08 <> 0 and m1 = t.regs.(1) land 0x10 <> 0 in
+  if m5 && m1 then 1 else 2
 
 let vram_addr t bank x y =
   let bpl = bytes_per_line t in
@@ -91,8 +121,9 @@ let logical op a c =
   | 4 -> lnot c land 0xff
   | _ -> c
 
-(* 명령 실행 — 즉시 완료 (CE 는 관찰되지 않는다). HMMC/LMCM 은 CPU
-   동기가 필요해 P2 후반으로 미룬다. *)
+(* 블록 명령 실행 — 즉시 완료 (CE 는 관찰되지 않는다). CPU 동기 전송
+   (LMMC/HMMC) 은 R#44 쓰기 구동 transfer_byte 로, POINT/SRCH/LINE/
+   LMCM 은 아직 없다. *)
 let exec_command t =
   let cmr = t.regs.(46) in
   let cmd = cmr lsr 4 and op = cmr land 0x0f in
@@ -153,9 +184,93 @@ let exec_command t =
     done
   | _ -> () (* STOP/POINT/PSET/SRCH/LINE/HMMC/LMCM — P2 후반 *)
 
+(* LMMC/HMMC 전송 한 바이트 — 전송 모드에서 R#44(CLR) 쓰기가 곧
+   데이터다 (openMSX setCmdReg case 0x0C → executeLmmc/executeHmmc).
+   HMMC 는 바이트 단위, LMMC 는 픽셀 단위 pset. *)
+let tx_count = ref 0
+
+let transfer_byte t v =
+  incr tx_count;
+  t.cmd_tr <- true; (* 다음 바이트 즉시 준비 *)
+  let arg = t.regs.(45) in
+  let dix = arg land 0x04 = 0 and diy = arg land 0x08 = 0 in
+  let mxd = arg land 0x20 <> 0 in
+  let op = t.regs.(46) land 0x0f in
+  let ppb = pixels_per_byte t in
+  if t.tx_hm then begin
+    Bytes.set t.vram (vram_addr t mxd t.tx_adx t.tx_dy) (Char.chr v);
+    t.tx_adx <- t.tx_adx + ((if dix then 1 else -1) * ppb);
+    t.tx_anx <- t.tx_anx - 1
+  end else begin
+    let a = vram_addr t mxd t.tx_adx t.tx_dy in
+    let old = Char.code (Bytes.get t.vram a) in
+    let col = if ppb = 1 then v land 0xff else v land 0x0f in
+    let apply () =
+      let oldc =
+        if ppb = 1 then old
+        else if t.tx_adx land 1 = 0 then old lsr 4
+        else old land 15
+      in
+      let newc = logical op oldc col in
+      Bytes.set t.vram a
+        (Char.chr
+           (if ppb = 1 then newc
+            else if t.tx_adx land 1 = 0 then (old land 0x0f) lor (newc lsl 4)
+            else (old land 0xf0) lor newc))
+    in
+    if op = 8 then (if col <> 0 then apply ()) else apply ();
+    t.tx_adx <- t.tx_adx + (if dix then 1 else -1);
+    t.tx_anx <- t.tx_anx - 1
+  end;
+  if t.tx_anx = 0 then begin
+    t.tx_dy <- t.tx_dy + (if diy then 1 else -1);
+    t.tx_adx <- t.tx_dx;
+    t.tx_anx <- t.tx_nx;
+    t.tx_ny <- t.tx_ny - 1;
+    if t.tx_ny = 0 then begin
+      t.tx_active <- false;
+      t.cmd_ce <- false
+      (* TR 은 다음 S#2 읽기에서 해제된다 — openMSX commandDone. *)
+    end
+  end
+
+let start_command t =
+  let cmr_v = t.regs.(46) in
+  t.cmd_log <- (cmr_v, reg16 t 36 37, reg16 t 38 39, reg16 t 42 43) :: List.filteri (fun i _ -> i < 31) t.cmd_log;
+  let cmd = t.regs.(46) lsr 4 in
+  if cmd = 0xB || cmd = 0xF then begin
+    t.tx_active <- true;
+    t.tx_hm <- cmd = 0xF;
+    t.tx_dx <- reg16 t 36 37;
+    t.tx_adx <- t.tx_dx;
+    (* openMSX clipNX_1_byte / clipNX_1_pixel: 한 줄 폭을 넘는 NX 는
+       잘린다 — HMMC 는 바이트 단위, LMMC 는 픽셀 단위. *)
+    let bpl = bytes_per_line t and ppb = pixels_per_byte t in
+    let nx_raw = reg16 t 40 41 in
+    t.tx_nx <-
+      (if t.tx_hm then
+         let dx_b = t.tx_dx / ppb in
+         max 1 (min nx_raw (bpl - dx_b))
+       else max 1 (min nx_raw (bpl * ppb - t.tx_dx)));
+    t.tx_anx <- t.tx_nx;
+    t.tx_dy <- reg16 t 38 39;
+    t.tx_ny <- max 1 (reg16 t 42 43);
+    t.cmd_ce <- true;
+    t.cmd_tr <- true;
+    (* 발행 전 R#44 에 쓰인 첫 픽셀이 큐에 있으면 즉시 소비. *)
+    if t.tx_pending then begin
+      t.tx_pending <- false;
+      transfer_byte t t.regs.(44)
+    end
+  end
+  else exec_command t
+
 let set_reg t r v =
   t.regs.(r) <- v land 0xff;
-  if r = 46 then exec_command t
+  if r = 44 then begin
+    if t.tx_active then transfer_byte t v else t.tx_pending <- true
+  end
+  else if r = 46 then start_command t
 
 let palette_rgb t i =
   if i land 0x10 = 0 then grb_to_rgb t.palette.(i land 15)
@@ -243,7 +358,18 @@ let io_read t ~port =
         let x = t.status1 in
         t.status1 <- 0;
         x
-      | 2 -> (if t.cmd_ce then 1 else 0) lor 0xfe
+      | 2 ->
+        (* TR: 전송 가능. 즉시 실행이라 전송 중엔 언제나 받을 수
+           있다 — 읽어도 유지. 완료 직후에는 한 번 1을 보여주고
+           해제한다 (openMSX commandDone: "TR is reset when S#2 is
+           read next") — 완료 감지는 그다음 읽기부터 TR=0 && CE=0. *)
+        let v =
+          ((if t.cmd_ce then 1 else 0)
+           lor (if t.cmd_tr || t.tx_active then 0x80 else 0))
+          lor 0x7e
+        in
+        if not t.tx_active then t.cmd_tr <- false;
+        v
       | _ -> 0xff
     in
     t.latch_first <- true;
@@ -277,6 +403,8 @@ let int_active t =
 
 let blanked t = t.regs.(1) land 0x40 = 0
 let vram t = t.vram
+let tx_state t = (t.tx_active, !tx_count, t.tx_ny, t.tx_anx, t.tx_dy)
+let cmd_history t = List.rev t.cmd_log
 let regs t = t.regs
 
 let write_log t =
@@ -287,9 +415,15 @@ let write_log t =
   done;
   !out
 
-(* 모드 판정. M2(멀티컬러) 는 아직 없다. *)
+(* 모드 판정 (V9938 모드표: M5=R0bit3, M4=R0bit2, M3=R0bit1,
+   M2=R1bit3, M1=R1bit4). G4 비트맵 = MSX2 SCREEN5 (M4+M3),
+   베이스는 R#2 의 A16/A15 (bit6/5) × 32K — 하위 5비트는 11111 고정.
+   멀티컬러(M2) 는 아직 없다. *)
 let mode_text t = t.regs.(1) land 0x10 <> 0
-let mode_g2 t = not (mode_text t) && t.regs.(0) land 0x02 <> 0
+let mode_g2 t =
+  not (mode_text t) && t.regs.(0) land 0x02 <> 0
+  && t.regs.(0) land 0x04 = 0
+let mode_s5 t = not (mode_text t) && t.regs.(0) land 0x06 = 0x06
 
 let frame_rgb t =
   let w = 256 and h = 192 in
@@ -305,9 +439,21 @@ let frame_rgb t =
   else begin
     let vr addr = Char.code (Bytes.get t.vram (addr land 0x1ffff)) in
     let r = t.regs in
-    if mode_text t then begin
+    if mode_s5 t then begin
+      (* SCREEN5: 256×212 비트맵, 4bpp (2px/바이트, 128바이트/줄).
+         베이스 = R#2 bit6/5 (A16/A15) × 32K. *)
+      let base = ((r.(2) lsr 5) land 3) * 0x8000 in
+      for y = 0 to h - 1 do
+        for x = 0 to w - 1 do
+          let b = vr (base + y * 128 + (x lsr 1)) in
+          let c = if x land 1 = 0 then b lsr 4 else b land 15 in
+          put x y c
+        done
+      done
+    end
+    else if mode_text t then begin
       (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
-      let nt = (r.(2) land 0xf) lsl 10 in
+      let nt = (r.(2) land 0x7f) lsl 10 in
       let pt = (r.(4) land 0x7) lsl 8 in
       let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
       for y = 0 to h - 1 do
@@ -330,7 +476,7 @@ let frame_rgb t =
     end
     else begin
       let g2 = mode_g2 t in
-      let nt = (r.(2) land 0xf) lsl 10 in
+      let nt = (r.(2) land 0x7f) lsl 10 in
       let pt = (r.(4) land 0x7) lsl 11 in
       let ct = (r.(3) land 0xff) lsl 6 in
       for row = 0 to 23 do
