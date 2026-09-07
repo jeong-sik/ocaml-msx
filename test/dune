@@ -1,3 +1,14 @@
 (test
  (name sprite_test)
+ (modules sprite_test)
+ (libraries vdpcore))
+
+(test
+ (name keyboard_test)
+ (modules keyboard_test)
+ (libraries msx))
+
+(test
+ (name g2_test)
+ (modules g2_test)
  (libraries vdpcore))
