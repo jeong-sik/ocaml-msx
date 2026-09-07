@@ -74,10 +74,14 @@ let mem_read m addr =
            부트 초반 로고(슬롯0 페이지2)와는 시점이 갈린다. *)
         | 0, 2 | 1, 2 -> (m.logo_rom, off)
         | 2, 2 ->
-          if Bytes.length m.cart > 0x8000 then (m.cart, cart_off)
+          (* 32KB 카트는 뒷 16KB. 16KB 카트는 A15 를 해독하지 않아 페이지2 에
+             앞 16KB 가 다시 보인다 (미러). 경계는 >= — 정확히 0x8000 인
+             파일이 로고 ROM 으로 새는 게 스펠렁커 halt 사태의 원인이었다. *)
+          if Bytes.length m.cart >= 0x8000 then (m.cart, cart_off)
+          else if Bytes.length m.cart >= 0x4000 then (m.cart, off)
           else (m.logo_rom, off)
         | 2, 0 | 2, 1 ->
-          if Bytes.length m.cart > 0x4000 then (m.cart, cart_off)
+          if Bytes.length m.cart >= 0x4000 then (m.cart, cart_off)
           else (m.main_rom, off)
         | 2, 3 | 1, 3 | 0, 3 -> (m.main_rom, off)
         | _ -> (m.logo_rom, off)
@@ -325,6 +329,7 @@ let ldirvm_log_calls () = List.rev !ldirvm_calls
 let tx_state t = Vdp.tx_state t.vdp
 let cmd_history t = Vdp.cmd_history t.vdp
 let vdp_status0 t = Vdp.status0 t.vdp
+let vdp_line t = Vdp.line_now t.vdp
 let vdp_irq_active t = Vdp.int_active t.vdp
 let cpu_halted t = Z80.halted t.cpu
 let vdp_regs t = Vdp.regs t.vdp
