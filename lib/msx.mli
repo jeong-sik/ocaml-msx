@@ -122,3 +122,25 @@ val serialize : t -> string
 (** 아직 없다 — P1 범위 밖. 호출하면 예외. *)
 
 val restore : state:string -> t
+
+(** 관측 — 화면을 그리지 않는 클라이언트(텍스트 keeper)가 기계 상태를 읽는
+    면. 프레임 픽셀은 {!frame_rgb}, 여기는 그 아래의 구조다. *)
+
+type display_mode = Vdp.display_mode =
+  | Text1
+  | Text2
+  | Multicolor
+  | Graphic1
+  | Graphic2
+  | Graphic3
+  | Graphic4
+  | Graphic5
+  | Graphic6
+  | Graphic7
+  | Undefined of int  (** M1=bit0 … M5=bit4 로 읽은 5비트 코드 *)
+
+val display_mode : t -> display_mode
+val display_mode_to_string : display_mode -> string
+
+val vram_read : t -> int -> int
+(** VRAM 한 바이트. name table(R#2<<10)·SAT(R#5<<7) 을 관측자가 직접 읽는다. *)

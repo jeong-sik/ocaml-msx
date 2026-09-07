@@ -420,3 +420,20 @@ let frame_rgb t = Vdp.frame_rgb t.vdp
 
 let serialize _ = failwith "savestate: P1 범위 밖"
 let restore ~state:_ = failwith "savestate: P1 범위 밖"
+
+type display_mode = Vdp.display_mode =
+  | Text1
+  | Text2
+  | Multicolor
+  | Graphic1
+  | Graphic2
+  | Graphic3
+  | Graphic4
+  | Graphic5
+  | Graphic6
+  | Graphic7
+  | Undefined of int
+
+let display_mode t = Vdp.display_mode t.vdp
+let display_mode_to_string = Vdp.display_mode_to_string
+let vram_read t addr = Vdp.vram_read t.vdp addr

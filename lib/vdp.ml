@@ -427,6 +427,61 @@ let mode_g2 t =
   && t.regs.(0) land 0x04 = 0
 let mode_s5 t = not (mode_text t) && t.regs.(0) land 0x06 = 0x06
 
+(* V9938 화면 모드표 (application manual 표 "screen mode register bits";
+   openMSX DisplayMode 의 base 코드와 같은 비트 배치 M1=bit0 … M5=bit4).
+   M1 = R#1 bit4, M2 = R#1 bit3, M3 = R#0 bit1, M4 = R#0 bit2, M5 = R#0 bit3.
+   표에 없는 조합은 코드를 그대로 든 Undefined 다 — 렌더러가 무엇을 그리든
+   관측자는 기계가 무슨 모드라고 말하는지를 받는다. *)
+type display_mode =
+  | Text1
+  | Text2
+  | Multicolor
+  | Graphic1
+  | Graphic2
+  | Graphic3
+  | Graphic4
+  | Graphic5
+  | Graphic6
+  | Graphic7
+  | Undefined of int
+
+let display_mode_code t =
+  let r0 = t.regs.(0) and r1 = t.regs.(1) in
+  ((r1 lsr 4) land 1)
+  lor (((r1 lsr 3) land 1) lsl 1)
+  lor (((r0 lsr 1) land 1) lsl 2)
+  lor (((r0 lsr 2) land 1) lsl 3)
+  lor (((r0 lsr 3) land 1) lsl 4)
+
+let display_mode t =
+  match display_mode_code t with
+  | 0x00 -> Graphic1
+  | 0x04 -> Graphic2
+  | 0x08 -> Graphic3
+  | 0x0c -> Graphic4
+  | 0x10 -> Graphic5
+  | 0x14 -> Graphic6
+  | 0x1c -> Graphic7
+  | 0x02 -> Multicolor
+  | 0x01 -> Text1
+  | 0x09 -> Text2
+  | code -> Undefined code
+
+let display_mode_to_string = function
+  | Text1 -> "TEXT1"
+  | Text2 -> "TEXT2"
+  | Multicolor -> "MULTICOLOR"
+  | Graphic1 -> "GRAPHIC1"
+  | Graphic2 -> "GRAPHIC2"
+  | Graphic3 -> "GRAPHIC3"
+  | Graphic4 -> "GRAPHIC4"
+  | Graphic5 -> "GRAPHIC5"
+  | Graphic6 -> "GRAPHIC6"
+  | Graphic7 -> "GRAPHIC7"
+  | Undefined code -> Printf.sprintf "UNDEFINED(0x%02x)" code
+
+let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
+
 (* 스프라이트 모드 1 — SCREEN1-3. SAT = R#5<<7 (32엔트리 × 4바이트:
    Y, X, 패턴번호, 컬러), PT = R#6<<11. R#1 bit0 = MAG(2배), bit1 =
    SIZE(16×16). Y 값은 실제보다 1 크고, 0xD0 인 엔트리부터 뒤는 없으며
