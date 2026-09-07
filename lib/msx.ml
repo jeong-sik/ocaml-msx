@@ -61,6 +61,14 @@ let key_target = function
 
 type machine = { ram_kb : int; vram_kb : int; roms : string list }
 
+(* MegaROM cartridge mappers. A cart larger than 32KB (or a 32KB one built for a
+   mapper) can't sit flat in the 0x4000-0xBFFF window; it shows one of its
+   segments per window and swaps them when the running code writes a bank
+   register. [Flat] is the plain 16/32KB cart with no banking. The four here are
+   the common ones (openMSX RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16);
+   the SCC sound chip is not modelled, only its banking. *)
+type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16
+
 type t = {
   cpu : Z80.t;
   vdp : Vdp.t;
@@ -68,6 +76,10 @@ type t = {
   mutable logo_rom : Bytes.t;
   mutable sub_rom : Bytes.t;
   mutable cart : Bytes.t;
+  mutable cart_mapper : cart_mapper;
+  cart_banks : int array;
+      (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
+          window); ASCII16 uses [.(0)]/[.(1)] as 16KB banks. *)
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
@@ -82,6 +94,71 @@ type t = {
 
 let rom_or_empty = function "" -> Bytes.make 0x4000 '\000' | s -> Bytes.of_string s
 
+(* Which 8KB segment a MegaROM shows in window [w] (0..3, one per 8KB of
+   0x4000-0xBFFF). The 8KB mappers read the register straight; ASCII16 splits a
+   16KB bank into its two 8KB halves. *)
+let cart_seg8 m w =
+  match m.cart_mapper with
+  | Konami | Konami_scc | Ascii8 -> m.cart_banks.(w)
+  | Ascii16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
+  | Flat -> w
+
+(* A write into the cart window selects a bank. Each mapper decodes the target
+   address differently; a write that hits no register is ignored (ROM is not
+   RAM). Segment values are masked to the ROM size at read time. *)
+let cart_bank_write m a v =
+  match m.cart_mapper with
+  | Flat -> ()
+  | Konami ->
+    (* 0x4000-0x5FFF fixed to segment 0; the upper three windows select. *)
+    (match a land 0xe000 with
+     | 0x6000 -> m.cart_banks.(1) <- v
+     | 0x8000 -> m.cart_banks.(2) <- v
+     | 0xa000 -> m.cart_banks.(3) <- v
+     | _ -> ())
+  | Konami_scc ->
+    (* Register at 0x5000/0x7000/0x9000/0xB000: (a land 0x1800) = 0x1000. *)
+    if a land 0x1800 = 0x1000 then m.cart_banks.((a lsr 13) - 2) <- v
+  | Ascii8 ->
+    (match a land 0xf800 with
+     | 0x6000 -> m.cart_banks.(0) <- v
+     | 0x6800 -> m.cart_banks.(1) <- v
+     | 0x7000 -> m.cart_banks.(2) <- v
+     | 0x7800 -> m.cart_banks.(3) <- v
+     | _ -> ())
+  | Ascii16 ->
+    (match a land 0xf800 with
+     | 0x6000 -> m.cart_banks.(0) <- v
+     | 0x7000 -> m.cart_banks.(1) <- v
+     | _ -> ())
+
+(* Guess a mapper from the ROM (openMSX-style): count [ld (nn),a] writes to each
+   mapper's register addresses and take the strongest signal. Only for ROMs over
+   32KB; smaller carts sit flat. The distinguishing addresses are 0x6800/0x7800
+   (ASCII8) and 0x5000/0x9000/0xB000 (SCC); 0x6000/0x7000 lean ASCII16 and
+   0x6000/0x8000/0xA000 lean Konami. Konami is the default for a MegaROM. The
+   guess can be wrong; [load_cartridge ~mapper] overrides it. *)
+let guess_mapper rom =
+  let len = String.length rom in
+  if len <= 0x8000 then Flat
+  else begin
+    let konami = ref 0 and scc = ref 0 and a8 = ref 0 and a16 = ref 0 in
+    for i = 0 to len - 3 do
+      if Char.code rom.[i] = 0x32 then begin
+        let addr = Char.code rom.[i + 1] lor (Char.code rom.[i + 2] lsl 8) in
+        (match addr with 0x6000 | 0x8000 | 0xa000 -> incr konami | _ -> ());
+        (match addr with 0x5000 | 0x9000 | 0xb000 -> incr scc | _ -> ());
+        (match addr with 0x6800 | 0x7800 -> incr a8 | _ -> ());
+        (match addr with 0x6000 | 0x7000 -> incr a16 | _ -> ())
+      end
+    done;
+    let best = ref Konami and score = ref !konami in
+    if !scc > !score then (best := Konami_scc; score := !scc);
+    if !a8 > !score then (best := Ascii8; score := !a8);
+    if !a16 > !score then (best := Ascii16; score := !a16);
+    !best
+  end
+
 let mem_read m addr =
   let a = addr land 0xffff in
   let page = a lsr 14 in
@@ -93,6 +170,16 @@ let mem_read m addr =
     | _ -> (m.ppi_a lsr 6) land 3
   in
   if a = 0xffff && slot = 3 then lnot m.slot3_sel land 0xff
+  else if
+    a >= 0x4000 && a < 0xc000 && slot = 2 && m.cart_mapper <> Flat
+    && Bytes.length m.cart > 0
+  then begin
+    (* MegaROM: 0x4000-0xBFFF is four 8KB windows, each showing the segment its
+       bank register selects. The cart sits in slot 2 (see load_cartridge). *)
+    let seg = cart_seg8 m ((a lsr 13) - 2) in
+    let off = (seg * 0x2000) + (a land 0x1fff) in
+    Char.code (Bytes.get m.cart (off mod Bytes.length m.cart))
+  end
   else begin
     let off = a land 0x3fff in
     match slot with
@@ -146,6 +233,11 @@ let mem_write m addr v =
     | _ -> (m.ppi_a lsr 6) land 3
   in
   if a = 0xffff && slot = 3 then m.slot3_sel <- v land 0xff
+  else if
+    slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
+  then
+    (* A write into the cart window is a bank select, not a store. *)
+    cart_bank_write m a (v land 0xff)
   else if slot = 3 && (m.slot3_sel land 3 = 2 || page = 3) then begin
     let seg = m.mapper.(page) in
     let base = ((seg * 0x4000) + (a land 0x3fff)) mod (Bytes.length m.ram) in
@@ -230,6 +322,8 @@ let create ~machine =
       logo_rom = rom_or_empty logo;
       sub_rom = rom_or_empty sub;
       cart = Bytes.make 0 '\000';
+      cart_mapper = Flat;
+      cart_banks = [| 0; 1; 2; 3 |];
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
       ppi_a = 0x00;
@@ -247,8 +341,16 @@ let create ~machine =
 
 let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
 
-let load_cartridge t rom =
+let load_cartridge ?mapper t rom =
   t.cart <- Bytes.of_string rom;
+  t.cart_mapper <- (match mapper with Some m -> m | None -> guess_mapper rom);
+  (* Reset the banks linear so a MegaROM boots: segment 0 at 0x4000 holds the
+     "AB" header and INIT vector, and the running code sets the selectable banks
+     before it relies on them. *)
+  t.cart_banks.(0) <- 0;
+  t.cart_banks.(1) <- 1;
+  t.cart_banks.(2) <- 2;
+  t.cart_banks.(3) <- 3;
   (* mem_read 은 카트리지를 슬롯2 페이지0·1 에 둔다. 페이지0 을 슬롯2 로
      돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
@@ -394,6 +496,7 @@ let cpu_halted t = Z80.halted t.cpu
 let vdp_regs t = Vdp.regs t.vdp
 let ppi_a t = t.ppi_a
 let slot3_sel t = t.slot3_sel
+let cart_mapper t = t.cart_mapper
 
 let debug_dump t =
   let v = t.vdp in

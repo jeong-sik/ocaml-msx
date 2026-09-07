@@ -30,11 +30,35 @@ type machine = {
 
 type t
 
+(** MegaROM cartridge mapper. [Flat] is a plain 16/32KB cart; the others bank
+    8KB/16KB windows the way the named hardware does (openMSX RomKonami /
+    RomKonamiSCC / RomAscii8 / RomAscii16). SCC sound is not modelled. *)
+type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16
+
 val create : machine:machine -> t
 
 val name : t -> string
 
-val load_cartridge : t -> string -> unit
+val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
+(** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
+    ({!guess_mapper}); pass it to override a wrong guess. The bank registers
+    reset linear so the ROM boots from segment 0. *)
+
+val cart_mapper : t -> cart_mapper
+(** The mapper the plugged-in cart is using ([Flat] when none/plain). *)
+
+val guess_mapper : string -> cart_mapper
+(** Guess a ROM's mapper by counting its bank-register writes. [Flat] for a ROM
+    of 32KB or less. A heuristic — the caller can override with
+    [load_cartridge ~mapper]. *)
+
+val mem_read : t -> int -> int
+(** Read the byte the Z80 sees at a 16-bit address (slots, mapper, and all).
+    For tests and debugging. *)
+
+val mem_write : t -> int -> int -> unit
+(** Write a byte at a 16-bit address as the Z80 would — into RAM, or as a bank
+    select in a MegaROM's cart window. For tests and debugging. *)
 
 val set_key : t -> key -> pressed:bool -> bool
 (** 논리 키를 누르거나 뗀다. 키보드 매트릭스 키와 조이스틱 1 버튼
