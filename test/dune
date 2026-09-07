@@ -1,0 +1,3 @@
+(test
+ (name sprite_test)
+ (libraries vdpcore))

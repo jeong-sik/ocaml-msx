@@ -30,6 +30,9 @@ val frame_rgb : t -> string
 val vram : t -> Bytes.t
 (** VRAM 원본 — 하네스 검사용. *)
 
+val palette_rgb : t -> int -> int * int * int
+(** 팔레트 색 인덱스의 RGB — 렌더 판정 하네스용. *)
+
 val tx_state : t -> bool * int * int * int * int
 (** (전송 중, transfer 횟수, 남은 줄, 줄 내 남은 바이트, 현재 Y). *)
 

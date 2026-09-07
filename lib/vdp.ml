@@ -425,6 +425,67 @@ let mode_g2 t =
   && t.regs.(0) land 0x04 = 0
 let mode_s5 t = not (mode_text t) && t.regs.(0) land 0x06 = 0x06
 
+(* 스프라이트 모드 1 — SCREEN1-3. SAT = R#5<<7 (32엔트리 × 4바이트:
+   Y, X, 패턴번호, 컬러), PT = R#6<<11. R#1 bit0 = MAG(2배), bit1 =
+   SIZE(16×16). Y 값은 실제보다 1 크고, 0xD0 인 엔트리부터 뒤는 없으며
+   0xFF 는 그 엔트리만 화면 밖이다. 컬러 0 은 투명, 컬러 bit7(EC) 은
+   X 를 16px 왼쪽으로 민다. 우선순위는 번호가 낮은 쪽이 위 — 큰 번호부터
+   그린다. 라인당 표시 제한(4/8)과 5th-sprite·충돌 플래그(S#0 bit6/5)
+   는 아직 없다. *)
+let render_sprites t ~w ~h put =
+  let vr a = Char.code (Bytes.get t.vram a) in
+  let sat = (t.regs.(5) land 0x7f) lsl 7 in
+  let pt = (t.regs.(6) land 0x07) lsl 11 in
+  let size16 = t.regs.(1) land 0x02 <> 0 in
+  let mag = t.regs.(1) land 0x01 <> 0 in
+  let pat_len = if size16 then 32 else 8 in
+  let edge = if size16 then 16 else 8 in
+  let step = if mag then 2 else 1 in
+  let sput x y c =
+    if x >= 0 && x < w && y >= 0 && y < h then put x y c
+  in
+  (* 표시할 엔트리를 번호순으로 모은 뒤 역순으로 그린다 — 0xD0 는
+     목록 수집 자체를 끝낸다. *)
+  let active = ref [] in
+  (try
+     for i = 0 to 31 do
+       let e = sat + i * 4 in
+       match vr e with
+       | 0xd0 -> raise Exit
+       | 0xff -> () (* 이 엔트리만 화면 밖 *)
+       | _ -> active := i :: !active
+     done
+   with Exit -> ());
+  List.iter
+    (fun i ->
+      let e = sat + i * 4 in
+      let y0 = ((vr e - 1) land 0xff) and x_raw = vr (e + 1) in
+      let pat = vr (e + 2) and col = vr (e + 3) in
+      let c = col land 0x0f in
+      let x0 = if col land 0x80 <> 0 then x_raw - 16 else x_raw in
+      if c <> 0 then
+        let pbase =
+          pt + (if size16 then (pat land 0xfc) * pat_len else pat * pat_len)
+        in
+        for row = 0 to edge - 1 do
+          (* 16×16 은 한 줄이 2바이트: 상위 바이트가 왼쪽 8px. *)
+          let bits =
+            if size16 then
+              (vr (pbase + row * 2) lsl 8) lor vr (pbase + row * 2 + 1)
+            else vr (pbase + row)
+          in
+          let top = if size16 then 15 else 7 in
+          for b = 0 to edge - 1 do
+            if (bits lsr (top - b)) land 1 = 1 then
+              for my = 0 to step - 1 do
+                for mx = 0 to step - 1 do
+                  sput (x0 + b * step + mx) (y0 + row * step + my) c
+                done
+              done
+          done
+        done)
+    !active
+
 let frame_rgb t =
   let w = 256 and h = 192 in
   let img = Bytes.make (w * h * 3) '\000' in
@@ -500,7 +561,10 @@ let frame_rgb t =
             done
           done
         done
-      done
+      done;
+      (* SCREEN1-3 에서만 모드 1 스프라이트를 올린다 (TEXT 는 스프라이트가
+         없고 SCREEN5+ 는 모드 2 가 따로 있다). *)
+      render_sprites t ~w ~h put
     end;
     Bytes.to_string img
   end
