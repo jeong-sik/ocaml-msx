@@ -95,6 +95,12 @@ val cpu_halted : t -> bool
 val vdp_regs : t -> int array
 (** VDP 레지스터 — 부트 디버깅용. *)
 
+val ppi_a : t -> int
+(** PPI 포트 A (슬롯 셀렉트) — 부트 디버깅용. *)
+
+val slot3_sel : t -> int
+(** 슬롯3 서브슬롯 선택(0xFFFF) — 부트 디버깅용. *)
+
 val cmd_history : t -> (int * int * int * int) list
 
 val debug_dump : t -> unit

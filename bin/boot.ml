@@ -104,12 +104,14 @@ let () =
       end;
       ring.(!ridx land 63) <- Msx.dump_pc t;
       incr ridx;
-      if !ridx mod 30 = 0 then begin
+      if !ridx mod 30 = 0 || (!ridx >= 500 && !ridx <= 525) then begin
         let rgb = Msx.frame_rgb t in
         let nb = count_nonblack rgb in
-        Printf.eprintf "f=%d pc=%04x s0=%02x irq=%b halt=%b R1=%02x nb=%d\n%!"
+        Printf.eprintf
+          "f=%d pc=%04x s0=%02x irq=%b halt=%b R1=%02x nb=%d ppi=%02x sl3=%02x\n%!"
           !ridx (Msx.dump_pc t) (Msx.vdp_status0 t) (Msx.vdp_irq_active t)
-          (Msx.cpu_halted t) (Msx.vdp_regs t).(1) nb
+          (Msx.cpu_halted t) (Msx.vdp_regs t).(1) nb (Msx.ppi_a t)
+          (Msx.slot3_sel t)
       end;
       run_frame (n - 1)
     end

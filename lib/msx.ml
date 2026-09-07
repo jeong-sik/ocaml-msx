@@ -328,6 +328,8 @@ let vdp_status0 t = Vdp.status0 t.vdp
 let vdp_irq_active t = Vdp.int_active t.vdp
 let cpu_halted t = Z80.halted t.cpu
 let vdp_regs t = Vdp.regs t.vdp
+let ppi_a t = t.ppi_a
+let slot3_sel t = t.slot3_sel
 
 let debug_dump t =
   let v = t.vdp in
