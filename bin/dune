@@ -1,23 +1,29 @@
 (executable
  (name msx_demo)
+ (modules msx_demo)
  (libraries msx unix))
 
 (executable
  (name zex)
+ (modules zex)
  (libraries z80core))
 
 (executable
  (name selftest)
+ (modules selftest)
  (libraries z80core))
 
 (executable
  (name vectors)
+ (modules vectors)
  (libraries z80core))
 
 (executable
  (name trace)
+ (modules trace)
  (libraries z80core))
 
 (executable
  (name boot)
+ (modules boot)
  (libraries msx))
