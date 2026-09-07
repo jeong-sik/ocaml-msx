@@ -343,6 +343,8 @@ let create ~machine =
   m_ref := Some m;
   m
 
+let palette_entries t = Array.init 16 (Vdp.palette_rgb t.vdp)
+
 let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
 
 let load_cartridge ?mapper t rom =

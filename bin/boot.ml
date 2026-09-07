@@ -8,6 +8,7 @@ let out_prefix = ref "/tmp/msxboot"
 let vlog = ref false
 let watch_mem = ref ""
 let cart = ref ""
+let cart_mapper = ref ""
 let tap_space : int list ref = ref []
 let assert_boot = ref false
 
@@ -41,6 +42,9 @@ let () =
     [ ("--vlog", Arg.Set vlog, "  VDP 포트 쓰기 로그");
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
+      ( "--cart-mapper",
+        Arg.String (fun s -> cart_mapper := s),
+        "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
       ( "--tap-space",
         Arg.String
           (fun s -> tap_space := List.map int_of_string (String.split_on_char ',' s)),
@@ -59,7 +63,17 @@ let () =
   let t =
     Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms }
   in
-  if !cart <> "" then Msx.load_cartridge t (read_file !cart);
+  if !cart <> "" then
+    let mapper = match !cart_mapper with
+      | "plain" -> Some Msx.Flat
+      | "ascii8" -> Some Msx.Ascii8
+      | "ascii16" -> Some Msx.Ascii16
+      | "konami" -> Some Msx.Konami
+      | "konami-scc" -> Some Msx.Konami_scc
+      | "" -> None
+      | other -> Printf.ksprintf failwith "unknown --cart-mapper %s" other
+    in
+    Msx.load_cartridge ?mapper t (read_file !cart);
   Msx.set_ldirvm_log true;
   Msx.set_pc_hist true;
   if !watch_mem <> "" then

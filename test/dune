@@ -27,3 +27,8 @@
  (name mapper_test)
  (modules mapper_test)
  (libraries msx))
+
+(test
+ (name palette_test)
+ (modules palette_test)
+ (libraries msx))

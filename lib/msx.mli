@@ -52,6 +52,9 @@ val guess_mapper : string -> cart_mapper
     of 32KB or less. A heuristic — the caller can override with
     [load_cartridge ~mapper]. *)
 
+val palette_entries : t -> (int * int * int) array
+(** 팔레트 레지스터 16색의 RGB (채널 확대 후). 부트 판정 재료. *)
+
 val mem_read : t -> int -> int
 (** Read the byte the Z80 sees at a 16-bit address (slots, mapper, and all).
     For tests and debugging. *)
