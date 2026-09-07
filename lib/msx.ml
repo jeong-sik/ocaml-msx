@@ -294,6 +294,19 @@ let vram_hex t from len =
     Printf.eprintf "\n%!"
   done
 
+(* RAM hex 덤프 — 페이지0 가 슬롯3(RAM) 로 스왑된 게임 코드를 읽는다.
+   page0 에 보이는 세그먼트는 매퍼(mapper.(0)) 가 고른다. *)
+let ram_hex t from len =
+  let base = t.mapper.(0) * 0x4000 in
+  for row = 0 to (len - 1) / 16 do
+    Printf.eprintf "ram %04x:" (from + row * 16);
+    for i = 0 to 15 do
+      let a = base + ((from + row * 16 + i) land 0x3fff) in
+      Printf.eprintf " %02x" (Char.code (Bytes.get t.ram a))
+    done
+  done;
+  Printf.eprintf "\n%!"
+
 let set_ldirvm_log b = ldirvm_log := b
 
 let set_watch_mem addrs =

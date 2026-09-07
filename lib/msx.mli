@@ -73,6 +73,10 @@ val watch_mem_entries : unit -> (int * int * int * int) list
 val vram_hex : t -> int -> int -> unit
 (** VRAM [from] 부터 [len] 바이트 hex 를 stderr 로. *)
 
+val ram_hex : t -> int -> int -> unit
+(** RAM [from] 부터 [len] 바이트 hex 를 stderr 로 — 페이지0 스왑 게임
+    코드 해독용. 매퍼 세그먼트 0 기준. *)
+
 val vdp_write_log : t -> (int * int * int) list
 (** VDP 포트 쓰기 로그 — 부트 디버깅용. *)
 

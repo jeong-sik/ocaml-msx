@@ -176,6 +176,12 @@ let () =
      Msx.vram_hex t (int_of_string ("0x" ^ String.sub env 0 i))
        (int_of_string ("0x" ^ String.sub env (i + 1) (String.length env - i - 1)))
    with Not_found -> ());
+  (try
+     let env = Sys.getenv "RAM_DUMP" in
+     let i = String.index env ',' in
+     Msx.ram_hex t (int_of_string ("0x" ^ String.sub env 0 i))
+       (int_of_string ("0x" ^ String.sub env (i + 1) (String.length env - i - 1)))
+   with Not_found -> ());
   print_string (Msx.screen_text t);
   (if !vlog then
      List.iter
