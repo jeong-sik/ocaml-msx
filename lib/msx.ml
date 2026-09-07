@@ -132,31 +132,35 @@ let cart_bank_write m a v =
      | 0x7000 -> m.cart_banks.(1) <- v
      | _ -> ())
 
-(* Guess a mapper from the ROM (openMSX-style): count [ld (nn),a] writes to each
-   mapper's register addresses and take the strongest signal. Only for ROMs over
-   32KB; smaller carts sit flat. The distinguishing addresses are 0x6800/0x7800
-   (ASCII8) and 0x5000/0x9000/0xB000 (SCC); 0x6000/0x7000 lean ASCII16 and
-   0x6000/0x8000/0xA000 lean Konami. Konami is the default for a MegaROM. The
-   guess can be wrong; [load_cartridge ~mapper] overrides it. *)
+(* Guess a mapper from the ROM by looking at where its code writes bank
+   registers ([ld (nn),a]). Only for ROMs over 32KB; smaller carts sit flat.
+
+   The decision is by *distinctive* register, not raw count: an ASCII8 game also
+   writes 0x6000/0x7000 (those are two of its four registers), so a plain count
+   mistakes it for ASCII16. But 0x6800/0x7800 are ASCII8's alone, 0x5000/0x9000/
+   0xB000 are Konami-SCC's alone, and 0x8000/0xA000 are Konami's alone. ASCII16
+   owns no unique register, so it is the fallback when 0x6000/0x7000 are written
+   with none of the above. Konami is the last-resort default. The guess can be
+   wrong; [load_cartridge ~mapper] overrides it. *)
 let guess_mapper rom =
   let len = String.length rom in
   if len <= 0x8000 then Flat
   else begin
-    let konami = ref 0 and scc = ref 0 and a8 = ref 0 and a16 = ref 0 in
+    let a8 = ref 0 and scc = ref 0 and konami = ref 0 and a16 = ref 0 in
     for i = 0 to len - 3 do
       if Char.code rom.[i] = 0x32 then begin
         let addr = Char.code rom.[i + 1] lor (Char.code rom.[i + 2] lsl 8) in
-        (match addr with 0x6000 | 0x8000 | 0xa000 -> incr konami | _ -> ());
-        (match addr with 0x5000 | 0x9000 | 0xb000 -> incr scc | _ -> ());
         (match addr with 0x6800 | 0x7800 -> incr a8 | _ -> ());
+        (match addr with 0x5000 | 0x9000 | 0xb000 -> incr scc | _ -> ());
+        (match addr with 0x8000 | 0xa000 -> incr konami | _ -> ());
         (match addr with 0x6000 | 0x7000 -> incr a16 | _ -> ())
       end
     done;
-    let best = ref Konami and score = ref !konami in
-    if !scc > !score then (best := Konami_scc; score := !scc);
-    if !a8 > !score then (best := Ascii8; score := !a8);
-    if !a16 > !score then (best := Ascii16; score := !a16);
-    !best
+    if !a8 > 0 && !a8 >= !scc && !a8 >= !konami then Ascii8
+    else if !scc > 0 && !scc >= !konami then Konami_scc
+    else if !konami > 0 then Konami
+    else if !a16 > 0 then Ascii16
+    else Konami
   end
 
 let mem_read m addr =

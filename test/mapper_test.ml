@@ -112,6 +112,12 @@ let detection () =
     (Msx.guess_mapper (rom_with_writes [ 0x5000; 0x9000; 0xb000 ]) = Msx.Konami_scc);
   check "ascii8 from 0x6800/0x7800"
     (Msx.guess_mapper (rom_with_writes [ 0x6800; 0x7800 ]) = Msx.Ascii8);
+  (* An ASCII8 game also writes 0x6000/0x7000 (two of its four registers), so a
+     naive count reads it as ASCII16. The 0x6800/0x7800 writes must still win.
+     This is the Deep Dungeon case. *)
+  check "ascii8 wins over ascii16 when both register sets appear"
+    (Msx.guess_mapper (rom_with_writes [ 0x6000; 0x6800; 0x7000; 0x7800; 0x6000; 0x7000 ])
+     = Msx.Ascii8);
   check "ascii16 from 0x6000/0x7000"
     (Msx.guess_mapper (rom_with_writes [ 0x6000; 0x7000 ]) = Msx.Ascii16);
   (* a flat 32KB cart reads through the flat path, not a bank register *)
