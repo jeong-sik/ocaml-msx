@@ -22,3 +22,8 @@
  (name replay_test)
  (modules replay_test)
  (libraries msx))
+
+(test
+ (name megarom_test)
+ (modules megarom_test)
+ (libraries msx))

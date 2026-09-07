@@ -34,7 +34,19 @@ val create : machine:machine -> t
 
 val name : t -> string
 
-val load_cartridge : t -> string -> unit
+type cartridge_mapper = Plain | Ascii16
+(** 카트리지 뱅킹. [Plain] 은 16KB/32KB 그대로. [Ascii16] 은 ASCII-16
+    메가롬 — ROM 이미지에 방식이 적혀 있지 않으니 호출자가 고른다. *)
+
+val load_cartridge : ?mapper:cartridge_mapper -> t -> string -> unit
+(** 카트리지 이미지를 slot 2 에 얹는다. [mapper] 의 기본은 [Plain]. *)
+
+val mem_read : t -> int -> int
+(** 슬롯 매핑을 포함한 주소를 읽는다. 뱅킹 증명과 디버그용. *)
+
+val mem_write : t -> int -> int -> unit
+(** 슬롯 매핑을 포함한 주소에 쓴다. ASCII-16 뱅크 레지스터 쓰기도 여기로
+    지나간다. *)
 
 val set_key : t -> key -> pressed:bool -> bool
 (** 논리 키를 누르거나 뗀다. 키보드 매트릭스 키와 조이스틱 1 버튼

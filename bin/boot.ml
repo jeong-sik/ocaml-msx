@@ -8,6 +8,7 @@ let out_prefix = ref "/tmp/msxboot"
 let vlog = ref false
 let watch_mem = ref ""
 let cart = ref ""
+let cart_ascii16 = ref false
 let tap_space : int list ref = ref []
 let assert_boot = ref false
 
@@ -41,6 +42,9 @@ let () =
     [ ("--vlog", Arg.Set vlog, "  VDP 포트 쓰기 로그");
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
+      ( "--cart-ascii16",
+        Arg.Set cart_ascii16,
+        "  카트리지를 ASCII-16 메가롬으로 (256KB KOEI 등)" );
       ( "--tap-space",
         Arg.String
           (fun s -> tap_space := List.map int_of_string (String.split_on_char ',' s)),
@@ -59,7 +63,10 @@ let () =
   let t =
     Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms }
   in
-  if !cart <> "" then Msx.load_cartridge t (read_file !cart);
+  if !cart <> "" then
+    Msx.load_cartridge
+      ~mapper:(if !cart_ascii16 then Msx.Ascii16 else Msx.Plain)
+      t (read_file !cart);
   Msx.set_ldirvm_log true;
   Msx.set_pc_hist true;
   if !watch_mem <> "" then

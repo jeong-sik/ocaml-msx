@@ -61,6 +61,13 @@ let key_target = function
 
 type machine = { ram_kb : int; vram_kb : int; roms : string list }
 
+(* 카트리지 뱅킹 방식. [Plain] 은 16KB/32KB 카트리지를 그대로 페이지1·2 에
+   놓는 기존 동작. [Ascii16] 은 ASCII-16 메가롬: 16KB 뱅크 두 개가 뱅크
+   레지스터 (0x6000-0x67FF → 0x4000 세그먼트, 0x7000-0x77FF → 0x8000
+   세그먼트) 로 전환된다. ROM 이미지에는 방식이 적혀 있지 않아 호출자가
+   알려 주어야 한다. *)
+type cartridge_mapper = Plain | Ascii16
+
 type t = {
   cpu : Z80.t;
   vdp : Vdp.t;
@@ -68,6 +75,9 @@ type t = {
   mutable logo_rom : Bytes.t;
   mutable sub_rom : Bytes.t;
   mutable cart : Bytes.t;
+  mutable cart_mapper : cartridge_mapper;
+  mutable cart_bank1 : int;  (** Ascii16: 0x4000 세그먼트가 보는 뱅크 *)
+  mutable cart_bank2 : int;  (** Ascii16: 0x8000 세그먼트가 보는 뱅크 *)
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
@@ -103,6 +113,13 @@ let mem_read m addr =
       let cart_off = if page = 2 then 0x4000 + off else off in
       let rom, roff =
         match slot, page with
+          (* ASCII-16 메가롬: 각 세그먼트가 뱅크 레지스터가 고른 16KB 를
+             통째로 본다. 초기 0·1 — 첫 32KB 가 연속으로 보이는 상태에서
+             C-BIOS 가 0x4000 의 헤더를 찾는다. *)
+        | 2, 1 when m.cart_mapper = Ascii16 && Bytes.length m.cart > 0 ->
+            (m.cart, (m.cart_bank1 * 0x4000 + off) mod Bytes.length m.cart)
+        | 2, 2 when m.cart_mapper = Ascii16 && Bytes.length m.cart > 0 ->
+            (m.cart, (m.cart_bank2 * 0x4000 + off) mod Bytes.length m.cart)
         | 0, 0 | 0, 1 -> (m.main_rom, off)
         | 1, 0 | 1, 1 -> (m.main_rom, off)
         (* calslt 가 init 호출 시 전 페이지를 카트리지 슬롯으로 스왑하므로
@@ -150,6 +167,18 @@ let mem_write m addr v =
     let seg = m.mapper.(page) in
     let base = ((seg * 0x4000) + (a land 0x3fff)) mod (Bytes.length m.ram) in
     Bytes.set m.ram base (Char.chr (v land 0xff))
+  end
+  else if slot = 2 && m.cart_mapper = Ascii16 && Bytes.length m.cart > 0 then begin
+    (* ASCII-16 뱅크 레지스터 창은 둘 다 0x4000-0x7FFF (page 1) 안에 있다:
+       0x6000-0x67FF 쓰기가 0x4000 세그먼트의 뱅크를, 0x7000-0x77FF 쓰기가
+       0x8000 세그먼트의 뱅크를 고른다. 그 밖의 카트리지 영역 쓰기는 이
+       코어에 저장 RAM 이 없으므로 버린다. *)
+    let nbanks = Bytes.length m.cart / 0x4000 in
+    let off = a land 0x3fff in
+    if page = 1 && off >= 0x2000 && off < 0x2800 then
+      m.cart_bank1 <- (v land 0xff) mod nbanks
+    else if page = 1 && off >= 0x3000 && off < 0x3800 then
+      m.cart_bank2 <- (v land 0xff) mod nbanks
   end
 
 let rtc_reg = ref 0
@@ -230,6 +259,9 @@ let create ~machine =
       logo_rom = rom_or_empty logo;
       sub_rom = rom_or_empty sub;
       cart = Bytes.make 0 '\000';
+      cart_mapper = Plain;
+      cart_bank1 = 0;
+      cart_bank2 = 1;
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
       ppi_a = 0x00;
@@ -247,8 +279,11 @@ let create ~machine =
 
 let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
 
-let load_cartridge t rom =
+let load_cartridge ?(mapper = Plain) t rom =
   t.cart <- Bytes.of_string rom;
+  t.cart_mapper <- mapper;
+  t.cart_bank1 <- 0;
+  t.cart_bank2 <- 1;
   (* mem_read 은 카트리지를 슬롯2 페이지0·1 에 둔다. 페이지0 을 슬롯2 로
      돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
