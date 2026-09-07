@@ -540,25 +540,35 @@ let frame_rgb t =
     else begin
       let g2 = mode_g2 t in
       let nt = (r.(2) land 0x7f) lsl 10 in
-      let pt = (r.(4) land 0x7) lsl 11 in
-      let ct = (r.(3) land 0xff) lsl 6 in
+      (* 패턴/컬러 주소 = base land index (openMSX VRAMWindow::readNP).
+         base 는 레지스터를 제자리에 두고 안 쓰는 하위 비트를 1 로 채운 값,
+         index 는 안 쓰는 상위 비트를 1 로 채운 값이다. G2 의 index 는
+         13비트(third<<11 | name<<3 | 행) 라 R#3 bits0-6 과 R#4 bits0-1 이
+         index 상위 비트의 AND 마스크가 된다 — TMS 시절 미러 트릭이 여기서
+         나온다. G2 는 컬러도 패턴처럼 행마다 한 바이트다. G1 은 패턴
+         11비트(name<<3 | 행), 컬러 5비트(name>>3). *)
+      let pt_base = ((r.(4) land 0x3f) lsl 11) lor 0x7ff in
+      let ct_base = ((r.(10) land 0x07) lsl 14) lor (r.(3) lsl 6) lor 0x3f in
       for row = 0 to 23 do
+        let third = row lsr 3 in
         for col = 0 to 31 do
-          let name = vr (nt + row * 32 + col) in
-          let pat_base, col_byte =
-            if g2 then
-              ( pt
-                + ((name lsr 6) * 0x800)
-                + ((name land 0x3f) * 8),
-                vr (ct + ((name lsr 6) * 0x800) + ((name land 0x3f) * 8)) )
-            else (pt + name * 8, vr (ct + (name lsr 3)))
-          in
-          let fg = (col_byte lsr 4) land 0xf and bg = col_byte land 0xf in
+          let name = vr (nt + (row * 32) + col) in
           for py = 0 to 7 do
-            let bits = vr (pat_base + py) in
+            let pat_addr, col_addr =
+              if g2 then begin
+                let index = (lnot 0 lsl 13) lor (third lsl 11) lor (name lsl 3) lor py in
+                (pt_base land index, ct_base land index)
+              end
+              else
+                ( pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor py),
+                  ct_base land ((lnot 0 lsl 6) lor (name lsr 3)) )
+            in
+            let bits = vr pat_addr in
+            let col_byte = vr col_addr in
+            let fg = (col_byte lsr 4) land 0xf and bg = col_byte land 0xf in
             for px = 0 to 7 do
-              let x = col * 8 + px in
-              let y = row * 8 + py in
+              let x = (col * 8) + px in
+              let y = (row * 8) + py in
               if (bits lsr (7 - px)) land 1 = 1 then put x y fg else put x y bg
             done
           done
