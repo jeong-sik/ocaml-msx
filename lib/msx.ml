@@ -177,11 +177,53 @@ let key_index k = let r, b = key_matrix k in r * 8 + b
 
 let set_key t k ~pressed = t.keys.(key_index k) <- pressed
 
+let ldirvm_log = ref false
+let ldirvm_calls = ref []
+let pc_hist_on = ref false
+let trace_from : (int * int) option ref = ref None
+let trace_remaining = ref 0
+let ring = Array.make 64 0
+let ri = ref 0
+let watch_enter : (int * int) option ref = ref None
+let pc_hist = Array.make 256 0
+
 let step t ~frames =
   for _ = 1 to frames do
     let budget = ref cycles_per_frame in
     while !budget > 0 do
       if Vdp.int_active t.vdp then ignore (Z80.interrupt t.cpu);
+      let pc0 = Z80.dump_pc t.cpu in
+      (match !trace_from with
+       | Some (target, n) when pc0 = target && !trace_remaining = 0 ->
+         trace_remaining := n
+       | _ -> ());
+      if !trace_remaining > 0 then begin
+        decr trace_remaining;
+        Printf.eprintf "t %04x af=%04x bc=%04x de=%04x hl=%04x sp=%04x\n%!"
+          pc0
+          (((Z80.dump_a t.cpu) lsl 8) lor Z80.dump_f t.cpu)
+          (Z80.dump_bc t.cpu) (Z80.dump_de t.cpu) (Z80.dump_hl t.cpu)
+          (Z80.dump_sp t.cpu)
+      end;
+      let pc = Z80.dump_pc t.cpu in
+      ring.(!ri land 63) <- pc;
+      incr ri;
+      (match !watch_enter with
+       | Some (lo, hi) when pc >= lo && pc < hi ->
+         watch_enter := None;
+         Printf.eprintf "== entered %04x-%04x; prev steps:\n%!" lo hi;
+         for k = max 0 (!ri - 40) to !ri - 1 do
+           Printf.eprintf "r %04x\n%!" ring.(k land 63)
+         done
+       | _ -> ());
+      if !pc_hist_on then begin
+        let i = pc lsr 8 in
+        pc_hist.(i) <- pc_hist.(i) + 1
+      end;
+      if !ldirvm_log && Z80.dump_pc t.cpu = 0x005C then
+        ldirvm_calls :=
+          (Z80.dump_hl t.cpu, Z80.dump_de t.cpu, Z80.dump_bc t.cpu)
+          :: !ldirvm_calls;
       let used = Z80.step t.cpu in
       ignore (Vdp.advance t.vdp ~cycles:used);
       budget := !budget - used
@@ -209,6 +251,27 @@ let screen_text t =
     Buffer.add_char b '\n'
   done;
   Buffer.contents b
+
+let vdp_write_log t = Vdp.write_log t.vdp
+
+let vram_hex t from len =
+  let b = Vdp.vram t.vdp in
+  for row = 0 to (len - 1) / 16 do
+    Printf.eprintf "%05x:" (from + row * 16);
+    for i = 0 to 15 do
+      Printf.eprintf " %02x"
+        (Char.code (Bytes.get b ((from + row * 16 + i) land 0x1ffff)))
+    done;
+    Printf.eprintf "\n%!"
+  done
+
+let set_ldirvm_log b = ldirvm_log := b
+let set_pc_hist b = pc_hist_on := b
+let set_watch_enter lo hi = watch_enter := Some (lo, hi)
+let set_trace_from pc n = trace_from := Some (pc, n)
+let pc_histogram () = Array.copy pc_hist
+
+let ldirvm_log_calls () = List.rev !ldirvm_calls
 
 let debug_dump t =
   let v = t.vdp in

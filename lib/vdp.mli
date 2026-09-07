@@ -30,4 +30,7 @@ val vram : t -> Bytes.t
 (** VRAM 원본 — 하네스 검사용. *)
 
 val regs : t -> int array
-(** 레지스터 0-31 — 하네스 검사용. *)
+(** 레지스터 0-46 — 하네스 검사용. *)
+
+val write_log : t -> (int * int * int) list
+(** 최근 4096 포트 쓰기 (port, 래치주소, 값) — 부트 디버깅용. *)

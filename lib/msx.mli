@@ -47,6 +47,28 @@ val dump_pc : t -> int
 val screen_text : t -> string
 (** name table 을 40×24 (또는 32×24) 문자 그리드로 — 부트 판정용. *)
 
+val set_watch_enter : int -> int -> unit
+(** PC 가 [lo,hi) 에 처음 들어가면 직전 40스텝을 stderr 로. *)
+
+val set_trace_from : int -> int -> unit
+(** PC 가 [pc] 에 도달하면 그 시점부터 [n] 스텝을 stderr 로 트레이스. *)
+
+val set_pc_hist : bool -> unit
+val pc_histogram : unit -> int array
+(** PC 상위 바이트별 실행 횟수 (256 버킷). *)
+
+val set_ldirvm_log : bool -> unit
+(** LDIRVM(0x005C) 호출 추적 on/off — 부트 디버깅용. *)
+
+val ldirvm_log_calls : unit -> (int * int * int) list
+(** (HL=src, DE=dst, BC=len) — set_ldirvm_log true 후 step 에 수집. *)
+
+val vram_hex : t -> int -> int -> unit
+(** VRAM [from] 부터 [len] 바이트 hex 를 stderr 로. *)
+
+val vdp_write_log : t -> (int * int * int) list
+(** VDP 포트 쓰기 로그 — 부트 디버깅용. *)
+
 val debug_dump : t -> unit
 (** VDP 레지스터·VRAM 통계·PPI 를 stderr 로 — 부트 디버깅용. *)
 
