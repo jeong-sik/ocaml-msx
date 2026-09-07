@@ -84,6 +84,7 @@ val tx_state : t -> bool * int * int * int * int
 (** (전송 중, transfer 횟수, 남은 줄, 줄 내 남은 바이트, 현재 Y). *)
 
 val vdp_status0 : t -> int
+val vdp_line : t -> int * int
 (** S#0 현재값 — 부트 디버깅용. *)
 
 val vdp_irq_active : t -> bool

@@ -45,5 +45,8 @@ val regs : t -> int array
 val status0 : t -> int
 (** S#0 현재값 — 인터럽트 디버깅용. *)
 
+val line_now : t -> int * int
+(** (현재 라인, 라인 내 사이클) — 인터럽트 미발사 진단용. *)
+
 val write_log : t -> (int * int * int) list
 (** 최근 4096 포트 쓰기 (port, 래치주소, 값) — 부트 디버깅용. *)

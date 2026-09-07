@@ -104,14 +104,24 @@ let () =
       end;
       ring.(!ridx land 63) <- Msx.dump_pc t;
       incr ridx;
-      if !ridx mod 30 = 0 || (!ridx >= 500 && !ridx <= 525) then begin
+      let dlo, dhi =
+        try
+          let env = Sys.getenv "DENSE" in
+          let c = String.index env ',' in
+          (int_of_string (String.sub env 0 c),
+           int_of_string (String.sub env (c + 1) (String.length env - c - 1)))
+        with Not_found -> (500, 525)
+      in
+      if !ridx mod 30 = 0 || (!ridx >= dlo && !ridx <= dhi) then begin
         let rgb = Msx.frame_rgb t in
         let nb = count_nonblack rgb in
         Printf.eprintf
           "f=%d pc=%04x s0=%02x irq=%b halt=%b R1=%02x nb=%d ppi=%02x sl3=%02x\n%!"
           !ridx (Msx.dump_pc t) (Msx.vdp_status0 t) (Msx.vdp_irq_active t)
           (Msx.cpu_halted t) (Msx.vdp_regs t).(1) nb (Msx.ppi_a t)
-          (Msx.slot3_sel t)
+          (Msx.slot3_sel t);
+        let ln, cy = Msx.vdp_line t in
+        Printf.eprintf "  ln=%d cy=%d R15=%02x\n%!" ln cy (Msx.vdp_regs t).(15)
       end;
       run_frame (n - 1)
     end

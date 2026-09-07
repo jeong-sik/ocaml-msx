@@ -407,6 +407,7 @@ let tx_state t = (t.tx_active, !tx_count, t.tx_ny, t.tx_anx, t.tx_dy)
 let cmd_history t = List.rev t.cmd_log
 let regs t = t.regs
 let status0 t = t.status0
+let line_now t = (t.line, t.cycle_in_line)
 
 let write_log t =
   let n = min t.wlog_i 65536 in
