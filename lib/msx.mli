@@ -48,6 +48,9 @@ val mem_write : t -> int -> int -> unit
 (** 슬롯 매핑을 포함한 주소에 쓴다. ASCII-16 뱅크 레지스터 쓰기도 여기로
     지나간다. *)
 
+val palette_entries : t -> (int * int * int) array
+(** 팔레트 레지스터 16색의 RGB (채널 확대 후). 부트 판정 재료. *)
+
 val set_key : t -> key -> pressed:bool -> bool
 (** 논리 키를 누르거나 뗀다. 키보드 매트릭스 키와 조이스틱 1 버튼
     (Trigger_a/b) 은 true. 자리가 없는 키(표 밖 글자, F6 이상) 는 아무것도

@@ -67,6 +67,19 @@ let () =
   Msx.mem_write m 0x6000 0x13;
   check "bank folds mod 16" (Msx.mem_read m 0x4000 = 3);
 
+  (* 팔레트 0x9A 두 번 쓰기 — Handbook 2.1.2 비트 배치: 첫 바이트 하위 3비트
+     R, 비트 4-6 B; 둘째 바이트 하위 3비트 G. (예전 해석은 R 과 B 를 뒤집고
+     G 를 상위 니블에서 읽었다.) *)
+  let m = Msx.create ~machine in
+  Msx.port_out m 0x99 5;
+  Msx.port_out m 0x99 (0x80 lor 16); (* R#16 = 5 *)
+  Msx.port_out m 0x9A 0x27; (* R=7, B=2 *)
+  Msx.port_out m 0x9A 0x03; (* G=3 *)
+  let r, g, b = (Msx.palette_entries m).(5) in
+  check "palette byte1 low nibble is R" (r = 255);
+  check "palette byte2 low nibble is G" (g = (3 * 255) / 7);
+  check "palette byte1 high nibble is B" (b = (2 * 255) / 7);
+
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1

@@ -204,10 +204,14 @@ let () =
        (int_of_string ("0x" ^ String.sub env (i + 1) (String.length env - i - 1)))
    with Not_found -> ());
   print_string (Msx.screen_text t);
+  (* 팔레트 레지스터 최종값 — GGRRBB 3비트 채널. *)
+  Array.iteri
+    (fun i (r, g, b) -> Printf.printf "pal %2d #%02x%02x%02x\n" i r g b)
+    (Msx.palette_entries t);
   (if !vlog then
      List.iter
        (fun (p, a, v) -> Printf.printf "w %02x a=%05x v=%02x\n" p a v)
-       (List.filter (fun (p, _, _) -> p = 0x99 || p = 0x98 || p = 0x9B)
+       (List.filter (fun (p, _, _) -> p = 0x99 || p = 0x98 || p = 0x9B || p = 0x9A)
           (Msx.vdp_write_log t)));
   let oc = open_out_bin (!out_prefix ^ ".ppm") in
   Printf.fprintf oc "P6\n256 192\n255\n%s" rgb;

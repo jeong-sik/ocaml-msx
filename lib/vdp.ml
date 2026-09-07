@@ -271,6 +271,11 @@ let set_reg t r v =
     if t.tx_active then transfer_byte t v else t.tx_pending <- true
   end
   else if r = 46 then start_command t
+  else if r = 16 then begin
+    (* R#16 이 팔레트 인덱스를 다시 고르면 진행 중이던 RGB 바이트는 버린다.
+       흘러들면 다음 색의 채널이 한 칸 어긋나 특정 채널이 통째로 죽는다. *)
+    t.pal_first <- None
+  end
 
 let palette_rgb t i =
   if i land 0x10 = 0 then grb_to_rgb t.palette.(i land 15)
@@ -318,13 +323,18 @@ let io_write t ~port v =
       t.latch_first <- true
     end
   | 0x9A ->
-    (* 팔레트 데이터: 두 번 연속 쓰기 — 첫 (R<<4|B), 둘째 (G<<4).
-       인덱스는 R#16 이 고르고 자동증가한다. *)
+    (* 팔레트 데이터: 두 번 연속 쓰기 — 첫 바이트 (B<<4|R), 둘째 (G).
+       인덱스는 R#16 이 고르고 두 번 쓰면 자동증가한다. (예전 코드는 첫
+       바이트를 (R<<4|B) 로, G 를 상위 니블로 읽어 빨강·파랑이 뒤집히고
+       녹색이 죽었다 — 실측 576 개의 0x9A 쓰기 전부 G 가 하위 니블이었다.) *)
     (match t.pal_first with
      | None -> t.pal_first <- Some (v land 0xff)
      | Some lo ->
-       let r = (lo lsr 4) land 7 and b = lo land 7 in
-       let g = (v lsr 4) land 7 in
+       (* 정본 MSX2 Technical Handbook 2.1.2: 첫 바이트는 하위 3비트 R,
+          비트 4-6 B (xRRRxBBB), 둘째 바이트 하위 3비트 G. 두 번 쓰면
+          R#16 이 다음 색으로 증가한다. *)
+       let r = lo land 7 and b = (lo lsr 4) land 7 in
+       let g = v land 7 in
        let idx = t.regs.(16) land 0x0f in
        t.palette.(idx) <- (g lsl 8) lor (r lsl 4) lor b;
        t.regs.(16) <- (idx + 1) land 0x0f;
