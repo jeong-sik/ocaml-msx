@@ -37,6 +37,13 @@ MSX2+ 를 OCaml 로 에뮬레이트한다. 최종 목표는 두 개다:
 - 키는 논리 키 주입. `set_key` 는 자리가 있으면 true, 없으면(표 밖 글자, F6 이상) 아무것도 바꾸지 않고 false. 누가 눌렀는지(TUI 사람/keeper)는 코어 밖에서 집합으로 관리한다. 키보드 매트릭스의 정본은 openMSX `unicodemap.int`, 조이스틱 포트(PSG R#14)의 빈 값은 0x3F.
 - 실시간 60fps 는 클라이언트의 선택이고, 코어의 기본은 턴제 스텝이다.
 
+## 관전과 재생
+
+- **재생**: `bin/replay.exe --roms DIR --cart ROM --ledger ledger.jsonl --out-dir DIR` 이 masc 가
+  기록한 입력 원장(`frame, who, key, edge`)을 결정론적으로 다시 돌려 프레임을 PPM 으로 덤프한다.
+  같은 카트리지 + 같은 원장 = 같은 화면(코어는 시계·난수를 안 읽는다). 사후 관전·GIF 용.
+- **라이브 관전**: masc TUI `&` 화면이 서버 프레임을 받아 그린다 (RFC-0439 §3.7, masc PR).
+
 ## 클라이언트
 
 - `bin/msx_demo` — 터미널 half-block 데모. 지금은 스텁 패턴.
