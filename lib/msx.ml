@@ -66,7 +66,14 @@ let mem_read m addr =
         match slot, page with
         | 0, 0 | 0, 1 -> m.main_rom
         | 1, 0 | 1, 1 -> m.main_rom
-        | 0, 2 | 1, 2 | 2, 2 -> m.logo_rom
+        (* 32KB 카트리지는 페이지2(0x8000)까지 붙는다 — 그 위에서 게임이
+           데이터·코드를 읽는다(spelunk-rom-to-.asm "Start in the 2nd
+           slot"). calslt 가 init 호출 시 전 페이지를 카트리지 슬롯으로
+           스왑하므로, 부트 초반 로고(슬롯0 페이지2)와는 시점이 갈린다. *)
+        | 0, 2 | 1, 2 ->
+          m.logo_rom
+        | 2, 2 ->
+          if Bytes.length m.cart > 0x8000 then m.cart else m.logo_rom
         | 2, 0 | 2, 1 ->
           if Bytes.length m.cart > 0x4000 then m.cart else m.main_rom
         | 2, 3 | 1, 3 | 0, 3 -> m.main_rom

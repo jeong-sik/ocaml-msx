@@ -63,6 +63,12 @@ let () =
     Msx.set_watch_mem
       (List.map (fun s -> int_of_string ("0x" ^ s)) (String.split_on_char ',' !watch_mem));
   (try
+     (* WATCH_ENTER_AT 이 있으면 프레임 루프 안에서 그 프레임에 건다 —
+        0x0000 같은 부트 주소를 처음이 아니라 재진입에서 잡으려면. *)
+     ignore (Sys.getenv "WATCH_ENTER_AT");
+     ()
+   with Not_found ->
+   try
      let env = Sys.getenv "WATCH_ENTER" in
      let c = String.index env ',' in
      Msx.set_watch_enter
@@ -71,7 +77,7 @@ let () =
    with Not_found -> Msx.set_watch_enter 0x8000 0xc000);
 (try
    let v = Sys.getenv "TRACE_FROM" in
-   let n = if String.length v > 4 && v.[2] = ':' then int_of_string (String.sub v 3 (String.length v - 3)) else 200 in
+   let c = String.index v (char_of_int 58) in let n = int_of_string (String.sub v (c + 1) (String.length v - c - 1)) in
    Msx.set_trace_from (int_of_string ("0x" ^ String.sub v 0 4)) n
  with Not_found -> ());
   let () = ignore (Msx.ldirvm_log_calls ()) in
@@ -82,16 +88,29 @@ let () =
     if n = 0 then ()
     else begin
       Msx.step t ~frames:1;
+      (try
+         let env = Sys.getenv "WATCH_ENTER_AT" in
+         if !ridx = int_of_string env then begin
+           let e = Sys.getenv "WATCH_ENTER" in
+           let c = String.index e ',' in
+           Msx.set_watch_enter
+             (int_of_string ("0x" ^ String.sub e 0 c))
+             (int_of_string ("0x" ^ String.sub e (c + 1) (String.length e - c - 1)))
+         end
+       with Not_found -> ());
       if !tap_space >= 0 then begin
         if !ridx = !tap_space then Msx.set_key t Space ~pressed:true;
         if !ridx = !tap_space + 5 then Msx.set_key t Space ~pressed:false
       end;
       ring.(!ridx land 63) <- Msx.dump_pc t;
       incr ridx;
-      if !ridx mod 60 = 0 then
-        Printf.eprintf "f=%d pc=%04x s0=%02x irq=%b halt=%b R1=%02x\n%!"
+      if !ridx mod 30 = 0 then begin
+        let rgb = Msx.frame_rgb t in
+        let nb = count_nonblack rgb in
+        Printf.eprintf "f=%d pc=%04x s0=%02x irq=%b halt=%b R1=%02x nb=%d\n%!"
           !ridx (Msx.dump_pc t) (Msx.vdp_status0 t) (Msx.vdp_irq_active t)
-          (Msx.cpu_halted t) (Msx.vdp_regs t).(1);
+          (Msx.cpu_halted t) (Msx.vdp_regs t).(1) nb
+      end;
       run_frame (n - 1)
     end
   in
