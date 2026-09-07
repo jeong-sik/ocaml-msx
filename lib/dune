@@ -1,15 +1,18 @@
 (library
  (name z80core)
+ (public_name ocaml-msx.z80core)
  (wrapped false)
  (modules z80))
 
 (library
  (name vdpcore)
+ (public_name ocaml-msx.vdpcore)
  (wrapped false)
  (modules vdp))
 
 (library
  (name msx)
+ (public_name ocaml-msx.msx)
  (wrapped false)
  (modules msx)
  (libraries z80core vdpcore))
