@@ -79,6 +79,18 @@ val vdp_write_log : t -> (int * int * int) list
 val tx_state : t -> bool * int * int * int * int
 (** (전송 중, transfer 횟수, 남은 줄, 줄 내 남은 바이트, 현재 Y). *)
 
+val vdp_status0 : t -> int
+(** S#0 현재값 — 부트 디버깅용. *)
+
+val vdp_irq_active : t -> bool
+(** VDP 인터럽트 라인 상태 — 부트 디버깅용. *)
+
+val cpu_halted : t -> bool
+(** Z80 HALT 상태 — 부트 디버깅용. *)
+
+val vdp_regs : t -> int array
+(** VDP 레지스터 — 부트 디버깅용. *)
+
 val cmd_history : t -> (int * int * int * int) list
 
 val debug_dump : t -> unit

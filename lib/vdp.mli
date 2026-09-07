@@ -42,5 +42,8 @@ val cmd_history : t -> (int * int * int * int) list
 val regs : t -> int array
 (** 레지스터 0-46 — 하네스 검사용. *)
 
+val status0 : t -> int
+(** S#0 현재값 — 인터럽트 디버깅용. *)
+
 val write_log : t -> (int * int * int) list
 (** 최근 4096 포트 쓰기 (port, 래치주소, 값) — 부트 디버깅용. *)

@@ -7,6 +7,8 @@ let frames = ref 60
 let out_prefix = ref "/tmp/msxboot"
 let vlog = ref false
 let watch_mem = ref ""
+let cart = ref ""
+let tap_space = ref (-1)
 let assert_boot = ref false
 
 let contains_sub hay needle =
@@ -38,6 +40,8 @@ let () =
   Arg.parse
     [ ("--vlog", Arg.Set vlog, "  VDP 포트 쓰기 로그");
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
+      ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
+      ("--tap-space", Arg.Set_int tap_space, "N  N 프레임에 스페이스 탭 (down 5프레임)");
       ("--watch-mem", Arg.Set_string watch_mem, "A,B,C  RAM 쓰기 감시 (hex, 콤마 구분)");
       ("--frames", Arg.Int (fun n -> frames := n), "N  실행할 프레임");
       ("--roms", Arg.String (fun s -> rom_dir := s), "DIR  C-BIOS roms 디렉터리");
@@ -52,12 +56,19 @@ let () =
   let t =
     Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms }
   in
+  if !cart <> "" then Msx.load_cartridge t (read_file !cart);
   Msx.set_ldirvm_log true;
   Msx.set_pc_hist true;
   if !watch_mem <> "" then
     Msx.set_watch_mem
       (List.map (fun s -> int_of_string ("0x" ^ s)) (String.split_on_char ',' !watch_mem));
-  (try Msx.set_watch_enter 0x8000 0xc000 with Not_found -> ());
+  (try
+     let env = Sys.getenv "WATCH_ENTER" in
+     let c = String.index env ',' in
+     Msx.set_watch_enter
+       (int_of_string ("0x" ^ String.sub env 0 c))
+       (int_of_string ("0x" ^ String.sub env (c + 1) (String.length env - c - 1)))
+   with Not_found -> Msx.set_watch_enter 0x8000 0xc000);
 (try
    let v = Sys.getenv "TRACE_FROM" in
    let n = if String.length v > 4 && v.[2] = ':' then int_of_string (String.sub v 3 (String.length v - 3)) else 200 in
@@ -71,8 +82,16 @@ let () =
     if n = 0 then ()
     else begin
       Msx.step t ~frames:1;
+      if !tap_space >= 0 then begin
+        if !ridx = !tap_space then Msx.set_key t Space ~pressed:true;
+        if !ridx = !tap_space + 5 then Msx.set_key t Space ~pressed:false
+      end;
       ring.(!ridx land 63) <- Msx.dump_pc t;
       incr ridx;
+      if !ridx mod 60 = 0 then
+        Printf.eprintf "f=%d pc=%04x s0=%02x irq=%b halt=%b R1=%02x\n%!"
+          !ridx (Msx.dump_pc t) (Msx.vdp_status0 t) (Msx.vdp_irq_active t)
+          (Msx.cpu_halted t) (Msx.vdp_regs t).(1);
       run_frame (n - 1)
     end
   in

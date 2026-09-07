@@ -185,8 +185,10 @@ let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
 
 let load_cartridge t rom =
   t.cart <- Bytes.of_string rom;
-  (* 카트리지는 슬롯1 페이지1 에. *)
-  t.ppi_a <- (t.ppi_a land 0x3f) lor 0x40
+  (* mem_read 은 카트리지를 슬롯2 페이지0·1 에 둔다. 페이지0 을 슬롯2 로
+     돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
+     슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
+  t.ppi_a <- (t.ppi_a land 0xf3) lor 0x08
 
 let key_index k = let r, b = key_matrix k in r * 8 + b
 
@@ -299,6 +301,10 @@ let ldirvm_log_calls () = List.rev !ldirvm_calls
 
 let tx_state t = Vdp.tx_state t.vdp
 let cmd_history t = Vdp.cmd_history t.vdp
+let vdp_status0 t = Vdp.status0 t.vdp
+let vdp_irq_active t = Vdp.int_active t.vdp
+let cpu_halted t = Z80.halted t.cpu
+let vdp_regs t = Vdp.regs t.vdp
 
 let debug_dump t =
   let v = t.vdp in
