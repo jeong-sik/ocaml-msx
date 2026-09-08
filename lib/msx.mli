@@ -170,6 +170,7 @@ val debug_dump : t -> unit
 
 val frame_dims : t -> int * int
 (** Native frame size; query again after a display mode change. *)
+
 val frame_rgb : t -> string
 
 val serialize : t -> string
