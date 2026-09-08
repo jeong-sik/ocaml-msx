@@ -247,4 +247,10 @@ let () =
   Printf.fprintf oc "P6\n256 192\n255\n%s" rgb;
   close_out oc;
   Array.iteri (fun i n -> Printf.printf "trap %d: %d\n" i n) (Msx.disk_trap_counts ());
+  let calls = Msx.fdc_recent_calls () in
+  Printf.printf "fdc touches: %d\n" (Array.length calls);
+  Array.iter
+    (fun (k, port, v) ->
+      Printf.printf "fdc %s %02x <- %02x\n" (if k = 0 then "R" else "W") port v)
+    (Array.sub calls (max 0 (Array.length calls - 24)) (min 24 (Array.length calls)));
   Printf.printf "wrote %s.ppm\n" !out_prefix

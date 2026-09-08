@@ -69,6 +69,23 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    the SCC sound chip is not modelled, only its banking. *)
 type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16
 
+(* WD279x 근사 상태. 즉시-완료 모델: 명령을 받으면 상태 읽기 한 번 안에
+   seek/read 준비를 끝낸다 — 실기 타이밍의 근사이고, 로더가 상태 비트를
+   폴링하는 한 관측상 같다. [buf] 는 READ SECTOR 가 채운 섹터 한 개. *)
+type fdc_state = {
+  mutable cmd : int;         (** 마지막 명령 바이트 — 상태 산출용 *)
+  mutable track : int;       (** 트랙 레지스터 *)
+  mutable sector : int;      (** 섹터 레지스터 *)
+  mutable data : int;        (** 데이터 레지스터 (seek 목적지 포함) *)
+  mutable side : int;        (** 0xD4 bit1 *)
+  mutable motor : bool;      (** 0xD4 bit3 *)
+  mutable busy : bool;
+  mutable drq : bool;
+  mutable intr : bool;
+  buf : Bytes.t;             (** READ SECTOR 버퍼, 512 *)
+  mutable pos : int;
+}
+
 type t = {
   cpu : Z80.t;
   vdp : Vdp.t;
@@ -81,6 +98,9 @@ type t = {
       (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
           window); ASCII16 uses [.(0)]/[.(1)] as 16KB banks. *)
   mutable disk : Dsk.t option;  (** 플로피 이미지 — DSKIO 트랩이 서비스 *)
+  mutable fdc : fdc_state;
+      (** WD279x 컨트롤러 근사: 명령/상태, 트랙·섹터 레지스터, 섹터 버퍼.
+          포트 0xD0-0xD4 로 로더가 직접 말을 건다. *)
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
@@ -276,8 +296,93 @@ let psg_read m =
   | r when r < 16 -> m.psg.(r)
   | _ -> 0xff
 
+(* ---------- FDC (WD279x 근사) — 포트 0xD0-0xD4 ----------
+
+   정본은 openMSX src/fdc/WD2793.cc. 즉시-완료 모델: RESTORE/SEEK 은 상태
+   읽기 한 번 안에 끝나고, READ SECTOR 는 명령 받는 순간 버퍼를 채워
+   DRQ 를 올린다 — 로더가 상태 비트를 폴링하는 한 실기와 관측이 같다.
+   논리 섹터 = (track*2 + side)*9 + (sector-1). *)
+
+let fdc_log : (int * int * int) array = Array.make 256 (0, 0, 0)
+let fdc_log_i = ref 0
+let fdc_note kind port v =
+  fdc_log.(!fdc_log_i land 255) <- (kind, port, v);
+  incr fdc_log_i
+
+let fdc_status m =
+  let f = m.fdc in
+  (* READ 계열 진행 중이면 DRQ, 아니면 ready(0). not-ready 는 디스크가
+     없을 때만 — 있으면 언제나 ready. *)
+  let base = if Option.is_none m.disk then 0x80 else 0x00 in
+  let drq = if f.drq then 0x02 else 0x00 in
+  let busy = if f.busy then 0x01 else 0x00 in
+  base lor drq lor busy
+
+let fdc_load_sector m =
+  let f = m.fdc in
+  match m.disk with
+  | None -> f.drq <- false
+  | Some d -> (
+      let logical = ((f.track * 2) + f.side) * 9 + (f.sector - 1) in
+      match Dsk.read_sector d logical with
+      | Some (b : string) ->
+          Bytes.blit_string b 0 f.buf 0 (String.length b);
+          f.pos <- 0;
+          f.drq <- true;
+          f.busy <- true
+      | None -> f.drq <- false)
+
+let fdc_write m port v =
+  let f = m.fdc in
+  match port land 0xff with
+  | 0xD0 ->
+      fdc_note 1 0xD0 v;
+      f.cmd <- v land 0xf0;
+      (match v land 0xf0 with
+       | 0x00 -> f.track <- 0; f.intr <- true (* RESTORE *)
+       | 0x10 -> f.track <- f.data; f.intr <- true (* SEEK *)
+       | 0x80 | 0x90 | 0xA0 | 0xB0 -> fdc_load_sector m (* READ SECTOR *)
+       | 0xC0 -> f.intr <- true (* READ ADDRESS — 최소 *)
+       | 0xD0 -> f.busy <- false; f.intr <- true (* FORCE INTERRUPT *)
+       | _ -> f.intr <- true)
+  | 0xD1 -> f.track <- v land 0xff
+  | 0xD2 -> f.sector <- v land 0xff
+  | 0xD3 -> f.data <- v land 0xff
+  | 0xD4 ->
+      (* 시스템 컨트롤: bit1 side, bit3 motor (배선은 로더 로그로 맞춘다). *)
+      fdc_note 1 0xD4 v;
+      f.side <- (v lsr 1) land 1;
+      f.motor <- v land 0x08 <> 0
+  | _ -> ()
+
+let fdc_read m port =
+  let f = m.fdc in
+  match port land 0xff with
+  | 0xD0 ->
+      let st = fdc_status m in
+      fdc_note 0 0xD0 st;
+      (* 상태 읽기가 seek 완료를 소비한다 — 즉시-완료 모델의 표현. *)
+      f.busy <- false;
+      st
+  | 0xD1 -> f.track
+  | 0xD2 -> f.sector
+  | 0xD3 ->
+      let b = Char.code (Bytes.get f.buf f.pos) in
+      if f.pos < 511 then f.pos <- f.pos + 1
+      else begin
+        f.drq <- false;
+        f.intr <- true
+      end;
+      fdc_note 0 0xD3 b;
+      b
+  | _ -> 0xff
+
+let fdc_recent_calls () =
+  Array.init (min !fdc_log_i 256) (fun k -> fdc_log.((!fdc_log_i - min !fdc_log_i 256 + k) land 255))
+
 let port_read m port =
   match port land 0xff with
+  | 0xD0 | 0xD1 | 0xD2 | 0xD3 -> fdc_read m port
   | 0x98 -> Vdp.io_read m.vdp ~port:0x98
   | 0x99 -> Vdp.io_read m.vdp ~port:0x99
   | 0xA8 -> m.ppi_a
@@ -299,6 +404,7 @@ let port_read m port =
 
 let port_write m port v =
   match port land 0xff with
+  | 0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xD4 -> fdc_write m port v
   | 0x98 | 0x99 | 0x9A | 0x9B -> Vdp.io_write m.vdp ~port:(port land 0xff) v
   | 0xA8 -> m.ppi_a <- v land 0xff
   | 0xAA -> m.ppi_c <- v land 0xff
@@ -344,6 +450,10 @@ let create ~machine =
       cart_mapper = Flat;
       cart_banks = [| 0; 1; 2; 3 |];
       disk = None;
+      fdc =
+        { cmd = 0; track = 0; sector = 1; data = 0; side = 0; motor = false;
+          busy = false; drq = false; intr = false; buf = Bytes.make 512 '\x00';
+          pos = 0 };
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
       ppi_a = 0x00;
