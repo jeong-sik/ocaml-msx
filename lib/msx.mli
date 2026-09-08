@@ -76,6 +76,10 @@ val set_disk_call_log : bool -> unit
 val disk_call_entries : unit -> (int * int * int * int * int * int) list
 (** [(pc, a, bc, de, hl, f)] per disk BIOS entry, in order. *)
 
+val bdos_counts : unit -> int array
+(** Per-function BDOS call counts indexed by function number — which
+    functions a loader actually exercises. For boot diagnosis. *)
+
 val set_key : t -> key -> pressed:bool -> bool
 (** 논리 키를 누르거나 뗀다. 키보드 매트릭스 키와 조이스틱 1 버튼
     (Trigger_a/b) 은 true. 자리가 없는 키(표 밖 글자, F6 이상) 는 아무것도

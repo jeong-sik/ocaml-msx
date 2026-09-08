@@ -90,8 +90,10 @@ type t = {
       (** the floppy image, 512 bytes a sector (empty = no drive). The disk
           interface ROM itself rides in [cart]; see [load_disk]. *)
   mutable disk_dma : int;  (** BDOS transfer address, set by function 0x1A *)
-  mutable disk_open : Bytes.t option;
-      (** bytes of the file the last BDOS Open (0x0F) found, for Read Block. *)
+  bdos_files : (int, Bytes.t * int) Hashtbl.t;
+      (** FCB 주소 → (파일 내용, 읽은 위치) — BDOS 스텁의 서버 쪽 상태.
+          로더가 여러 FCB 를 번갈아 열기 때문에 마지막 파일 하나로는
+          부족하다 (삼국지2 는 _OPEN 을 6번 부른다). *)
   mutable con_esc : int;
       (** VT52 escape-sequence state for the BDOS console: 0=plain, 1=after
           ESC, 2=after "ESC Y" (row byte next), 3=column byte next. *)
@@ -376,7 +378,7 @@ let create ~machine =
       cart_sram_bit = 0;
       disk = Bytes.make 0 '\000';
       disk_dma = 0x0080;
-      disk_open = None;
+      bdos_files = Hashtbl.create 4;
       con_esc = 0;
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
@@ -445,6 +447,10 @@ let disk_calls : (int * int * int * int * int * int) list ref = ref []
 let disk_call_log = ref false
 let set_disk_call_log b = disk_call_log := b
 let disk_call_entries () = List.rev !disk_calls
+
+(* Per-function BDOS call counts, for boot diagnosis: which functions a
+   loader actually exercises (_RDBLK 27 calls in Sangokushi II's loader). *)
+let bdos_call_counts : int array = Array.make 256 0
 
 let disk_rom_bytes () =
   let rom = Bytes.make 0x4000 '\xc9' (* every unentered byte is a RET *) in
@@ -568,12 +574,14 @@ let fat12_open t name11 =
 
 let load_disk t dsk =
   t.disk <- Bytes.of_string dsk;
-  t.disk_open <- None;
+  Hashtbl.reset t.bdos_files;
   t.disk_dma <- 0x0080;
   (* The interface ROM occupies the cartridge slot; loading it the cart way puts
      it in slot 2 page 1 with page 1 selected, so C-BIOS finds the "AB" header
      and calls INIT -- the proven path a game cart takes. *)
   load_cartridge ~mapper:Flat t (disk_rom_bytes ())
+
+let bdos_counts () = bdos_call_counts
 
 (* Serviced in the step loop before the opcode at [pc] runs. Returns true when
    [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
@@ -633,25 +641,36 @@ let disk_trap t pc =
     true
   end
   else if pc = disk_bdos_entry then begin
-    (* MSX DISK-BASIC system call (C = function). Only the file-load path the
-       boot uses is served, against the FAT12 image: Open File (0x0F), Set DMA
-       (0x1A), Random block read (0x27). A=0 success, A=0xFF failure -- the boot
-       does INC A / JR Z, so 0 continues and 0xFF branches to its error path. *)
+    (* MSX DISK-BASIC system call (C = function). The file-load path the boot
+       uses is served against the FAT12 image; per-file state lives in
+       [bdos_files] keyed by the FCB address. A=0 success, A=0xFF failure --
+       the boot does INC A / JR Z, so 0 continues and 0xFF branches to its
+       error path. _RDBLK reads from the FCB's random-record field and
+       advances it, the way a real MSX-DOS leaves it for the next call --
+       Sangokushi II's loader issues 27 back-to-back _RDBLK calls this way. *)
     let c = Z80.dump_bc t.cpu land 0xff in
     let de = Z80.dump_de t.cpu in
     let fcb i = mem_read t ((de + i) land 0xffff) in
+    bdos_call_counts.(c) <- bdos_call_counts.(c) + 1;
     if !disk_call_log then
       disk_calls := (pc, c, Z80.dump_bc t.cpu, de, Z80.dump_hl t.cpu, Z80.dump_f t.cpu)
                     :: !disk_calls;
     let a =
       match c with
+      | 0x06 ->
+        (* _DIRIO: console in/out. No console -- an input poll (E=0xFF) gets
+           "no character ready" (A=0), output is consumed. *)
+        0x00
+      | 0x09 ->
+        (* _STROUT: print a '$'-terminated string -- consumed, no console. *)
+        0x00
       | 0x0f -> (
         let name = String.init 11 (fun i -> Char.chr (fcb (1 + i))) in
         match fat12_open t name with
         | Some data ->
           if !disk_call_log then
             Printf.eprintf "BDOS open '%s' -> %d bytes\n%!" name (Bytes.length data);
-          t.disk_open <- Some data;
+          Hashtbl.replace t.bdos_files de (data, 0);
           let sz = Bytes.length data in
           mem_write t ((de + 0x10) land 0xffff) (sz land 0xff);
           mem_write t ((de + 0x11) land 0xffff) ((sz lsr 8) land 0xff);
@@ -661,6 +680,30 @@ let disk_trap t pc =
         | None ->
           if !disk_call_log then Printf.eprintf "BDOS open '%s' -> NOT FOUND\n%!" name;
           0xff)
+      | 0x10 ->
+        (* _CLOSE: drop the server-side file state. *)
+        Hashtbl.remove t.bdos_files de;
+        0x00
+      | 0x14 -> (
+        (* _RDSEQ: one record (FCB+0x0E, default 128) from the sequential
+           position to the DMA address. A=1 on end-of-file, the CP/M code. *)
+        match Hashtbl.find_opt t.bdos_files de with
+        | None -> 0xff
+        | Some (data, pos) ->
+          let rec_size =
+            let r = fcb 0x0e lor (fcb 0x0f lsl 8) in
+            if r = 0 then 128 else r
+          in
+          let take = min rec_size (Bytes.length data - pos) in
+          if take <= 0 then 1
+          else begin
+            for i = 0 to take - 1 do
+              mem_write t ((t.disk_dma + i) land 0xffff)
+                (Char.code (Bytes.get data (pos + i)))
+            done;
+            Hashtbl.replace t.bdos_files de (data, pos + take);
+            0x00
+          end)
       | 0x1a ->
         t.disk_dma <- de;
         0x00
@@ -718,9 +761,9 @@ let disk_trap t pc =
         disk_transfer t ~write:false ~sector ~count ~addr:t.disk_dma;
         0x00
       | 0x27 -> (
-        match t.disk_open with
+        match Hashtbl.find_opt t.bdos_files de with
         | None -> 0xff
-        | Some data ->
+        | Some (data, pos) ->
           let rec_size =
             let r = fcb 0x0e lor (fcb 0x0f lsl 8) in
             if r = 0 then 128 else r
@@ -729,13 +772,20 @@ let disk_trap t pc =
             fcb 0x21 lor (fcb 0x22 lsl 8) lor (fcb 0x23 lsl 16) lor (fcb 0x24 lsl 24)
           in
           let count = Z80.dump_hl t.cpu in
-          let start = rand_rec * rec_size in
+          (* 랜덤 레코드 0 은 "서버의 순차 위치" — 호출부가 새 FCB 없이 이어
+             부르는 경우 실기처럼 이어진다. *)
+          let start = if rand_rec = 0 then pos else rand_rec * rec_size in
           let want = count * rec_size in
           let avail = max 0 (Bytes.length data - start) in
           let n = min want avail in
           for i = 0 to n - 1 do
             mem_write t ((t.disk_dma + i) land 0xffff) (Char.code (Bytes.get data (start + i)))
           done;
+          let next_rec = (start / rec_size) + (n / rec_size) in
+          mem_write t ((de + 0x21) land 0xffff) (next_rec land 0xff);
+          mem_write t ((de + 0x22) land 0xffff) ((next_rec lsr 8) land 0xff);
+          mem_write t ((de + 0x23) land 0xffff) ((next_rec lsr 16) land 0xff);
+          Hashtbl.replace t.bdos_files de (data, start + n);
           Z80.set_hl t.cpu (n / rec_size);
           if n < want then 0x01 else 0x00)
       | _ -> 0xff

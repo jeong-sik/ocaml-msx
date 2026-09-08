@@ -434,7 +434,14 @@ let mode_text t = t.regs.(1) land 0x10 <> 0
 let mode_g2 t =
   not (mode_text t) && t.regs.(0) land 0x02 <> 0
   && t.regs.(0) land 0x04 = 0
-let mode_s5 t = not (mode_text t) && t.regs.(0) land 0x06 = 0x06
+(* G4(SCREEN5) 는 M5 가 꺼져 있다 — 0x06 마스크만으론 SCREEN8(M5+M4+M3,
+   R0=0x0E) 도 걸려버린다. *)
+let mode_s5 t =
+  not (mode_text t) && t.regs.(0) land 0x08 = 0 && t.regs.(0) land 0x06 = 0x06
+
+(* SCREEN6/7/8 — 512폭 비트맵 계열(GRAPHIC 5/6/7). R0 bit3 이 이 셋의
+   공통 비트(GRAPHIC 4 는 bit3=0 이라 mode_s5 가 먼저 잡는다). *)
+let mode_bitmap_hi t = not (mode_text t) && t.regs.(0) land 0x08 <> 0
 
 (* V9938 화면 모드표 (application manual 표 "screen mode register bits";
    openMSX DisplayMode 의 base 코드와 같은 비트 배치 M1=bit0 … M5=bit4).
@@ -600,6 +607,57 @@ let frame_rgb t =
           done
         done
       done
+    end
+    else if mode_bitmap_hi t then begin
+      (* SCREEN6/7/8 비트맵. MSX2 Technical Handbook 4장: GRAPHIC 5 는
+         ADR = X/4 + Y*128, GRAPHIC 6 은 X/2 + Y*256, GRAPHIC 7 은
+         X + Y*256. 베이스는 GRAPHIC 6/7 이 R#2 A16(bit6) 만으로 64K 단위
+         두 값, GRAPHIC 5 는 bits6-5 로 32K 단위. 512폭을 256 캔버스에
+         줄일 때 원본 인접 2픽셀(2x, 2x+1)의 RGB 평균을 쓴다 — 한쪽만
+         고르면 50% 디더링이 moiré 로 남는다 (삼국지2 타이틀 실측). *)
+      let mix i (r0, g0, b0) (r1, g1, b1) =
+        Bytes.set img i (Char.chr ((r0 + r1) / 2));
+        Bytes.set img (i + 1) (Char.chr ((g0 + g1) / 2));
+        Bytes.set img (i + 2) (Char.chr ((b0 + b1) / 2))
+      in
+      match display_mode t with
+      | Graphic5 ->
+          (* 2bpp 4px/바이트. 캔버스 x 의 원본 픽셀쌍 (2x, 2x+1) 은
+             항상 같은 바이트 안에 있다 — 2x mod 4 가 0 또는 2. *)
+          let px b k = palette_rgb t ((b lsr (6 - (k * 2))) land 3) in
+          for y = 0 to h - 1 do
+            for x = 0 to w - 1 do
+              let b = vr (((r.(2) lsr 5) land 3) * 0x8000 + (y * 128) + (x lsr 1)) in
+              let k = (x lsl 1) land 3 in
+              mix ((y * w + x) * 3) (px b k) (px b (k + 1))
+            done
+          done
+      | Graphic6 ->
+          (* 4bpp 2px/바이트 — 상위/하위 니블이 곧 픽셀쌍. *)
+          for y = 0 to h - 1 do
+            for x = 0 to w - 1 do
+              let b = vr (((r.(2) lsr 6) land 1) * 0x10000 + (y * 256) + x) in
+              mix ((y * w + x) * 3)
+                (palette_rgb t (b lsr 4))
+                (palette_rgb t (b land 15))
+            done
+          done
+      | Graphic7 ->
+          (* 8bpp — 바이트는 R3G3B2 고정 팔레트, 팔레트 RAM 을 안 쓴다. *)
+          let rgb b =
+            ( ((b lsr 5) land 7) * 255 / 7,
+              ((b lsr 2) land 7) * 255 / 7,
+              (b land 3) * 255 / 3 )
+          in
+          for y = 0 to h - 1 do
+            for x = 0 to w - 1 do
+              let base = ((r.(2) lsr 6) land 1) * 0x10000 + (y * 256) in
+              mix ((y * w + x) * 3)
+                (rgb (vr (base + (x * 2))))
+                (rgb (vr (base + (x * 2 + 1))))
+            done
+          done
+      | _ -> ()
     end
     else begin
       let g2 = mode_g2 t in

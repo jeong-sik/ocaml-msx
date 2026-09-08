@@ -191,7 +191,8 @@ let () =
       if i mod 3 = 0 && (b > 8 || Char.code rgb.[i + 1] > 8 || Char.code rgb.[i + 2] > 8) then
         incr nonblack)
     rgb;
-  Printf.printf "frames=%d pc=%04x nonblack=%d\n%!" !frames (Msx.dump_pc t) !nonblack;
+  Printf.printf "frames=%d pc=%04x nonblack=%d mode=%s\n%!" !frames (Msx.dump_pc t) !nonblack
+    (Msx.display_mode_to_string (Msx.display_mode t));
   if !disk <> "" then begin
     let calls = Msx.disk_call_entries () in
     Printf.printf "disk calls=%d\n" (List.length calls);
@@ -200,9 +201,56 @@ let () =
         if i < 20 then
           Printf.printf "  disk @%04x a=%02x bc=%04x de(sec)=%04x hl(addr)=%04x f=%02x\n"
             pc a bc de hl f)
-      calls
+      calls;
+    Array.iteri
+      (fun i n -> if n > 0 then Printf.printf "bdos %02x: %d\n" i n)
+      (Msx.bdos_counts ())
   end;
   Msx.debug_dump t;
+  (* SCREEN7 판정 보조: 64K 페이지별로 256바이트 줄(한 표시 줄)의 non-zero
+     바이트 수. 한 줄 걸러 비면 인터레이스, 반대 페이지에 있으면 베이스
+     오산정, 골고루 차 있으면 렌더 버그. *)
+  (try
+     ignore (Sys.getenv "ROWSTAT");
+     for p = 0 to 1 do
+       let base = p * 0x10000 in
+       Printf.eprintf "rows page%d:\n%!" p;
+       for y = 0 to 211 do
+         let c = ref 0 in
+         for x = 0 to 255 do
+           if Msx.vram_read t (base + (y * 256) + x) <> 0 then incr c
+         done;
+         Printf.eprintf "%d " !c;
+         if y mod 32 = 31 then Printf.eprintf "\n%!"
+       done;
+       Printf.eprintf "\n%!"
+     done
+   with Not_found -> ());
+  (* SCREEN7 진단: 페이지마다 렌더러와 같은 패킹(2px/바이트, 256B/줄)으로
+     전폭 512×212 덤프 — R#2 가 고른 페이지와 그림이 실제로 있는 페이지가
+     갈리는지, 다운샘플이 무늬를 부수는지 본다 (삼국지2 moire 실측). *)
+  (try
+     let n = int_of_string (Sys.getenv "G6_PAGES") in
+     let pal = Msx.palette_entries t in
+     for p = 0 to n - 1 do
+       let base = p * 0x10000 in
+       let img = Bytes.make (512 * 212 * 3) '\000' in
+       for y = 0 to 211 do
+         for x = 0 to 511 do
+           let b = Msx.vram_read t (base + (y * 256) + (x lsr 1)) in
+           let nib = if x land 1 = 0 then b lsr 4 else b land 15 in
+           let r, g, bl = pal.(nib) in
+           let i = (y * 512 + x) * 3 in
+           Bytes.set img i (Char.chr r);
+           Bytes.set img (i + 1) (Char.chr g);
+           Bytes.set img (i + 2) (Char.chr bl)
+         done
+       done;
+       let oc = open_out_bin (Printf.sprintf "%s.g6p%d.ppm" !out_prefix p) in
+       Printf.fprintf oc "P6\n512 212\n255\n%s" (Bytes.to_string img);
+       close_out oc
+     done
+   with Not_found -> ());
   let (active, n, ny, anx, dy) = Msx.tx_state t in
   Printf.printf "tx active=%b count=%d ny=%d anx=%d dy=%d\n" active n ny anx dy;
   List.iter
