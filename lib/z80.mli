@@ -53,4 +53,6 @@ val dump_hl : t -> int
 val dump_f : t -> int
 val dump_ix : t -> int
 val dump_iy : t -> int
+val set_ix : t -> int -> unit
+val set_iy : t -> int -> unit
 val dump_sp : t -> int

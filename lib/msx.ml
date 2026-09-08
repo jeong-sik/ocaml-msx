@@ -67,7 +67,7 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    register. [Flat] is the plain 16/32KB cart with no banking. The four here are
    the common ones (openMSX RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16);
    the SCC sound chip is not modelled, only its banking. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16
+type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
 
 type t = {
   cpu : Z80.t;
@@ -80,6 +80,21 @@ type t = {
   cart_banks : int array;
       (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
           window); ASCII16 uses [.(0)]/[.(1)] as 16KB banks. *)
+  mutable cart_sram : Bytes.t;
+      (** battery RAM for an [Ascii8_sram] (Koei) cart: a bank whose value has
+          [cart_sram_bit] set reads/writes here instead of ROM. Empty otherwise. *)
+  mutable cart_sram_bit : int;
+      (** the bank-value bit that selects SRAM (just above the ROM's segment
+          range), e.g. 0x20 for a 256KB cart. *)
+  mutable disk : Bytes.t;
+      (** the floppy image, 512 bytes a sector (empty = no drive). The disk
+          interface ROM itself rides in [cart]; see [load_disk]. *)
+  mutable disk_dma : int;  (** BDOS transfer address, set by function 0x1A *)
+  mutable disk_open : Bytes.t option;
+      (** bytes of the file the last BDOS Open (0x0F) found, for Read Block. *)
+  mutable con_esc : int;
+      (** VT52 escape-sequence state for the BDOS console: 0=plain, 1=after
+          ESC, 2=after "ESC Y" (row byte next), 3=column byte next. *)
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
@@ -99,7 +114,7 @@ let rom_or_empty = function "" -> Bytes.make 0x4000 '\000' | s -> Bytes.of_strin
    16KB bank into its two 8KB halves. *)
 let cart_seg8 m w =
   match m.cart_mapper with
-  | Konami | Konami_scc | Ascii8 -> m.cart_banks.(w)
+  | Konami | Konami_scc | Ascii8 | Ascii8_sram -> m.cart_banks.(w)
   | Ascii16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
   | Flat -> w
 
@@ -119,7 +134,7 @@ let cart_bank_write m a v =
   | Konami_scc ->
     (* Register at 0x5000/0x7000/0x9000/0xB000: (a land 0x1800) = 0x1000. *)
     if a land 0x1800 = 0x1000 then m.cart_banks.((a lsr 13) - 2) <- v
-  | Ascii8 ->
+  | Ascii8 | Ascii8_sram ->
     (match a land 0xf800 with
      | 0x6000 -> m.cart_banks.(0) <- v
      | 0x6800 -> m.cart_banks.(1) <- v
@@ -156,7 +171,10 @@ let guess_mapper rom =
         (match addr with 0x6000 | 0x7000 -> incr a16 | _ -> ())
       end
     done;
-    if !a8 > 0 && !a8 >= !scc && !a8 >= !konami then Ascii8
+    (* ASCII8 detection returns the SRAM-capable variant: the SRAM only engages
+       when a bank sets its select bit (Koei games do; plain ASCII8 never does),
+       so it is a safe superset and lets Koei carts boot without an override. *)
+    if !a8 > 0 && !a8 >= !scc && !a8 >= !konami then Ascii8_sram
     else if !scc > 0 && !scc >= !konami then Konami_scc
     else if !konami > 0 then Konami
     else if !a16 > 0 then Ascii16
@@ -180,9 +198,23 @@ let mem_read m addr =
   then begin
     (* MegaROM: 0x4000-0xBFFF is four 8KB windows, each showing the segment its
        bank register selects. The cart sits in slot 2 (see load_cartridge). *)
-    let seg = cart_seg8 m ((a lsr 13) - 2) in
-    let off = (seg * 0x2000) + (a land 0x1fff) in
-    Char.code (Bytes.get m.cart (off mod Bytes.length m.cart))
+    let w = (a lsr 13) - 2 in
+    let bank = m.cart_banks.(w) in
+    if
+      m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
+      && bank land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
+    then begin
+      (* A Koei cart maps its battery RAM into a window whose bank has the SRAM
+         bit; the low bits pick the 8KB SRAM page. *)
+      let pages = Bytes.length m.cart_sram / 0x2000 in
+      let off = ((bank land (pages - 1)) * 0x2000) + (a land 0x1fff) in
+      Char.code (Bytes.get m.cart_sram off)
+    end
+    else begin
+      let seg = cart_seg8 m w in
+      let off = (seg * 0x2000) + (a land 0x1fff) in
+      Char.code (Bytes.get m.cart (off mod Bytes.length m.cart))
+    end
   end
   else begin
     let off = a land 0x3fff in
@@ -239,9 +271,21 @@ let mem_write m addr v =
   if a = 0xffff && slot = 3 then m.slot3_sel <- v land 0xff
   else if
     slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
-  then
-    (* A write into the cart window is a bank select, not a store. *)
-    cart_bank_write m a (v land 0xff)
+  then begin
+    let w = (a lsr 13) - 2 in
+    if
+      a >= 0x8000 && m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
+      && m.cart_banks.(w) land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
+    then begin
+      (* A store into a window mapped to battery RAM lands in the SRAM. *)
+      let pages = Bytes.length m.cart_sram / 0x2000 in
+      let off = ((m.cart_banks.(w) land (pages - 1)) * 0x2000) + (a land 0x1fff) in
+      Bytes.set m.cart_sram off (Char.chr (v land 0xff))
+    end
+    else
+      (* Otherwise a write into the cart window is a bank select, not a store. *)
+      cart_bank_write m a (v land 0xff)
+  end
   else if slot = 3 && (m.slot3_sel land 3 = 2 || page = 3) then begin
     let seg = m.mapper.(page) in
     let base = ((seg * 0x4000) + (a land 0x3fff)) mod (Bytes.length m.ram) in
@@ -328,6 +372,12 @@ let create ~machine =
       cart = Bytes.make 0 '\000';
       cart_mapper = Flat;
       cart_banks = [| 0; 1; 2; 3 |];
+      cart_sram = Bytes.make 0 '\000';
+      cart_sram_bit = 0;
+      disk = Bytes.make 0 '\000';
+      disk_dma = 0x0080;
+      disk_open = None;
+      con_esc = 0;
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
       ppi_a = 0x00;
@@ -357,10 +407,347 @@ let load_cartridge ?mapper t rom =
   t.cart_banks.(1) <- 1;
   t.cart_banks.(2) <- 2;
   t.cart_banks.(3) <- 3;
+  (* A Koei cart gets 32KB of battery RAM (covers KoeiSRAM8 and KoeiSRAM32); the
+     SRAM-select bit is the first bit above the ROM's segment range. *)
+  (match t.cart_mapper with
+   | Ascii8_sram ->
+     let nseg = (String.length rom + 0x1fff) / 0x2000 in
+     let bit = ref 1 in
+     while !bit < nseg do bit := !bit lsl 1 done;
+     t.cart_sram_bit <- !bit;
+     t.cart_sram <- Bytes.make 0x8000 '\000'
+   | _ ->
+     t.cart_sram_bit <- 0;
+     t.cart_sram <- Bytes.make 0 '\000');
   (* mem_read 은 카트리지를 슬롯2 페이지0·1 에 둔다. 페이지0 을 슬롯2 로
      돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
   t.ppi_a <- (t.ppi_a land 0xf3) lor 0x08
+
+(* --- Disk interface (HLE) -------------------------------------------------
+   A game disk boots through a disk interface ROM that rides in the cartridge
+   slot: C-BIOS finds its "AB" header and calls INIT, the same slot path a game
+   cart uses. The ROM's BIOS entries are not WD2793 code but addresses the step
+   loop traps ([disk_trap]); the trap moves whole 512-byte sectors between the
+   .dsk image and RAM in OCaml. No floppy controller is emulated -- the sector
+   transfer is the whole model. *)
+
+let disk_sector_bytes = 512
+let disk_init_entry = 0x4100 (* the "AB" INIT vector; C-BIOS CALLSLTs here *)
+let disk_dskio_entry = 0x4010 (* DSKIO; the standard disk BIOS jumptable offset *)
+let disk_inienv_entry = 0x4030 (* INIENV; the MSX-DOS kernel init calls this first *)
+let disk_bdos_entry = 0xf37d (* MSX DISK-BASIC system-call entry; C = function *)
+let disk_boot_addr = 0xc000 (* boot sector lands here; entry at +0x1e *)
+
+(* Observation: every disk BIOS entry the boot code hits, so an offline run can
+   show what convention the .dsk expects (which addresses, which registers). *)
+let disk_calls : (int * int * int * int * int * int) list ref = ref []
+let disk_call_log = ref false
+let set_disk_call_log b = disk_call_log := b
+let disk_call_entries () = List.rev !disk_calls
+
+let disk_rom_bytes () =
+  let rom = Bytes.make 0x4000 '\xc9' (* every unentered byte is a RET *) in
+  Bytes.set rom 0 'A';
+  Bytes.set rom 1 'B';
+  Bytes.set rom 2 (Char.chr (disk_init_entry land 0xff));
+  Bytes.set rom 3 (Char.chr ((disk_init_entry lsr 8) land 0xff));
+  Bytes.to_string rom
+
+(* Move [count] 512-byte sectors between the disk image and RAM. [write] false
+   reads disk -> RAM. Sectors past the image read as zero and drop on write, the
+   way a real controller reports a seek error; the caller sets the flags. *)
+let disk_transfer t ~write ~sector ~count ~addr =
+  let len = Bytes.length t.disk in
+  for s = 0 to count - 1 do
+    let disk_off = (sector + s) * disk_sector_bytes in
+    for i = 0 to disk_sector_bytes - 1 do
+      let mem = (addr + (s * disk_sector_bytes) + i) land 0xffff in
+      let doff = disk_off + i in
+      if write then begin
+        if doff < len then Bytes.set t.disk doff (Char.chr (mem_read t mem))
+      end
+      else begin
+        let v = if doff < len then Char.code (Bytes.get t.disk doff) else 0 in
+        mem_write t mem v
+      end
+    done
+  done
+
+(* --- FAT12 read-only file system on the .dsk image -----------------------
+   Enough of FAT12 to find a file in the root directory and read its bytes, so
+   the BDOS trap can load MSXDOS.SYS (and whatever the boot opens). The BPB is in
+   the boot sector; only fields the reader needs are decoded. *)
+
+let dsk_u8 t off = if off < Bytes.length t.disk then Char.code (Bytes.get t.disk off) else 0
+let dsk_u16 t off = dsk_u8 t off lor (dsk_u8 t (off + 1) lsl 8)
+
+let rec ilog2 n = if n <= 1 then 0 else 1 + ilog2 (n / 2)
+
+type fat12 = {
+  bytes_per_sec : int;
+  sec_per_clus : int;
+  sec_per_fat : int;
+  root_start_sec : int;
+  root_entries : int;
+  data_start_sec : int;
+  fat_start_sec : int;
+}
+
+let fat12_of t =
+  let bytes_per_sec = dsk_u16 t 0x0b in
+  let sec_per_clus = dsk_u8 t 0x0d in
+  let reserved = dsk_u16 t 0x0e in
+  let num_fats = dsk_u8 t 0x10 in
+  let root_entries = dsk_u16 t 0x11 in
+  let sec_per_fat = dsk_u16 t 0x16 in
+  let root_start_sec = reserved + (num_fats * sec_per_fat) in
+  let root_sectors = ((root_entries * 32) + bytes_per_sec - 1) / bytes_per_sec in
+  { bytes_per_sec; sec_per_clus; sec_per_fat; root_start_sec; root_entries;
+    data_start_sec = root_start_sec + root_sectors; fat_start_sec = reserved }
+
+(* Next cluster in the FAT12 chain (12 bits packed, low/high nibble by parity). *)
+let fat12_next t fs cluster =
+  let base = fs.fat_start_sec * fs.bytes_per_sec in
+  let off = base + (cluster * 3 / 2) in
+  let v = dsk_u8 t off lor (dsk_u8 t (off + 1) lsl 8) in
+  if cluster land 1 = 0 then v land 0xfff else (v lsr 4) land 0xfff
+
+(* The 11-byte directory name (8+3, space padded) of the root entry, uppercased
+   the way a stored FAT name already is. *)
+let fat12_find t fs name11 =
+  let entry_at i = (fs.root_start_sec * fs.bytes_per_sec) + (i * 32) in
+  let rec scan i =
+    if i >= fs.root_entries then None
+    else
+      let e = entry_at i in
+      let first = dsk_u8 t e in
+      if first = 0x00 then None (* no more entries *)
+      else if first = 0xe5 then scan (i + 1) (* deleted *)
+      else
+        let matches = ref true in
+        for k = 0 to 10 do
+          if dsk_u8 t (e + k) <> Char.code name11.[k] then matches := false
+        done;
+        if !matches then Some e else scan (i + 1)
+  in
+  scan 0
+
+(* The whole file's bytes, walking its cluster chain up to the directory size. *)
+let fat12_read t fs dir_entry =
+  let start = dsk_u16 t (dir_entry + 0x1a) in
+  let size =
+    dsk_u8 t (dir_entry + 0x1c)
+    lor (dsk_u8 t (dir_entry + 0x1d) lsl 8)
+    lor (dsk_u8 t (dir_entry + 0x1e) lsl 16)
+    lor (dsk_u8 t (dir_entry + 0x1f) lsl 24)
+  in
+  let out = Buffer.create size in
+  let clus_bytes = fs.sec_per_clus * fs.bytes_per_sec in
+  let rec walk cluster =
+    if cluster < 2 || cluster >= 0xff8 || Buffer.length out >= size then ()
+    else begin
+      let sec = fs.data_start_sec + ((cluster - 2) * fs.sec_per_clus) in
+      let off = sec * fs.bytes_per_sec in
+      for i = 0 to clus_bytes - 1 do
+        if Buffer.length out < size then Buffer.add_char out (Bytes.get t.disk (off + i))
+      done;
+      walk (fat12_next t fs cluster)
+    end
+  in
+  walk start;
+  Buffer.to_bytes out
+
+let fat12_open t name11 =
+  if Bytes.length t.disk = 0 then None
+  else
+    let fs = fat12_of t in
+    match fat12_find t fs name11 with
+    | None -> None
+    | Some e -> Some (fat12_read t fs e)
+
+let load_disk t dsk =
+  t.disk <- Bytes.of_string dsk;
+  t.disk_open <- None;
+  t.disk_dma <- 0x0080;
+  (* The interface ROM occupies the cartridge slot; loading it the cart way puts
+     it in slot 2 page 1 with page 1 selected, so C-BIOS finds the "AB" header
+     and calls INIT -- the proven path a game cart takes. *)
+  load_cartridge ~mapper:Flat t (disk_rom_bytes ())
+
+(* Serviced in the step loop before the opcode at [pc] runs. Returns true when
+   [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
+let disk_trap t pc =
+  if Bytes.length t.disk = 0 then false
+  else if pc = disk_init_entry then begin
+    if !disk_call_log then
+      disk_calls := (pc, Z80.dump_a t.cpu, Z80.dump_bc t.cpu, Z80.dump_de t.cpu,
+                     Z80.dump_hl t.cpu, Z80.dump_f t.cpu) :: !disk_calls;
+    (* INIT: read the boot sector to 0xC000 and enter it at +0x1e with carry
+       clear -- the boot code's first byte is RET NC, a check that the read
+       succeeded. *)
+    disk_transfer t ~write:false ~sector:0 ~count:1 ~addr:disk_boot_addr;
+    (* A real disk ROM's boot procedure enables RAM in the low pages before it
+       loads the DOS kernel. Do the same: pages 0 and 2 to slot 3 (the RAM
+       mapper), with the sub-slot on the RAM bank. Page 0 holds the kernel at
+       0x0100; page 2 holds its stack (the kernel sets SP=0x9000). Page 1 stays
+       the disk ROM -- the kernel calls INIENV/DSKIO there -- and page 3 keeps
+       the boot sector + system area. Without RAM in page 2 the stack lands on
+       the logo ROM and CALL/RET reads back garbage. *)
+    t.ppi_a <- (t.ppi_a land 0xcc) lor 0x33;
+    t.slot3_sel <- (t.slot3_sel land 0xfc) lor 0x02;
+    (* Enter the boot sector at +0x1e with carry SET: its first byte is RET NC,
+       which the disk ROM uses to bail when the sector is not bootable. Carry
+       set means "boot this", so the code runs instead of returning. *)
+    Z80.set_af t.cpu ((0x00 lsl 8) lor 0x01) (* A=0 (drive 0), carry set *);
+    Z80.set_pc t.cpu (disk_boot_addr + 0x1e);
+    true
+  end
+  else if pc = disk_inienv_entry then begin
+    (* INIENV, observation stub: just return. Measures how far the kernel
+       gets before it needs what a real INIENV installs. *)
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in
+    Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+    Z80.set_pc t.cpu ret;
+    true
+  end
+  else if pc = disk_dskio_entry then begin
+    (* DSKIO: A=drive, B=sectors, C=media, DE=first sector, HL=addr, carry=write
+       on entry. Success returns carry clear, B=0 remaining; then RET. *)
+    let a = Z80.dump_a t.cpu in
+    let f = Z80.dump_f t.cpu in
+    let write = f land 0x01 <> 0 in
+    let count = (Z80.dump_bc t.cpu lsr 8) land 0xff in
+    let sector = Z80.dump_de t.cpu in
+    let addr = Z80.dump_hl t.cpu in
+    if !disk_call_log then
+      disk_calls := (pc, a, Z80.dump_bc t.cpu, sector, addr, f) :: !disk_calls;
+    disk_transfer t ~write ~sector ~count ~addr;
+    Z80.set_af t.cpu ((a lsl 8) lor (f land 0xfe)) (* carry clear = success *);
+    Z80.set_bc t.cpu (Z80.dump_bc t.cpu land 0x00ff) (* B=0 remaining *);
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in
+    Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+    Z80.set_pc t.cpu ret;
+    true
+  end
+  else if pc = disk_bdos_entry then begin
+    (* MSX DISK-BASIC system call (C = function). Only the file-load path the
+       boot uses is served, against the FAT12 image: Open File (0x0F), Set DMA
+       (0x1A), Random block read (0x27). A=0 success, A=0xFF failure -- the boot
+       does INC A / JR Z, so 0 continues and 0xFF branches to its error path. *)
+    let c = Z80.dump_bc t.cpu land 0xff in
+    let de = Z80.dump_de t.cpu in
+    let fcb i = mem_read t ((de + i) land 0xffff) in
+    if !disk_call_log then
+      disk_calls := (pc, c, Z80.dump_bc t.cpu, de, Z80.dump_hl t.cpu, Z80.dump_f t.cpu)
+                    :: !disk_calls;
+    let a =
+      match c with
+      | 0x0f -> (
+        let name = String.init 11 (fun i -> Char.chr (fcb (1 + i))) in
+        match fat12_open t name with
+        | Some data ->
+          if !disk_call_log then
+            Printf.eprintf "BDOS open '%s' -> %d bytes\n%!" name (Bytes.length data);
+          t.disk_open <- Some data;
+          let sz = Bytes.length data in
+          mem_write t ((de + 0x10) land 0xffff) (sz land 0xff);
+          mem_write t ((de + 0x11) land 0xffff) ((sz lsr 8) land 0xff);
+          mem_write t ((de + 0x12) land 0xffff) ((sz lsr 16) land 0xff);
+          mem_write t ((de + 0x13) land 0xffff) ((sz lsr 24) land 0xff);
+          0x00
+        | None ->
+          if !disk_call_log then Printf.eprintf "BDOS open '%s' -> NOT FOUND\n%!" name;
+          0xff)
+      | 0x1a ->
+        t.disk_dma <- de;
+        0x00
+      | 0x0d ->
+        (* Disk reset: default drive A, DMA back to 0x0080. *)
+        t.disk_dma <- 0x0080;
+        0x00
+      | 0x19 ->
+        (* Default drive: A. *)
+        0x00
+      | 0x1b when Bytes.length t.disk > 0 ->
+        (* Disk information (MSX-DOS specific). A=sectors/cluster, BC=sector
+           size, DE=clusters+1, IX=DPB address, IY=FAT in memory. The FAT copy
+           and DPB live above the boot sector image: FAT @ 0xC800 (one FAT),
+           DPB right after it -- what a real disk ROM installs for the boot
+           loader to parse. *)
+        let fs = fat12_of t in
+        let fat_bytes = fs.sec_per_fat * fs.bytes_per_sec in
+        let fat_addr = 0xc800 in
+        let dpb = fat_addr + fat_bytes in
+        let w off v =
+          mem_write t (dpb + off) (v land 0xff);
+          mem_write t (dpb + off + 1) ((v lsr 8) land 0xff)
+        in
+        for i = 0 to fat_bytes - 1 do
+          mem_write t (fat_addr + i)
+            (dsk_u8 t ((fs.fat_start_sec * fs.bytes_per_sec) + i))
+        done;
+        let clusters = (dsk_u16 t 0x13 - fs.data_start_sec) / fs.sec_per_clus in
+        mem_write t dpb 0; (* drive A *)
+        mem_write t (dpb + 1) (dsk_u8 t 0x15); (* media ID *)
+        w 2 fs.bytes_per_sec;
+        mem_write t (dpb + 4) ((fs.bytes_per_sec / 32) - 1); (* dir mask *)
+        mem_write t (dpb + 5) (ilog2 (fs.bytes_per_sec / 32));
+        mem_write t (dpb + 6) (fs.sec_per_clus - 1); (* cluster mask *)
+        mem_write t (dpb + 7) (ilog2 fs.sec_per_clus);
+        w 8 fs.fat_start_sec; (* top sector of FAT *)
+        mem_write t (dpb + 10) (dsk_u8 t 0x10); (* number of FATs *)
+        mem_write t (dpb + 11) fs.root_entries;
+        w 12 fs.data_start_sec; (* top sector of data area *)
+        w 14 (clusters + 1);
+        mem_write t (dpb + 16) fs.sec_per_fat;
+        w 17 fs.root_start_sec;
+        w 19 fat_addr; (* FAT address in memory *)
+        Z80.set_bc t.cpu fs.bytes_per_sec;
+        Z80.set_de t.cpu (clusters + 1);
+        Z80.set_ix t.cpu dpb;
+        Z80.set_iy t.cpu fat_addr;
+        fs.sec_per_clus
+      | 0x2f when Bytes.length t.disk > 0 ->
+        (* Absolute logical-sector read: DE=first sector, H=count, L=drive.
+           The .dsk is a raw image, so a logical sector IS a file sector. *)
+        let sector = Z80.dump_de t.cpu in
+        let count = (Z80.dump_hl t.cpu lsr 8) land 0xff in
+        disk_transfer t ~write:false ~sector ~count ~addr:t.disk_dma;
+        0x00
+      | 0x27 -> (
+        match t.disk_open with
+        | None -> 0xff
+        | Some data ->
+          let rec_size =
+            let r = fcb 0x0e lor (fcb 0x0f lsl 8) in
+            if r = 0 then 128 else r
+          in
+          let rand_rec =
+            fcb 0x21 lor (fcb 0x22 lsl 8) lor (fcb 0x23 lsl 16) lor (fcb 0x24 lsl 24)
+          in
+          let count = Z80.dump_hl t.cpu in
+          let start = rand_rec * rec_size in
+          let want = count * rec_size in
+          let avail = max 0 (Bytes.length data - start) in
+          let n = min want avail in
+          for i = 0 to n - 1 do
+            mem_write t ((t.disk_dma + i) land 0xffff) (Char.code (Bytes.get data (start + i)))
+          done;
+          Z80.set_hl t.cpu (n / rec_size);
+          if n < want then 0x01 else 0x00)
+      | _ -> 0xff
+    in
+    Z80.set_af t.cpu ((a lsl 8) lor (Z80.dump_f t.cpu land 0xff));
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in
+    Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+    Z80.set_pc t.cpu ret;
+    true
+  end
+  else false
 
 let set_key t k ~pressed =
   match key_target k with
@@ -423,7 +810,9 @@ let step t ~frames =
         ldirvm_calls :=
           (Z80.dump_hl t.cpu, Z80.dump_de t.cpu, Z80.dump_bc t.cpu)
           :: !ldirvm_calls;
-      let used = Z80.step t.cpu in
+      (* A disk BIOS entry is served in OCaml (HLE), not by fetching the ROM's
+         opcode there; the trap moves PC on, so charge a nominal call's cycles. *)
+      let used = if disk_trap t pc then 18 else Z80.step t.cpu in
       incr instr_count;
       ignore (Vdp.advance t.vdp ~cycles:used);
       budget := !budget - used

@@ -8,6 +8,7 @@ let out_prefix = ref "/tmp/msxboot"
 let vlog = ref false
 let watch_mem = ref ""
 let cart = ref ""
+let disk = ref ""
 let cart_mapper = ref ""
 let tap_space : int list ref = ref []
 let assert_boot = ref false
@@ -42,6 +43,7 @@ let () =
     [ ("--vlog", Arg.Set vlog, "  VDP 포트 쓰기 로그");
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
+      ("--disk", Arg.Set_string disk, "PATH  플로피 이미지(.dsk) — 드라이브 A.");
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
         "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
@@ -63,17 +65,26 @@ let () =
   let t =
     Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms }
   in
-  if !cart <> "" then
+  (* [begin..end] bounds the then-branch: without it the [let mapper = .. in]
+     swallows every following statement (run loop, prints), so a no-cart boot
+     (BIOS only or disk) ran nothing and exited silently. *)
+  if !cart <> "" then begin
     let mapper = match !cart_mapper with
       | "plain" -> Some Msx.Flat
       | "ascii8" -> Some Msx.Ascii8
       | "ascii16" -> Some Msx.Ascii16
       | "konami" -> Some Msx.Konami
       | "konami-scc" -> Some Msx.Konami_scc
+      | "koei" -> Some Msx.Ascii8_sram
       | "" -> None
       | other -> Printf.ksprintf failwith "unknown --cart-mapper %s" other
     in
-    Msx.load_cartridge ?mapper t (read_file !cart);
+    Msx.load_cartridge ?mapper t (read_file !cart)
+  end;
+  if !disk <> "" then begin
+    Msx.load_disk t (read_file !disk);
+    Msx.set_disk_call_log true
+  end;
   Msx.set_ldirvm_log true;
   Msx.set_pc_hist true;
   if !watch_mem <> "" then
@@ -181,6 +192,16 @@ let () =
         incr nonblack)
     rgb;
   Printf.printf "frames=%d pc=%04x nonblack=%d\n%!" !frames (Msx.dump_pc t) !nonblack;
+  if !disk <> "" then begin
+    let calls = Msx.disk_call_entries () in
+    Printf.printf "disk calls=%d\n" (List.length calls);
+    List.iteri
+      (fun i (pc, a, bc, de, hl, f) ->
+        if i < 20 then
+          Printf.printf "  disk @%04x a=%02x bc=%04x de(sec)=%04x hl(addr)=%04x f=%02x\n"
+            pc a bc de hl f)
+      calls
+  end;
   Msx.debug_dump t;
   let (active, n, ny, anx, dy) = Msx.tx_state t in
   Printf.printf "tx active=%b count=%d ny=%d anx=%d dy=%d\n" active n ny anx dy;

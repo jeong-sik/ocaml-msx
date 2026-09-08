@@ -33,7 +33,7 @@ type t
 (** MegaROM cartridge mapper. [Flat] is a plain 16/32KB cart; the others bank
     8KB/16KB windows the way the named hardware does (openMSX RomKonami /
     RomKonamiSCC / RomAscii8 / RomAscii16). SCC sound is not modelled. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16
+type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
 
 val create : machine:machine -> t
 
@@ -62,6 +62,19 @@ val mem_read : t -> int -> int
 val mem_write : t -> int -> int -> unit
 (** Write a byte at a 16-bit address as the Z80 would — into RAM, or as a bank
     select in a MegaROM's cart window. For tests and debugging. *)
+
+val load_disk : t -> string -> unit
+(** Plug a floppy image (raw .dsk, 512 bytes a sector) into drive A. A disk
+    interface ROM rides in the cartridge slot; C-BIOS finds its "AB" header and
+    calls INIT, whose BIOS entries are HLE traps the step loop services against
+    the image. *)
+
+val set_disk_call_log : bool -> unit
+(** Record each disk BIOS entry the running code reaches — for learning the
+    convention a given .dsk expects. Off by default. *)
+
+val disk_call_entries : unit -> (int * int * int * int * int * int) list
+(** [(pc, a, bc, de, hl, f)] per disk BIOS entry, in order. *)
 
 val set_key : t -> key -> pressed:bool -> bool
 (** 논리 키를 누르거나 뗀다. 키보드 매트릭스 키와 조이스틱 1 버튼
