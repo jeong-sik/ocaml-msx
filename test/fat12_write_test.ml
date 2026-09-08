@@ -189,6 +189,17 @@ let test_bdos () =
   check "partial data and zero padding reach DMA"
     (Msx.mem_read t 0xc800 = Char.code first.[256]
      && String.init 127 (fun i -> Char.chr (Msx.mem_read t (0xc801 + i))) = String.make 127 '\000');
+  record t 2;
+  for i = 0 to 255 do Msx.mem_write t (0xc800 + i) 0xa5 done;
+  let error, returned = bdos t 0x27 0xc200 2 in
+  check "partial short read reports EOF and actual count" (error = 1 && returned = 1);
+  check "short read advances by the returned record" (Msx.mem_read t 0xc221 = 3);
+  check "short read leaves the next record untouched"
+    (String.init 128 (fun i -> Char.chr (Msx.mem_read t (0xc880 + i))) = String.make 128 '\165');
+  let error, returned = bdos t 0x27 0xc200 1 in
+  check "subsequent EOF returns no records without moving the cursor"
+    (error = 1 && returned = 0 && Msx.mem_read t 0xc221 = 3);
+  Msx.mem_write t 0xc224 0x7f;
   check "ignored high byte is preserved" (Msx.mem_read t 0xc224 = 0x7f);
   let before_extent_create = Msx.disk_image t in
   Msx.mem_write t 0xc20c 1;
