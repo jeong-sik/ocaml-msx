@@ -78,6 +78,12 @@ val boot_disk : t -> (unit, string) result
     RAM. This is the path a game's loader runs to its title on; the
     cart-INIT path reboots mid-boot (see the implementation note). *)
 
+val change_disk : t -> string -> (unit, string) result
+(** Swap the floppy while the machine keeps running: image bytes and the BDOS
+    server state reset, nothing else moves. A multi-disk game waiting on
+    "insert disk 2" unblocks here without a reboot. Errors when no disk is
+    loaded ({!load_disk} first). *)
+
 val set_disk_call_log : bool -> unit
 (** Record each disk BIOS entry the running code reaches — for learning the
     convention a given .dsk expects. Off by default. *)

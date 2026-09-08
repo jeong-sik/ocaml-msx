@@ -595,6 +595,20 @@ let load_disk ?(interface_rom = true) t dsk =
      (observed), so the replay path wants a plain BIOS boot first. *)
   if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ())
 
+(* Swap the floppy while the machine keeps running: the image bytes and the
+   BDOS server state (open files, DMA) reset — a different disk names
+   different files — and nothing else moves. The running game notices the way
+   real software does: its next read sees the new image. A multi-disk game
+   waiting on "insert disk 2" unblocks here without a reboot. *)
+let change_disk t dsk =
+  if Bytes.length t.disk = 0 then Error "no disk loaded"
+  else begin
+    t.disk <- Bytes.of_string dsk;
+    Hashtbl.reset t.bdos_files;
+    t.disk_dma <- 0x0080;
+    Ok ()
+  end
+
 (* The warm-up replay of the Disk ROM's second-stage call (MSX2 Technical
    Handbook ch.3 step 7), for harnesses and lanes: after the C-BIOS boot run
    (720 frames plants the F380 inter-slot primitives in RAM), this puts the
