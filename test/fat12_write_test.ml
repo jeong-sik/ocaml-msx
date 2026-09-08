@@ -229,6 +229,22 @@ let test_bdos () =
   check "nonzero extent CREATE rejects invalid BPB without mutating media"
     (result = 0xff && Msx.disk_image t = Some invalid)
 
+let test_disk_slots_still_dispatch () =
+  List.iter (fun (label, call) ->
+    let t, _ = machine () in
+    (* boot_disk selected slot2 in page1. RST30 temporarily switches it to
+       slot1, then restores the caller's mapping on return. *)
+    let code = [0x01;0x34;0x12] @ call
+      @ [0xed;0x43;0x20;0xc3;0xc3;0x00;0xc1] in
+    List.iteri (fun i byte -> Msx.mem_write t (0xc040 + i) byte) code;
+    List.iteri (fun i byte -> Msx.mem_write t (0xc080 + i) byte) [0xc3;0x40;0xc0];
+    List.iteri (fun i byte -> Msx.mem_write t (0xc100 + i) byte) [0x18;0xfe];
+    Msx.step t ~frames:1;
+    check label (Msx.mem_read t 0xc320 = 0 && Msx.mem_read t 0xc321 = 0x12
+                 && Msx.dump_pc t = 0xc100 && Msx.port_in t 0xa8 = 0xfb)
+  ) ["slot2 direct disk entry", [0xcd;0x16;0x40];
+     "slot1 inter-slot disk entry restores caller mapping", [0xf7;0x01;0x16;0x40]]
+
 let test_ram_disk_entry_collisions () =
   let t, _ = machine () in
   (* The same numeric addresses are ordinary instructions when page1 maps
@@ -251,5 +267,6 @@ let test_ram_disk_entry_collisions () =
 let () =
   test_fat ();
   test_bdos ();
+  test_disk_slots_still_dispatch ();
   test_ram_disk_entry_collisions ();
   print_endline "FAT12: fragmented atomic writes and CPU BDOS checkpoint continuation passed"
