@@ -82,6 +82,20 @@ def main():
              "--save-state", sampled], frame=46)
         assert ram(sampled)[0xc001] & 1 == 0, "tail-zero final key edge survives save and restore"
 
+        # Same-frame edges retain ledger order; the CPU samples the final
+        # keyboard state on the following frame, not an arbitrary sorted edge.
+        for directions, expected_bit in [(('down', 'up'), 1), (('up', 'down'), 0)]:
+            name = '-'.join(directions)
+            ordered = ledger(root / f"same-frame-{name}.jsonl",
+                             [(45, "space", direction) for direction in directions])
+            ordered_state = root / f"same-frame-{name}.state"
+            result = run(["--roms", roms, "--ledger", ordered, "--tail", 1,
+                          "--save-state", ordered_state], frame=46)
+            assert "replayed 2 entries" in result.stdout, result.stdout
+            assert ram(ordered_state)[0xc001] & 1 == expected_bit, (
+                f"same-frame {directions} must preserve the last keyboard edge"
+            )
+
         edges = [(45, "space", "down"), (48, "space", "up"),
                  (52, "space", "down"), (56, "space", "up")]
         full = ledger(root / "full.jsonl", edges)
@@ -97,6 +111,17 @@ def main():
         run(["--restore-state", checkpoint, "--ledger", rest, "--tail", 3,
              "--save-state", resumed], frame=59)
         assert whole.read_bytes() == resumed.read_bytes(), "split replay must equal uninterrupted state"
+
+        # JSON whitespace, escaped keys, and field order do not change input.
+        spaced = root / "spaced.jsonl"
+        spaced.write_text("\n" + "\n".join(json.dumps(
+            {"edge": direction, "key": key, "frame": frame, "who": "tester"},
+        ).replace('"space"', '"spa\\u0063e"') for frame, key, direction in edges) + "\n")
+        spaced_state = root / "spaced.state"
+        result = run(["--roms", roms, "--ledger", spaced, "--tail", 3,
+                      "--save-state", spaced_state], frame=59)
+        assert "replayed 4 entries" in result.stdout, result.stdout
+        assert whole.read_bytes() == spaced_state.read_bytes(), "equivalent JSON must replay identical state"
 
         # A pre-existing destination is never replaced by an invalid request.
         destination = root / "preserved.state"
@@ -126,6 +151,23 @@ def main():
         reject(["--roms", roms, "--ledger", old, "--tail", 0], "predates initial machine state")
         unknown = ledger(root / "unknown.jsonl", [(45, "not-a-key", "down")])
         reject(["--roms", roms, "--ledger", unknown, "--tail", 0], "unknown ledger key")
+        malformed = root / "malformed.jsonl"
+        for content, message in [
+            ('{', 'invalid JSON'),
+            ('[]', 'expected a JSON object'),
+            ('{"frame":45,"key":"space"}', 'edge must be down or up'),
+            ('{"frame":45,"key":"space","edge":"DOWN"}', 'edge must be down or up'),
+            ('{"frame":45,"key":"space","edge":false}', 'edge must be down or up'),
+            ('{"frame":-1,"key":"space","edge":"up"}', 'frame must be a nonnegative integer'),
+            ('{"frame":45.0,"key":"space","edge":"up"}', 'frame must be a nonnegative integer'),
+            ('{"frame":"45","key":"space","edge":"up"}', 'frame must be a nonnegative integer'),
+            ('{"frame":45,"key":null,"edge":"up"}', 'key must be a nonempty string'),
+            ('{"frame":45,"frame":46,"key":"space","edge":"up"}', 'duplicate field'),
+        ]:
+            malformed.write_text('\n' + content + '\n')
+            reject(["--roms", roms, "--ledger", malformed, "--tail", 0],
+                   'ledger line 2: ' + message)
+
         print("replay CLI: final edges, restored clock, split continuation and safe failures passed")
 
 

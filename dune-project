@@ -10,4 +10,4 @@
  (source
   (uri git+https://github.com/jeong-sik/ocaml-msx.git))
  (license MIT)
- (depends ocaml dune))
+ (depends ocaml dune yojson))

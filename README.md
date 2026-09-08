@@ -16,4 +16,6 @@ dune exec bin/msx_demo.exe -- --frames 3  # 3프레임만 찍고 종료 (CI/확�
 
 Use `replay --restore-state checkpoint.state --change-disk next.dsk --ledger input.jsonl --trace-disk` to diagnose the exact BIOS/BDOS calls after a media change. The trace includes extended disk BIOS entries and is opt-in.
 
+Replay ledgers contain one JSON object per line with a nonnegative integer `frame`, a nonempty string `key`, and `edge` equal to `down` or `up`; caller metadata such as `who` is retained in the source ledger but does not affect input. JSON whitespace and escapes are accepted, blank lines are ignored, and malformed rows or duplicate fields fail with a line number instead of being skipped. Same-frame edges retain their recorded order. An empty ledger deliberately replays no input.
+
 Disk games can create root-directory files through MSX-DOS FCB call 16h and write blocks through 26h. Writes update FAT12 image bytes, including mirrored allocation tables; checkpoints retain them. Nonzero-extent create preserves an existing file, and zero-count block writes resize it. Invalid geometry, inconsistent allocation or insufficient space reject before replacing image bytes. A valid formatted disk is required.

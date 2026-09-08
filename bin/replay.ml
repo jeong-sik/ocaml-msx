@@ -29,48 +29,37 @@ let read_file p =
   close_in ic;
   s
 
-(* One field out of the fixed ledger shape: name is frame, key, or edge. *)
-let field line name =
-  let key = "\"" ^ name ^ "\":" in
-  match
-    let klen = String.length key and llen = String.length line in
-    let rec find i =
-      if i + klen > llen then None
-      else if String.sub line i klen = key then Some (i + klen)
-      else find (i + 1)
-    in
-    find 0
-  with
-  | None -> None
-  | Some start ->
-    let llen = String.length line in
-    let start = if start < llen && line.[start] = '"' then start + 1 else start in
-    let stop = ref start in
-    while
-      !stop < llen
-      &&
-      let c = line.[!stop] in
-      c <> '"' && c <> ',' && c <> '}'
-    do
-      incr stop
-    done;
-    Some (String.sub line start (!stop - start))
-
 type entry = { at : int; key : string; down : bool }
 
 let parse_ledger path =
   read_file path
   |> String.split_on_char '\n'
-  |> List.filter_map (fun line ->
+  |> List.mapi (fun index line ->
+       let invalid reason = invalid_arg
+         (Printf.sprintf "ledger line %d: %s" (index + 1) reason) in
        if String.trim line = "" then None
        else
-         match field line "frame", field line "key", field line "edge" with
-         | Some f, Some k, Some e -> (
-           match int_of_string_opt f with
-           | Some at -> Some { at; key = k; down = e = "down" }
-           | None -> None)
-         | _ -> None)
-  |> List.sort (fun a b -> compare a.at b.at)
+         let json = try Yojson.Safe.from_string line with
+           | Yojson.Json_error _ -> invalid "invalid JSON" in
+         match json with
+         | `Assoc fields ->
+             let names = List.map fst fields in
+             if List.length names <> List.length (List.sort_uniq String.compare names) then
+               invalid "duplicate field";
+             let at = match List.assoc_opt "frame" fields with
+               | Some (`Int n) when n >= 0 -> n
+               | _ -> invalid "frame must be a nonnegative integer" in
+             let key = match List.assoc_opt "key" fields with
+               | Some (`String key) when key <> "" -> key
+               | _ -> invalid "key must be a nonempty string" in
+             let down = match List.assoc_opt "edge" fields with
+               | Some (`String "down") -> true
+               | Some (`String "up") -> false
+               | _ -> invalid "edge must be down or up" in
+             Some { at; key; down }
+         | _ -> invalid "expected a JSON object")
+  |> List.filter_map Fun.id
+  |> List.stable_sort (fun a b -> compare a.at b.at)
 
 let key_of_string s : Msx.key option =
   match String.lowercase_ascii s with
@@ -121,6 +110,11 @@ let () =
     (prerr_endline "replay: choose cartridge, disk, or saved state"; exit 2);
   if !change_disk <> "" && !restore_state = "" then
     (prerr_endline "replay: --change-disk requires --restore-state"; exit 2);
+  let entries =
+    try parse_ledger !ledger with
+    | Invalid_argument message | Sys_error message ->
+        prerr_endline ("replay: " ^ message); exit 2
+  in
   let roms =
     if !roms_dir = "" then [ ""; ""; "" ]
     else
@@ -154,7 +148,6 @@ let () =
   (try Unix.mkdir !out_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   Msx.set_disk_call_log !trace_disk;
   let initial_frame = Msx.frame_number t in
-  let entries = parse_ledger !ledger in
   List.iter (fun e ->
     if e.at < initial_frame then failwith "ledger entry predates initial machine state";
     match key_of_string e.key with

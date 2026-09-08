@@ -9,6 +9,7 @@ license: "MIT"
 depends: [
   "ocaml"
   "dune" {>= "3.0"}
+  "yojson"
   "odoc" {with-doc}
 ]
 build: [
