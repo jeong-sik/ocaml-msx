@@ -11,7 +11,7 @@ let mapper_writes : int array = Array.make 4 0
 
 type key =
   | Up | Down | Left | Right | Space | Trigger_a | Trigger_b
-  | Esc | Return | Function of int | Char of char
+  | Esc | Return | Function of int | Char of char | Backspace
 
 (* 논리 키가 닿는 자리. 키보드 매트릭스 (행 0-10, 비트 0-7) 의 정본은
    openMSX share/unicodemaps/unicodemap.int (국제 배열, <ROW><COL>).
@@ -37,6 +37,7 @@ let key_target = function
   | Space -> Matrix (8, 0)
   | Esc -> Matrix (7, 2)
   | Return -> Matrix (7, 7)
+  | Backspace -> Matrix (7, 5)
   | Function 1 -> Matrix (6, 5)
   | Function 2 -> Matrix (6, 6)
   | Function 3 -> Matrix (6, 7)
