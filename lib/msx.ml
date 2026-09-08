@@ -80,6 +80,9 @@ type t = {
   cart_banks : int array;
       (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
           window); ASCII16 uses [.(0)]/[.(1)] as 16KB banks. *)
+  mutable disk : Bytes.t;
+      (** the floppy image, 512 bytes a sector (empty = no drive). The disk
+          interface ROM itself rides in [cart]; see [load_disk]. *)
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
@@ -328,6 +331,7 @@ let create ~machine =
       cart = Bytes.make 0 '\000';
       cart_mapper = Flat;
       cart_banks = [| 0; 1; 2; 3 |];
+      disk = Bytes.make 0 '\000';
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
       ppi_a = 0x00;
@@ -361,6 +365,102 @@ let load_cartridge ?mapper t rom =
      돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
   t.ppi_a <- (t.ppi_a land 0xf3) lor 0x08
+
+(* --- Disk interface (HLE) -------------------------------------------------
+   A game disk boots through a disk interface ROM that rides in the cartridge
+   slot: C-BIOS finds its "AB" header and calls INIT, the same slot path a game
+   cart uses. The ROM's BIOS entries are not WD2793 code but addresses the step
+   loop traps ([disk_trap]); the trap moves whole 512-byte sectors between the
+   .dsk image and RAM in OCaml. No floppy controller is emulated -- the sector
+   transfer is the whole model. *)
+
+let disk_sector_bytes = 512
+let disk_init_entry = 0x4100 (* the "AB" INIT vector; C-BIOS CALLSLTs here *)
+let disk_dskio_entry = 0x4110 (* DSKIO; the standard disk BIOS offset lands here *)
+let disk_boot_addr = 0xc000 (* boot sector lands here; entry at +0x1e *)
+
+(* Observation: every disk BIOS entry the boot code hits, so an offline run can
+   show what convention the .dsk expects (which addresses, which registers). *)
+let disk_calls : (int * int * int * int * int * int) list ref = ref []
+let disk_call_log = ref false
+let set_disk_call_log b = disk_call_log := b
+let disk_call_entries () = List.rev !disk_calls
+
+let disk_rom_bytes () =
+  let rom = Bytes.make 0x4000 '\xc9' (* every unentered byte is a RET *) in
+  Bytes.set rom 0 'A';
+  Bytes.set rom 1 'B';
+  Bytes.set rom 2 (Char.chr (disk_init_entry land 0xff));
+  Bytes.set rom 3 (Char.chr ((disk_init_entry lsr 8) land 0xff));
+  Bytes.to_string rom
+
+(* Move [count] 512-byte sectors between the disk image and RAM. [write] false
+   reads disk -> RAM. Sectors past the image read as zero and drop on write, the
+   way a real controller reports a seek error; the caller sets the flags. *)
+let disk_transfer t ~write ~sector ~count ~addr =
+  let len = Bytes.length t.disk in
+  for s = 0 to count - 1 do
+    let disk_off = (sector + s) * disk_sector_bytes in
+    for i = 0 to disk_sector_bytes - 1 do
+      let mem = (addr + (s * disk_sector_bytes) + i) land 0xffff in
+      let doff = disk_off + i in
+      if write then begin
+        if doff < len then Bytes.set t.disk doff (Char.chr (mem_read t mem))
+      end
+      else begin
+        let v = if doff < len then Char.code (Bytes.get t.disk doff) else 0 in
+        mem_write t mem v
+      end
+    done
+  done
+
+let load_disk t dsk =
+  t.disk <- Bytes.of_string dsk;
+  (* The interface ROM occupies the cartridge slot; loading it the cart way puts
+     it in slot 2 page 1 with page 1 selected, so C-BIOS finds the "AB" header
+     and calls INIT -- the proven path a game cart takes. *)
+  load_cartridge ~mapper:Flat t (disk_rom_bytes ())
+
+(* Serviced in the step loop before the opcode at [pc] runs. Returns true when
+   [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
+let disk_trap t pc =
+  if Bytes.length t.disk = 0 then false
+  else if pc = disk_init_entry then begin
+    if !disk_call_log then
+      disk_calls := (pc, Z80.dump_a t.cpu, Z80.dump_bc t.cpu, Z80.dump_de t.cpu,
+                     Z80.dump_hl t.cpu, Z80.dump_f t.cpu) :: !disk_calls;
+    (* INIT: read the boot sector to 0xC000 and enter it at +0x1e with carry
+       clear -- the boot code's first byte is RET NC, a check that the read
+       succeeded. *)
+    disk_transfer t ~write:false ~sector:0 ~count:1 ~addr:disk_boot_addr;
+    (* Enter the boot sector at +0x1e with carry SET: its first byte is RET NC,
+       which the disk ROM uses to bail when the sector is not bootable. Carry
+       set means "boot this", so the code runs instead of returning. *)
+    Z80.set_af t.cpu ((0x00 lsl 8) lor 0x01) (* A=0 (drive 0), carry set *);
+    Z80.set_pc t.cpu (disk_boot_addr + 0x1e);
+    true
+  end
+  else if pc = disk_dskio_entry then begin
+    (* DSKIO: A=drive, B=sectors, C=media, DE=first sector, HL=addr, carry=write
+       on entry. Success returns carry clear, B=0 remaining; then RET. *)
+    let a = Z80.dump_a t.cpu in
+    let f = Z80.dump_f t.cpu in
+    let write = f land 0x01 <> 0 in
+    let count = (Z80.dump_bc t.cpu lsr 8) land 0xff in
+    let sector = Z80.dump_de t.cpu in
+    let addr = Z80.dump_hl t.cpu in
+    if !disk_call_log then
+      disk_calls := (pc, a, Z80.dump_bc t.cpu, sector, addr, f) :: !disk_calls;
+    disk_transfer t ~write ~sector ~count ~addr;
+    Z80.set_af t.cpu ((a lsl 8) lor (f land 0xfe)) (* carry clear = success *);
+    Z80.set_bc t.cpu (Z80.dump_bc t.cpu land 0x00ff) (* B=0 remaining *);
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in
+    Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+    Z80.set_pc t.cpu ret;
+    true
+  end
+  else false
 
 let set_key t k ~pressed =
   match key_target k with
@@ -423,7 +523,9 @@ let step t ~frames =
         ldirvm_calls :=
           (Z80.dump_hl t.cpu, Z80.dump_de t.cpu, Z80.dump_bc t.cpu)
           :: !ldirvm_calls;
-      let used = Z80.step t.cpu in
+      (* A disk BIOS entry is served in OCaml (HLE), not by fetching the ROM's
+         opcode there; the trap moves PC on, so charge a nominal call's cycles. *)
+      let used = if disk_trap t pc then 18 else Z80.step t.cpu in
       incr instr_count;
       ignore (Vdp.advance t.vdp ~cycles:used);
       budget := !budget - used
