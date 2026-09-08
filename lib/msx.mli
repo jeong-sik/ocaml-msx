@@ -33,7 +33,7 @@ type t
 (** MegaROM cartridge mapper. [Flat] is a plain 16/32KB cart; the others bank
     8KB/16KB windows the way the named hardware does (openMSX RomKonami /
     RomKonamiSCC / RomAscii8 / RomAscii16). SCC sound is not modelled. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16
+type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
 
 val create : machine:machine -> t
 

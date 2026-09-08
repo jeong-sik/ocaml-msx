@@ -75,6 +75,7 @@ let () =
       | "ascii16" -> Some Msx.Ascii16
       | "konami" -> Some Msx.Konami
       | "konami-scc" -> Some Msx.Konami_scc
+      | "koei" -> Some Msx.Ascii8_sram
       | "" -> None
       | other -> Printf.ksprintf failwith "unknown --cart-mapper %s" other
     in

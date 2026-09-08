@@ -67,7 +67,7 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    register. [Flat] is the plain 16/32KB cart with no banking. The four here are
    the common ones (openMSX RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16);
    the SCC sound chip is not modelled, only its banking. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16
+type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
 
 type t = {
   cpu : Z80.t;
@@ -80,6 +80,12 @@ type t = {
   cart_banks : int array;
       (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
           window); ASCII16 uses [.(0)]/[.(1)] as 16KB banks. *)
+  mutable cart_sram : Bytes.t;
+      (** battery RAM for an [Ascii8_sram] (Koei) cart: a bank whose value has
+          [cart_sram_bit] set reads/writes here instead of ROM. Empty otherwise. *)
+  mutable cart_sram_bit : int;
+      (** the bank-value bit that selects SRAM (just above the ROM's segment
+          range), e.g. 0x20 for a 256KB cart. *)
   mutable disk : Bytes.t;
       (** the floppy image, 512 bytes a sector (empty = no drive). The disk
           interface ROM itself rides in [cart]; see [load_disk]. *)
@@ -108,7 +114,7 @@ let rom_or_empty = function "" -> Bytes.make 0x4000 '\000' | s -> Bytes.of_strin
    16KB bank into its two 8KB halves. *)
 let cart_seg8 m w =
   match m.cart_mapper with
-  | Konami | Konami_scc | Ascii8 -> m.cart_banks.(w)
+  | Konami | Konami_scc | Ascii8 | Ascii8_sram -> m.cart_banks.(w)
   | Ascii16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
   | Flat -> w
 
@@ -128,7 +134,7 @@ let cart_bank_write m a v =
   | Konami_scc ->
     (* Register at 0x5000/0x7000/0x9000/0xB000: (a land 0x1800) = 0x1000. *)
     if a land 0x1800 = 0x1000 then m.cart_banks.((a lsr 13) - 2) <- v
-  | Ascii8 ->
+  | Ascii8 | Ascii8_sram ->
     (match a land 0xf800 with
      | 0x6000 -> m.cart_banks.(0) <- v
      | 0x6800 -> m.cart_banks.(1) <- v
@@ -189,9 +195,23 @@ let mem_read m addr =
   then begin
     (* MegaROM: 0x4000-0xBFFF is four 8KB windows, each showing the segment its
        bank register selects. The cart sits in slot 2 (see load_cartridge). *)
-    let seg = cart_seg8 m ((a lsr 13) - 2) in
-    let off = (seg * 0x2000) + (a land 0x1fff) in
-    Char.code (Bytes.get m.cart (off mod Bytes.length m.cart))
+    let w = (a lsr 13) - 2 in
+    let bank = m.cart_banks.(w) in
+    if
+      m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
+      && bank land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
+    then begin
+      (* A Koei cart maps its battery RAM into a window whose bank has the SRAM
+         bit; the low bits pick the 8KB SRAM page. *)
+      let pages = Bytes.length m.cart_sram / 0x2000 in
+      let off = ((bank land (pages - 1)) * 0x2000) + (a land 0x1fff) in
+      Char.code (Bytes.get m.cart_sram off)
+    end
+    else begin
+      let seg = cart_seg8 m w in
+      let off = (seg * 0x2000) + (a land 0x1fff) in
+      Char.code (Bytes.get m.cart (off mod Bytes.length m.cart))
+    end
   end
   else begin
     let off = a land 0x3fff in
@@ -248,9 +268,21 @@ let mem_write m addr v =
   if a = 0xffff && slot = 3 then m.slot3_sel <- v land 0xff
   else if
     slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
-  then
-    (* A write into the cart window is a bank select, not a store. *)
-    cart_bank_write m a (v land 0xff)
+  then begin
+    let w = (a lsr 13) - 2 in
+    if
+      a >= 0x8000 && m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
+      && m.cart_banks.(w) land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
+    then begin
+      (* A store into a window mapped to battery RAM lands in the SRAM. *)
+      let pages = Bytes.length m.cart_sram / 0x2000 in
+      let off = ((m.cart_banks.(w) land (pages - 1)) * 0x2000) + (a land 0x1fff) in
+      Bytes.set m.cart_sram off (Char.chr (v land 0xff))
+    end
+    else
+      (* Otherwise a write into the cart window is a bank select, not a store. *)
+      cart_bank_write m a (v land 0xff)
+  end
   else if slot = 3 && (m.slot3_sel land 3 = 2 || page = 3) then begin
     let seg = m.mapper.(page) in
     let base = ((seg * 0x4000) + (a land 0x3fff)) mod (Bytes.length m.ram) in
@@ -337,6 +369,8 @@ let create ~machine =
       cart = Bytes.make 0 '\000';
       cart_mapper = Flat;
       cart_banks = [| 0; 1; 2; 3 |];
+      cart_sram = Bytes.make 0 '\000';
+      cart_sram_bit = 0;
       disk = Bytes.make 0 '\000';
       disk_dma = 0x0080;
       disk_open = None;
@@ -370,6 +404,18 @@ let load_cartridge ?mapper t rom =
   t.cart_banks.(1) <- 1;
   t.cart_banks.(2) <- 2;
   t.cart_banks.(3) <- 3;
+  (* A Koei cart gets 32KB of battery RAM (covers KoeiSRAM8 and KoeiSRAM32); the
+     SRAM-select bit is the first bit above the ROM's segment range. *)
+  (match t.cart_mapper with
+   | Ascii8_sram ->
+     let nseg = (String.length rom + 0x1fff) / 0x2000 in
+     let bit = ref 1 in
+     while !bit < nseg do bit := !bit lsl 1 done;
+     t.cart_sram_bit <- !bit;
+     t.cart_sram <- Bytes.make 0x8000 '\000'
+   | _ ->
+     t.cart_sram_bit <- 0;
+     t.cart_sram <- Bytes.make 0 '\000');
   (* mem_read 은 카트리지를 슬롯2 페이지0·1 에 둔다. 페이지0 을 슬롯2 로
      돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
