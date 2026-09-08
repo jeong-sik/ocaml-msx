@@ -70,6 +70,12 @@ val load_disk : ?interface_rom:bool -> t -> string -> unit
     services against the image. [~interface_rom:false] leaves the slot empty
     for the warm-up replay ({!boot_disk}). *)
 
+val change_disk : t -> string -> (unit, string) result
+(** Replace the mounted floppy without rebooting or changing CPU, RAM, VDP,
+    keyboard, frame count or DMA address. Invalid images preserve the machine.
+    Cached open files are invalidated: callers must reopen against new media.
+    Persist {!serialize} first to retain outgoing disk writes. *)
+
 val boot_disk : t -> (unit, string) result
 (** Replay the Disk ROM's second-stage call onto a machine whose C-BIOS boot
     has already run: boot sector to 0xC000, RAM in page 0, CALL 0xC01E with

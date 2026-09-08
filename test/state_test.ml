@@ -155,6 +155,23 @@ let () =
        && List.init 128 (fun i -> Msx.mem_read m (0xc200 + i)) = List.init 128 (fun _ -> 0x22))
   ) [t;copy];
   same "BDOS open file position continues identically" t copy;
+  let disk = fcb_machine () in
+  Msx.step disk ~frames:1;
+  let before = Msx.serialize disk in
+  List.iter (fun bytes ->
+    check "partial disk rejected" (Result.is_error (Msx.change_disk disk bytes));
+    check "rejected swap changes nothing" (Msx.serialize disk = before)
+  ) [""; String.make 511 '\000'; String.make 513 '\000'];
+  let pc = Msx.dump_pc disk and frame = Msx.frame_number disk and rgb = Msx.frame_rgb disk in
+  check "valid swap accepted" (Msx.change_disk disk (String.make 512 '\x5a') = Ok ());
+  check "disk swap preserves CPU and display" (Msx.dump_pc disk = pc && Msx.frame_number disk = frame && Msx.frame_rgb disk = rgb);
+  check "disk swap preserves RAM" (Msx.mem_read disk 0xc200 = 0x11);
+  (* The old FCB cannot silently return cached bytes from the removed disk. *)
+  List.iteri (fun i byte -> Msx.mem_write disk (0xc080 + i) byte) [0xc3;0x90;0xc0];
+  Msx.step disk ~frames:1;
+  check "removed disk FCB cache invalidated" (Msx.mem_read disk 0xc302 = 0xff && Msx.mem_read disk 0xc200 = 0x11);
+  let empty = fresh () in
+  check "swap requires mounted drive" (Result.is_error (Msx.change_disk empty (String.make 512 '\000')));
   List.iter (fun n ->
     check "truncation rejected" (Result.is_error (Msx.restore ~state:(String.sub state 0 n))))
     [0;1;10;26;String.length state / 2;String.length state - 1];

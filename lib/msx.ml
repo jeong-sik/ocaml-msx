@@ -597,6 +597,18 @@ let load_disk ?(interface_rom = true) t dsk =
      (observed), so the replay path wants a plain BIOS boot first. *)
   if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ())
 
+let change_disk t image =
+  let size = String.length image in
+  if Bytes.length t.disk = 0 then Error "no disk drive is loaded"
+  else if size = 0 || size mod disk_sector_bytes <> 0 then
+    Error "disk image must contain complete 512-byte sectors"
+  else begin
+    let disk = Bytes.of_string image in
+    t.disk <- disk;
+    Hashtbl.reset t.bdos_files;
+    Ok ()
+  end
+
 (* The warm-up replay of the Disk ROM's second-stage call (MSX2 Technical
    Handbook ch.3 step 7), for harnesses and lanes: after the C-BIOS boot run
    (720 frames plants the F380 inter-slot primitives in RAM), this puts the
