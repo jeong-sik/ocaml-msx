@@ -86,6 +86,9 @@ type t = {
   mutable disk_dma : int;  (** BDOS transfer address, set by function 0x1A *)
   mutable disk_open : Bytes.t option;
       (** bytes of the file the last BDOS Open (0x0F) found, for Read Block. *)
+  mutable con_esc : int;
+      (** VT52 escape-sequence state for the BDOS console: 0=plain, 1=after
+          ESC, 2=after "ESC Y" (row byte next), 3=column byte next. *)
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
@@ -337,6 +340,7 @@ let create ~machine =
       disk = Bytes.make 0 '\000';
       disk_dma = 0x0080;
       disk_open = None;
+      con_esc = 0;
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
       ppi_a = 0x00;
@@ -534,12 +538,14 @@ let disk_trap t pc =
        clear -- the boot code's first byte is RET NC, a check that the read
        succeeded. *)
     disk_transfer t ~write:false ~sector:0 ~count:1 ~addr:disk_boot_addr;
-    (* A real disk ROM's boot procedure enables RAM in page 0 before it loads
-       the DOS kernel to 0x0100. Do the same: page 0 to slot 3 (the RAM mapper),
-       with its sub-slot on the RAM bank. Page 1 stays the disk ROM (the kernel
-       calls DSKIO there); page 2/3 are left as they are. Without RAM in page 0
-       the load to 0x0100 lands on the BIOS ROM and is dropped. *)
-    t.ppi_a <- (t.ppi_a land 0xfc) lor 0x03;
+    (* A real disk ROM's boot procedure enables RAM in the low pages before it
+       loads the DOS kernel. Do the same: pages 0 and 2 to slot 3 (the RAM
+       mapper), with the sub-slot on the RAM bank. Page 0 holds the kernel at
+       0x0100; page 2 holds its stack (the kernel sets SP=0x9000). Page 1 stays
+       the disk ROM -- the kernel calls INIENV/DSKIO there -- and page 3 keeps
+       the boot sector + system area. Without RAM in page 2 the stack lands on
+       the logo ROM and CALL/RET reads back garbage. *)
+    t.ppi_a <- (t.ppi_a land 0xcc) lor 0x33;
     t.slot3_sel <- (t.slot3_sel land 0xfc) lor 0x02;
     (* Enter the boot sector at +0x1e with carry SET: its first byte is RET NC,
        which the disk ROM uses to bail when the sector is not bootable. Carry
