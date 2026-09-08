@@ -229,7 +229,26 @@ let test_bdos () =
   check "nonzero extent CREATE rejects invalid BPB without mutating media"
     (result = 0xff && Msx.disk_image t = Some invalid)
 
+let test_ram_disk_entry_collisions () =
+  let t, _ = machine () in
+  (* The same numeric addresses are ordinary instructions when page1 maps
+     RAM. Executing them must not call HLE disk BIOS or pop a return address. *)
+  Msx.port_out t 0xa8 0xff;
+  List.iter (fun address ->
+    List.iteri (fun i byte -> Msx.mem_write t (address + i) byte)
+      [0x3e;0x5a;0x32;0x10;0xc3;0xc3;0x00;0xc1];
+    List.iteri (fun i byte -> Msx.mem_write t (0xc100 + i) byte) [0x18;0xfe];
+    let pc = Msx.dump_pc t in
+    List.iteri (fun i byte -> Msx.mem_write t (pc + i) byte)
+      [0xc3;address land 255;address lsr 8];
+    Msx.mem_write t 0xc310 0;
+    Msx.step t ~frames:1;
+    check (Printf.sprintf "RAM %04x is guest code, not disk BIOS" address)
+      (Msx.mem_read t 0xc310 = 0x5a && Msx.dump_pc t = 0xc100)
+  ) [0x4010;0x4013;0x4016;0x4019;0x401c;0x401f;0x4030;0x4100]
+
 let () =
   test_fat ();
   test_bdos ();
+  test_ram_disk_entry_collisions ();
   print_endline "FAT12: fragmented atomic writes and CPU BDOS checkpoint continuation passed"

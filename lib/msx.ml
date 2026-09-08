@@ -729,6 +729,8 @@ let disk_trap t pc =
     Z80.set_pc t.cpu (serve_rst30 t);
     true
   end
+  else if pc >= 0x4000 && pc < 0x8000
+          && (let slot = (t.ppi_a lsr 2) land 3 in slot = 0 || slot = 3) then false
   else if pc = disk_init_entry then begin
     if !disk_call_log then
       disk_calls := (pc, Z80.dump_a t.cpu, Z80.dump_bc t.cpu, Z80.dump_de t.cpu,
