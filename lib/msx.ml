@@ -97,6 +97,8 @@ type t = {
       (** FCB 주소 → (파일 내용, 읽은 위치) — BDOS 스텁의 서버 쪽 상태.
           로더가 여러 FCB 를 번갈아 열기 때문에 마지막 파일 하나로는
           부족하다 (삼국지2 는 _OPEN 을 6번 부른다). *)
+  mutable frames : int;
+  mutable rtc_reg : int;
   mutable con_esc : int;
       (** VT52 escape-sequence state for the BDOS console: 0=plain, 1=after
           ESC, 2=after "ESC Y" (row byte next), 3=column byte next. *)
@@ -301,8 +303,6 @@ let mem_write m addr v =
     Bytes.set m.ram base (Char.chr (v land 0xff))
   end
 
-let rtc_reg = ref 0
-
 (* PSG R#14 = 조이스틱 포트 입력. R#15 bit6 이 포트 선택(0 = 1번), 2번 포트는
    비어 있다. bit6 = 키배열 점퍼(50on = 0), bit7 = 카세트 입력(0).
    정본: openMSX MSXPSG::readA, DummyJoystick::read = 0x3F. *)
@@ -345,7 +345,7 @@ let port_write m port v =
   | 0xFC | 0xFD | 0xFE | 0xFF ->
     mapper_writes.(port land 3) <- mapper_writes.(port land 3) + 1;
     m.mapper.(port land 3) <- v land 0x3f
-  | 0xB4 -> rtc_reg := v
+  | 0xB4 -> m.rtc_reg <- v land 0xff
   | _ -> ()
 
 (* 메모리 쓰기 감시 — write 클로저가 참조하므로 create 보다 앞에. *)
@@ -388,6 +388,8 @@ let create ~machine =
       disk = Bytes.make 0 '\000';
       disk_dma = 0x0080;
       bdos_files = Hashtbl.create 4;
+      frames = 0;
+      rtc_reg = 0;
       con_esc = 0;
       rst30_pending = [];
       ram = Bytes.make (ram_kb * 1024) '\000';
@@ -992,9 +994,11 @@ let step t ~frames =
       incr instr_count;
       ignore (Vdp.advance t.vdp ~cycles:used);
       budget := !budget - used
-    done
+    done;
+    t.frames <- t.frames + 1
   done
 
+let frame_number t = t.frames
 let dump_pc t = Z80.dump_pc t.cpu
 
 let screen_text t =
@@ -1097,8 +1101,95 @@ let frame_dims t = Vdp.frame_dims t.vdp
 
 let frame_rgb t = Vdp.frame_rgb t.vdp
 
-let serialize _ = failwith "savestate: P1 범위 밖"
-let restore ~state:_ = failwith "savestate: P1 범위 밖"
+let mapper_code = function
+  | Flat -> 0 | Konami -> 1 | Konami_scc -> 2 | Ascii8 -> 3 | Ascii16 -> 4 | Ascii8_sram -> 5
+let mapper_of_code = function
+  | 0 -> Flat | 1 -> Konami | 2 -> Konami_scc | 3 -> Ascii8 | 4 -> Ascii16 | 5 -> Ascii8_sram
+  | _ -> State_codec.fail "invalid cartridge mapper"
+
+let serialize t =
+  let w = State_codec.writer () in
+  (* RAM/media first so restore can create correctly bound CPU callbacks. *)
+  List.iter (State_codec.put_bytes w)
+    [t.ram; t.main_rom; t.logo_rom; t.sub_rom; t.cart; t.cart_sram; t.disk];
+  State_codec.put_int w (mapper_code t.cart_mapper);
+  State_codec.put_int_array w t.cart_banks;
+  State_codec.put_int_array w t.mapper;
+  State_codec.put_int_array w t.psg;
+  Array.iter (State_codec.put_bool w) t.keys;
+  State_codec.put_int w t.frames;
+  State_codec.put_int w t.cart_sram_bit;
+  State_codec.put_int w t.disk_dma;
+  State_codec.put_int w t.rtc_reg;
+  State_codec.put_int w t.con_esc;
+  State_codec.put_int w t.ppi_a;
+  State_codec.put_int w t.ppi_c;
+  State_codec.put_int w t.slot3_sel;
+  State_codec.put_int w t.psg_latch;
+  State_codec.put_int w t.joy1;
+  State_codec.put_int w (List.length t.rst30_pending);
+  List.iter (fun (pc, slots) -> State_codec.put_int w pc; State_codec.put_int w slots) t.rst30_pending;
+  let files = Hashtbl.to_seq t.bdos_files |> List.of_seq |> List.sort (fun (a,_) (b,_) -> compare a b) in
+  State_codec.put_int w (List.length files);
+  List.iter (fun (fcb, (data, pos)) ->
+    State_codec.put_int w fcb; State_codec.put_bytes w data; State_codec.put_int w pos) files;
+  Z80.write_state w t.cpu;
+  Vdp.write_state w t.vdp;
+  State_codec.finish w
+
+let restore ~state =
+  try
+    let r = State_codec.reader state in
+    let ram = State_codec.get_bytes r in
+    (* Current mapper exposes 6 bank bits, 16K each. *)
+    let ram_size = Bytes.length ram in
+    if ram_size < 65536 || ram_size > 64 * 16384 || ram_size mod 16384 <> 0 then
+      State_codec.fail "invalid RAM size";
+    let main = State_codec.get_bytes r in
+    let logo = State_codec.get_bytes r in
+    let sub = State_codec.get_bytes r in
+    let t = create ~machine:{ram_kb = ram_size / 1024; vram_kb = 128;
+        roms = List.map Bytes.to_string [main; logo; sub]} in
+    Bytes.blit ram 0 t.ram 0 ram_size;
+    t.cart <- State_codec.get_bytes r;
+    t.cart_sram <- State_codec.get_bytes r;
+    let sram_size = Bytes.length t.cart_sram in
+    if sram_size <> 0 && (sram_size mod 8192 <> 0 || sram_size land (sram_size - 1) <> 0) then
+      State_codec.fail "invalid cartridge SRAM size";
+    t.disk <- State_codec.get_bytes r;
+    t.cart_mapper <- mapper_of_code (State_codec.get_int r ~min:0 ~max:5);
+    State_codec.fill_int_array r ~min:0 ~max:255 t.cart_banks;
+    State_codec.fill_int_array r ~min:0 ~max:63 t.mapper;
+    State_codec.fill_int_array r ~min:0 ~max:255 t.psg;
+    Array.iteri (fun i _ -> t.keys.(i) <- State_codec.get_bool r) t.keys;
+    t.frames <- State_codec.get_int r ~min:0 ~max:max_int;
+    t.cart_sram_bit <- State_codec.get_int r ~min:0 ~max:max_int;
+    t.disk_dma <- State_codec.get_int r ~min:0 ~max:65535;
+    t.rtc_reg <- State_codec.get_int r ~min:0 ~max:255;
+    t.con_esc <- State_codec.get_int r ~min:0 ~max:3;
+    t.ppi_a <- State_codec.get_int r ~min:0 ~max:255;
+    t.ppi_c <- State_codec.get_int r ~min:0 ~max:255;
+    t.slot3_sel <- State_codec.get_int r ~min:0 ~max:255;
+    t.psg_latch <- State_codec.get_int r ~min:0 ~max:255;
+    t.joy1 <- State_codec.get_int r ~min:0 ~max:255;
+    let pending = State_codec.get_int r ~min:0 ~max:(State_codec.remaining r / 16) in
+    t.rst30_pending <- List.init pending (fun _ ->
+      let pc = State_codec.get_int r ~min:0 ~max:65535 in
+      let slots = State_codec.get_int r ~min:0 ~max:255 in pc, slots);
+    let files = State_codec.get_int r ~min:0 ~max:65536 in
+    for _ = 1 to files do
+      let fcb = State_codec.get_int r ~min:0 ~max:65535 in
+      if Hashtbl.mem t.bdos_files fcb then State_codec.fail "duplicate saved FCB";
+      let data = State_codec.get_bytes r in
+      let pos = State_codec.get_int r ~min:0 ~max:max_int in
+      Hashtbl.add t.bdos_files fcb (data, pos)
+    done;
+    Z80.read_state r t.cpu;
+    Vdp.read_state r t.vdp;
+    State_codec.end_of_input r;
+    Ok t
+  with State_codec.Invalid_state message -> Error message
+
 
 type display_mode = Vdp.display_mode =
   | Text1

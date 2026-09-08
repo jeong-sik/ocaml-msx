@@ -56,3 +56,8 @@ val dump_iy : t -> int
 val set_ix : t -> int -> unit
 val set_iy : t -> int -> unit
 val dump_sp : t -> int
+
+(** Internal state codec; read only into a fresh unpublished CPU. *)
+val write_state : State_codec.writer -> t -> unit
+
+val read_state : State_codec.reader -> t -> unit

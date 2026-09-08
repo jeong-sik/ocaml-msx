@@ -42,3 +42,8 @@
  (name bitmap_test)
  (modules bitmap_test)
  (libraries vdpcore))
+
+(test
+ (name state_test)
+ (modules state_test)
+ (libraries msx))

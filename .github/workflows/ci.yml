@@ -26,6 +26,8 @@ jobs:
       - run: opam install . --deps-only --with-test -y
       - run: opam exec -- dune build @all
       - run: opam exec -- dune runtest
+      - name: Replay CLI continuation and failure regressions
+        run: python3 test/replay_cli_test.py _build/default/bin/replay.exe
       - name: Package exact-source diagnostic runners
         run: |
           mkdir -p artifacts

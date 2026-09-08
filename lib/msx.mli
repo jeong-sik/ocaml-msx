@@ -4,8 +4,8 @@
     {!step} 호출로만 진행한다. P0 의 Z80 과 P1 의 V9938(TMS 호환)·PPI·
     RAM 매퍼를 배선한 MSX2 머신이다.
 
-    지금 시점의 경계: 스프라이트 렌더·command engine·사운드 출력·
-    savestate 은 없다 (P2/P3). 인터럽트는 VBlank INT 하나만 나간다. *)
+    Sound output remains unimplemented. Versioned save states include CPU,
+    VDP, memory, mounted media and device state; file IO belongs to callers. *)
 
 type key =
   | Up
@@ -102,6 +102,9 @@ val port_out : t -> int -> int -> unit
 val step : t -> frames:int -> unit
 (** [frames] 프레임만큼 진행. 한 프레임 = 262 라인 × 228 사이클. *)
 
+val frame_number : t -> int
+(** Completed frames since creation; preserved by save states. *)
+
 val dump_pc : t -> int
 (** 현재 PC — 부트 하네스 판정용. *)
 
@@ -174,9 +177,13 @@ val frame_dims : t -> int * int
 val frame_rgb : t -> string
 
 val serialize : t -> string
-(** 아직 없다 — P1 범위 밖. 호출하면 예외. *)
+(** Versioned, checksummed machine snapshot. Includes mounted ROM/disk bytes,
+    writable SRAM, pending VDP transfers and open BDOS files. Debug histories
+    are excluded. No file IO; the caller must persist the returned bytes. *)
 
-val restore : state:string -> t
+val restore : state:string -> (t, string) result
+(** Rejects invalid version, checksum, truncated data or invalid device state.
+    Returns a new independent machine; the old machine is never modified. *)
 
 (** 관측 — 화면을 그리지 않는 클라이언트(텍스트 keeper)가 기계 상태를 읽는
     면. 프레임 픽셀은 {!frame_rgb}, 여기는 그 아래의 구조다. *)

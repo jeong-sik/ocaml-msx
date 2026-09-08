@@ -838,3 +838,65 @@ let interrupt z =
     z.iff2 <- false;
     true
   end
+
+let write_state w z =
+  State_codec.put_int w z.a;
+  State_codec.put_int w z.f;
+  State_codec.put_int w z.b;
+  State_codec.put_int w z.c;
+  State_codec.put_int w z.d;
+  State_codec.put_int w z.e;
+  State_codec.put_int w z.h;
+  State_codec.put_int w z.l;
+  State_codec.put_int w z.a2;
+  State_codec.put_int w z.f2;
+  State_codec.put_int w z.b2;
+  State_codec.put_int w z.c2;
+  State_codec.put_int w z.d2;
+  State_codec.put_int w z.e2;
+  State_codec.put_int w z.h2;
+  State_codec.put_int w z.l2;
+  State_codec.put_int w z.i;
+  State_codec.put_int w z.r;
+  State_codec.put_int w z.ix;
+  State_codec.put_int w z.iy;
+  State_codec.put_int w z.sp;
+  State_codec.put_int w z.pc;
+  State_codec.put_int w z.im;
+  State_codec.put_int w z.t;
+  State_codec.put_bool w z.iff1;
+  State_codec.put_bool w z.iff2;
+  State_codec.put_bool w z.halted;
+  State_codec.put_bool w z.after_ei;
+  ()
+
+let read_state r z =
+  z.a <- State_codec.get_int r ~min:0 ~max:255;
+  z.f <- State_codec.get_int r ~min:0 ~max:255;
+  z.b <- State_codec.get_int r ~min:0 ~max:255;
+  z.c <- State_codec.get_int r ~min:0 ~max:255;
+  z.d <- State_codec.get_int r ~min:0 ~max:255;
+  z.e <- State_codec.get_int r ~min:0 ~max:255;
+  z.h <- State_codec.get_int r ~min:0 ~max:255;
+  z.l <- State_codec.get_int r ~min:0 ~max:255;
+  z.a2 <- State_codec.get_int r ~min:0 ~max:255;
+  z.f2 <- State_codec.get_int r ~min:0 ~max:255;
+  z.b2 <- State_codec.get_int r ~min:0 ~max:255;
+  z.c2 <- State_codec.get_int r ~min:0 ~max:255;
+  z.d2 <- State_codec.get_int r ~min:0 ~max:255;
+  z.e2 <- State_codec.get_int r ~min:0 ~max:255;
+  z.h2 <- State_codec.get_int r ~min:0 ~max:255;
+  z.l2 <- State_codec.get_int r ~min:0 ~max:255;
+  z.i <- State_codec.get_int r ~min:0 ~max:255;
+  z.r <- State_codec.get_int r ~min:0 ~max:255;
+  z.ix <- State_codec.get_int r ~min:0 ~max:65535;
+  z.iy <- State_codec.get_int r ~min:0 ~max:65535;
+  z.sp <- State_codec.get_int r ~min:0 ~max:65535;
+  z.pc <- State_codec.get_int r ~min:0 ~max:65535;
+  z.im <- State_codec.get_int r ~min:0 ~max:2;
+  z.t <- State_codec.get_int r ~min:0 ~max:max_int;
+  z.iff1 <- State_codec.get_bool r;
+  z.iff2 <- State_codec.get_bool r;
+  z.halted <- State_codec.get_bool r;
+  z.after_ei <- State_codec.get_bool r;
+  ()

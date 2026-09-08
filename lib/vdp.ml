@@ -655,3 +655,67 @@ let frame_rgb t =
     end;
     Bytes.to_string img
   end
+
+let write_state w t =
+  State_codec.put_int_array w t.regs;
+  State_codec.put_bytes w t.vram;
+  State_codec.put_int_array w t.palette;
+  State_codec.put_bool w (Option.is_some t.pal_first);
+  Option.iter (State_codec.put_int w) t.pal_first;
+  State_codec.put_int w t.addr;
+  State_codec.put_int w t.latch_lo;
+  State_codec.put_int w t.read_buf;
+  State_codec.put_int w t.pal_idx;
+  State_codec.put_int w t.status0;
+  State_codec.put_int w t.status1;
+  State_codec.put_int w t.line;
+  State_codec.put_int w t.cycle_in_line;
+  State_codec.put_int w t.tx_dx;
+  State_codec.put_int w t.tx_adx;
+  State_codec.put_int w t.tx_anx;
+  State_codec.put_int w t.tx_nx;
+  State_codec.put_int w t.tx_dy;
+  State_codec.put_int w t.tx_ny;
+  State_codec.put_bool w t.write_mode;
+  State_codec.put_bool w t.latch_first;
+  State_codec.put_bool w t.int_pending;
+  State_codec.put_bool w t.cmd_ce;
+  State_codec.put_bool w t.tx_active;
+  State_codec.put_bool w t.tx_hm;
+  State_codec.put_bool w t.cmd_tr;
+  State_codec.put_bool w t.tx_pending;
+  ()
+
+let read_state r t =
+  State_codec.fill_int_array r ~min:0 ~max:255 t.regs;
+  let vram = State_codec.get_bytes r in
+  if Bytes.length vram <> Bytes.length t.vram then State_codec.fail "invalid VRAM size";
+  Bytes.blit vram 0 t.vram 0 (Bytes.length vram);
+  State_codec.fill_int_array r ~min:0 ~max:0x777 t.palette;
+  t.pal_first <- (if State_codec.get_bool r then Some (State_codec.get_int r ~min:0 ~max:255) else None);
+  t.addr <- State_codec.get_int r ~min:(0) ~max:16383;
+  t.latch_lo <- State_codec.get_int r ~min:(0) ~max:255;
+  t.read_buf <- State_codec.get_int r ~min:(0) ~max:255;
+  t.pal_idx <- State_codec.get_int r ~min:(0) ~max:15;
+  t.status0 <- State_codec.get_int r ~min:(0) ~max:255;
+  t.status1 <- State_codec.get_int r ~min:(0) ~max:255;
+  t.line <- State_codec.get_int r ~min:(0) ~max:261;
+  t.cycle_in_line <- State_codec.get_int r ~min:(0) ~max:227;
+  t.tx_dx <- State_codec.get_int r ~min:(0) ~max:511;
+  (* ARG and mode can change during a transfer: permit every coordinate
+     reachable across 512 units at up to four pixels per byte. *)
+  t.tx_adx <- State_codec.get_int r ~min:(-2048) ~max:2559;
+  t.tx_anx <- State_codec.get_int r ~min:(0) ~max:512;
+  t.tx_nx <- State_codec.get_int r ~min:(0) ~max:512;
+  t.tx_dy <- State_codec.get_int r ~min:(-1024) ~max:2047;
+  t.tx_ny <- State_codec.get_int r ~min:(0) ~max:1024;
+  t.write_mode <- State_codec.get_bool r;
+  t.latch_first <- State_codec.get_bool r;
+  t.int_pending <- State_codec.get_bool r;
+  t.cmd_ce <- State_codec.get_bool r;
+  t.tx_active <- State_codec.get_bool r;
+  t.tx_hm <- State_codec.get_bool r;
+  t.cmd_tr <- State_codec.get_bool r;
+  t.tx_pending <- State_codec.get_bool r;
+  if t.tx_active && (t.tx_nx = 0 || t.tx_anx = 0 || t.tx_anx > t.tx_nx || t.tx_ny = 0) then
+    State_codec.fail "invalid active VDP transfer"
