@@ -23,8 +23,12 @@ val advance : t -> cycles:int -> bool
 val int_active : t -> bool
 (** 인터럽트 라인 상태 — IE 가 켜져 있고 status0 비트7 이 서 있는 동안. *)
 
+val frame_dims : t -> int * int
+(** Bitmap modes retain native width (SCREEN6/7: 512, SCREEN5/8: 256)
+    and R#9 LN selects 192 or 212 visible lines. *)
+
 val frame_rgb : t -> string
-(** 현재 VRAM 을 256×192 RGB (row-major, 채널 R,G,B) 로 렌더.
+(** 현재 VRAM 을 {!frame_dims} RGB (row-major, 채널 R,G,B) 로 렌더.
     BLANK(R1 bit6) 꺼짐이면 검은 화면. *)
 
 val vram : t -> Bytes.t

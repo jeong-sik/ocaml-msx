@@ -37,3 +37,8 @@
  (name disk_test)
  (modules disk_test)
  (libraries msx))
+
+(test
+ (name bitmap_test)
+ (modules bitmap_test)
+ (libraries vdpcore))
