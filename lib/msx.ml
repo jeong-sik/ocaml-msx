@@ -822,6 +822,64 @@ let disk_trap t pc =
         | None ->
           if !disk_call_log then Printf.eprintf "BDOS open '%s' -> NOT FOUND\n%!" name;
           0xff)
+      | 0x16 -> (
+        let name = String.init 11 (fun i -> Char.chr (fcb (1 + i))) in
+        if fcb 0 > 1 then 0xff
+        else
+          let validated = Disk_fat12.validate_writable_file ~image:t.disk ~name in
+          let existing = if Result.is_ok validated && fcb 0x0c <> 0 then fat12_open t name else None in
+          let result = match validated, existing with
+            | Error error, _ -> Error error
+            | Ok (), Some data -> Ok (t.disk, data)
+            | Ok (), None -> Result.map (fun disk -> disk, Bytes.empty)
+                (Disk_fat12.put_file ~image:t.disk ~name ~data:Bytes.empty) in
+          match result with
+          | Error _ -> 0xff
+          | Ok (disk, data) ->
+            t.disk <- disk;
+            Hashtbl.replace t.bdos_files de (data, 0);
+            let extent = fcb 0x0c in
+            for i = 0x0c to 0x24 do mem_write t ((de + i) land 0xffff) 0 done;
+            mem_write t ((de + 0x0c) land 0xffff) extent;
+            mem_write t ((de + 0x0e) land 0xffff) 128;
+            for i = 0 to 3 do
+              mem_write t ((de + 0x10 + i) land 0xffff) ((Bytes.length data lsr (8 * i)) land 255)
+            done;
+            0x00)
+      | 0x26 -> (
+        let name = String.init 11 (fun i -> Char.chr (fcb (1 + i))) in
+        let current = if Hashtbl.mem t.bdos_files de
+          && Result.is_ok (Disk_fat12.validate_writable_file ~image:t.disk ~name)
+          then fat12_open t name else None in
+        match current with
+        | None -> 0x01
+        | Some data ->
+          let size = fcb 0x0e lor (fcb 0x0f lsl 8) in
+          let record = fcb 0x21 lor (fcb 0x22 lsl 8) lor (fcb 0x23 lsl 16)
+            lor (if size < 64 then fcb 0x24 lsl 24 else 0) in
+          let count = Z80.dump_hl t.cpu in
+          let start = record * size and amount = count * size in
+          let length = if count = 0 then start else max (Bytes.length data) (start + amount) in
+          if size = 0 || amount > 65536 || length > Bytes.length t.disk || fcb 0 > 1 then 0x01
+          else
+            let updated = Bytes.make length '\000' in
+            Bytes.blit data 0 updated 0 (min length (Bytes.length data));
+            for i = 0 to amount - 1 do
+              Bytes.set updated (start + i) (Char.chr (mem_read t ((t.disk_dma + i) land 0xffff)))
+            done;
+            let name = String.init 11 (fun i -> Char.chr (fcb (1 + i))) in
+            match Disk_fat12.put_file ~image:t.disk ~name ~data:updated with
+            | Error _ -> 0x01
+            | Ok disk ->
+              t.disk <- disk;
+              Hashtbl.replace t.bdos_files de (updated, start + amount);
+              for i = 0 to (if size < 64 then 3 else 2) do
+                mem_write t ((de + 0x21 + i) land 0xffff) (((record + count) lsr (8 * i)) land 255)
+              done;
+              for i = 0 to 3 do
+                mem_write t ((de + 0x10 + i) land 0xffff) ((length lsr (8 * i)) land 255)
+              done;
+              0x00)
       | 0x10 ->
         (* _CLOSE: drop the server-side file state. *)
         Hashtbl.remove t.bdos_files de;
@@ -932,6 +990,7 @@ let disk_trap t pc =
           if n < want then 0x01 else 0x00)
       | _ -> 0xff
     in
+    if c = 0x16 then Z80.set_hl t.cpu ((Z80.dump_hl t.cpu land 0xff00) lor a);
     Z80.set_af t.cpu ((a lsl 8) lor (Z80.dump_f t.cpu land 0xff));
     let sp = Z80.dump_sp t.cpu in
     let ret = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in

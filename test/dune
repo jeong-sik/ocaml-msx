@@ -47,3 +47,8 @@
  (name state_test)
  (modules state_test)
  (libraries msx))
+
+(test
+ (name fat12_write_test)
+ (modules fat12_write_test)
+ (libraries msx))
