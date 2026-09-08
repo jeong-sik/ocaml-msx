@@ -171,7 +171,10 @@ let guess_mapper rom =
         (match addr with 0x6000 | 0x7000 -> incr a16 | _ -> ())
       end
     done;
-    if !a8 > 0 && !a8 >= !scc && !a8 >= !konami then Ascii8
+    (* ASCII8 detection returns the SRAM-capable variant: the SRAM only engages
+       when a bank sets its select bit (Koei games do; plain ASCII8 never does),
+       so it is a safe superset and lets Koei carts boot without an override. *)
+    if !a8 > 0 && !a8 >= !scc && !a8 >= !konami then Ascii8_sram
     else if !scc > 0 && !scc >= !konami then Konami_scc
     else if !konami > 0 then Konami
     else if !a16 > 0 then Ascii16
