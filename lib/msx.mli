@@ -73,10 +73,10 @@ val load_disk : ?interface_rom:bool -> t -> string -> unit
 val boot_disk : t -> (unit, string) result
 (** Replay the Disk ROM's second-stage call onto a machine whose C-BIOS boot
     has already run: boot sector to 0xC000, RAM in page 0, CALL 0xC01E with
-    carry set. Needs {!load_disk ~interface_rom:false} first and ~720 frames
-    of C-BIOS stepped before it, so the inter-slot primitives sit in RAM.
-    This is the path a game's loader runs to its title on; the cart-INIT path
-    reboots mid-boot (see the implementation note). *)
+    carry set. Needs {!load_disk} with [interface_rom:false] first and ~720
+    frames of C-BIOS stepped before it, so the inter-slot primitives sit in
+    RAM. This is the path a game's loader runs to its title on; the
+    cart-INIT path reboots mid-boot (see the implementation note). *)
 
 val set_disk_call_log : bool -> unit
 (** Record each disk BIOS entry the running code reaches — for learning the
@@ -109,7 +109,7 @@ val screen_text : t -> string
 (** name table 을 40×24 (또는 32×24) 문자 그리드로 — 부트 판정용. *)
 
 val set_watch_enter : int -> int -> unit
-(** PC 가 [lo,hi) 에 처음 들어가면 직전 40스텝을 stderr 로. *)
+(** PC 가 lo 이상 hi 미만 구간에 처음 들어가면 직전 40스텝을 stderr 로. *)
 
 val set_trace_from : int -> int -> unit
 (** PC 가 [pc] 에 도달하면 그 시점부터 [n] 스텝을 stderr 로 트레이스. *)
