@@ -32,7 +32,7 @@ let u16 b off v =
    같은 BDOS 호출 열을 수행하고 커널(0x0100)로 점프한다. *)
 let boot_code =
   sbytes
-    [| 0xC0; (* RET NC *)
+    [| 0xD0; (* RET NC — carry set 으로 진입하면 통과 *)
        0x31; 0x1F; 0xF5; (* LD SP,0xF51F *)
        0x11; 0xB0; 0xC0; (* LD DE,0xC0B0 (FCB) *)
        0x0E; 0x0F; (* LD C,open *)
@@ -105,17 +105,29 @@ let dsk () =
   Bytes.to_string d
 
 let rom_names =
-  [ "roms/cbios/cbios_main_msx2.rom"; "roms/cbios/cbios_logo_msx2.rom"; "roms/cbios/cbios_sub.rom" ]
+  [ "cbios_main_msx2.rom"; "cbios_logo_msx2.rom"; "cbios_sub.rom" ]
+
+(* dune 실행 CWD가 어디냐에 따라 roms/ 가 다른 상대 깊이에 있다. *)
+let roms_dir () =
+  List.find_opt
+    (fun dir -> List.for_all (fun f -> Sys.file_exists (Filename.concat dir f)) rom_names)
+    [ "roms/cbios"; "../roms/cbios"; "../../roms/cbios"; "../../../roms/cbios" ]
 
 let () =
-  if List.exists (fun f -> not (Sys.file_exists f)) rom_names then
-    Printf.eprintf "SKIP disk_test: C-BIOS ROM 없음 (roms/ 는 gitignore)\n%!"
-  else begin
-    let roms = List.map read_file rom_names in
+  match roms_dir () with
+  | None -> Printf.eprintf "SKIP disk_test: C-BIOS ROM 없음 (roms/ 는 gitignore)\n%!"
+  | Some dir ->
+    let roms = List.map (fun f -> read_file (Filename.concat dir f)) rom_names in
     let t = Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms } in
+    Msx.set_disk_call_log true;
     Msx.load_disk t (dsk ());
     for _ = 1 to 500 do Msx.step t ~frames:1 done;
+    let entries = Msx.disk_call_entries () in
+    check "boot sector loader ran INIT + open/setdma/read"
+      (List.length entries >= 4
+      && List.exists (fun (pc, _, _, _, _, _) -> pc = 0xf37d) entries);
+    Printf.eprintf "disk_test: %d disk traps\n%!" (List.length entries);
     let got = String.init 8 (fun i -> Char.chr (Msx.vram_read t (0x1800 + i))) in
-    check "disk boot renders payload at 0x1800" (got = "FAT12 OK");
+    check (Printf.sprintf "disk boot renders payload at 0x1800 (got %S)" got)
+      (got = "FAT12 OK");
     if !failures > 0 then exit 1
-  end

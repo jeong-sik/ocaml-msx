@@ -74,6 +74,8 @@ let dump_de z = (z.d lsl 8) lor z.e
 let dump_hl z = (z.h lsl 8) lor z.l
 let dump_ix z = z.ix
 let dump_iy z = z.iy
+let set_ix z v = z.ix <- v land 0xffff
+let set_iy z v = z.iy <- v land 0xffff
 let dump_sp z = z.sp
 
 (* 한 step 의 T-state 카운터. *)

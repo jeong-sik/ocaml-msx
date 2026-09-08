@@ -382,6 +382,7 @@ let load_cartridge ?mapper t rom =
 let disk_sector_bytes = 512
 let disk_init_entry = 0x4100 (* the "AB" INIT vector; C-BIOS CALLSLTs here *)
 let disk_dskio_entry = 0x4010 (* DSKIO; the standard disk BIOS jumptable offset *)
+let disk_inienv_entry = 0x4030 (* INIENV; the MSX-DOS kernel init calls this first *)
 let disk_bdos_entry = 0xf37d (* MSX DISK-BASIC system-call entry; C = function *)
 let disk_boot_addr = 0xc000 (* boot sector lands here; entry at +0x1e *)
 
@@ -428,9 +429,12 @@ let disk_transfer t ~write ~sector ~count ~addr =
 let dsk_u8 t off = if off < Bytes.length t.disk then Char.code (Bytes.get t.disk off) else 0
 let dsk_u16 t off = dsk_u8 t off lor (dsk_u8 t (off + 1) lsl 8)
 
+let rec ilog2 n = if n <= 1 then 0 else 1 + ilog2 (n / 2)
+
 type fat12 = {
   bytes_per_sec : int;
   sec_per_clus : int;
+  sec_per_fat : int;
   root_start_sec : int;
   root_entries : int;
   data_start_sec : int;
@@ -446,7 +450,7 @@ let fat12_of t =
   let sec_per_fat = dsk_u16 t 0x16 in
   let root_start_sec = reserved + (num_fats * sec_per_fat) in
   let root_sectors = ((root_entries * 32) + bytes_per_sec - 1) / bytes_per_sec in
-  { bytes_per_sec; sec_per_clus; root_start_sec; root_entries;
+  { bytes_per_sec; sec_per_clus; sec_per_fat; root_start_sec; root_entries;
     data_start_sec = root_start_sec + root_sectors; fat_start_sec = reserved }
 
 (* Next cluster in the FAT12 chain (12 bits packed, low/high nibble by parity). *)
@@ -544,6 +548,15 @@ let disk_trap t pc =
     Z80.set_pc t.cpu (disk_boot_addr + 0x1e);
     true
   end
+  else if pc = disk_inienv_entry then begin
+    (* INIENV, observation stub: just return. Measures how far the kernel
+       gets before it needs what a real INIENV installs. *)
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in
+    Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+    Z80.set_pc t.cpu ret;
+    true
+  end
   else if pc = disk_dskio_entry then begin
     (* DSKIO: A=drive, B=sectors, C=media, DE=first sector, HL=addr, carry=write
        on entry. Success returns carry clear, B=0 remaining; then RET. *)
@@ -595,6 +608,59 @@ let disk_trap t pc =
           0xff)
       | 0x1a ->
         t.disk_dma <- de;
+        0x00
+      | 0x0d ->
+        (* Disk reset: default drive A, DMA back to 0x0080. *)
+        t.disk_dma <- 0x0080;
+        0x00
+      | 0x19 ->
+        (* Default drive: A. *)
+        0x00
+      | 0x1b when Bytes.length t.disk > 0 ->
+        (* Disk information (MSX-DOS specific). A=sectors/cluster, BC=sector
+           size, DE=clusters+1, IX=DPB address, IY=FAT in memory. The FAT copy
+           and DPB live above the boot sector image: FAT @ 0xC800 (one FAT),
+           DPB right after it -- what a real disk ROM installs for the boot
+           loader to parse. *)
+        let fs = fat12_of t in
+        let fat_bytes = fs.sec_per_fat * fs.bytes_per_sec in
+        let fat_addr = 0xc800 in
+        let dpb = fat_addr + fat_bytes in
+        let w off v =
+          mem_write t (dpb + off) (v land 0xff);
+          mem_write t (dpb + off + 1) ((v lsr 8) land 0xff)
+        in
+        for i = 0 to fat_bytes - 1 do
+          mem_write t (fat_addr + i)
+            (dsk_u8 t ((fs.fat_start_sec * fs.bytes_per_sec) + i))
+        done;
+        let clusters = (dsk_u16 t 0x13 - fs.data_start_sec) / fs.sec_per_clus in
+        mem_write t dpb 0; (* drive A *)
+        mem_write t (dpb + 1) (dsk_u8 t 0x15); (* media ID *)
+        w 2 fs.bytes_per_sec;
+        mem_write t (dpb + 4) ((fs.bytes_per_sec / 32) - 1); (* dir mask *)
+        mem_write t (dpb + 5) (ilog2 (fs.bytes_per_sec / 32));
+        mem_write t (dpb + 6) (fs.sec_per_clus - 1); (* cluster mask *)
+        mem_write t (dpb + 7) (ilog2 fs.sec_per_clus);
+        w 8 fs.fat_start_sec; (* top sector of FAT *)
+        mem_write t (dpb + 10) (dsk_u8 t 0x10); (* number of FATs *)
+        mem_write t (dpb + 11) fs.root_entries;
+        w 12 fs.data_start_sec; (* top sector of data area *)
+        w 14 (clusters + 1);
+        mem_write t (dpb + 16) fs.sec_per_fat;
+        w 17 fs.root_start_sec;
+        w 19 fat_addr; (* FAT address in memory *)
+        Z80.set_bc t.cpu fs.bytes_per_sec;
+        Z80.set_de t.cpu (clusters + 1);
+        Z80.set_ix t.cpu dpb;
+        Z80.set_iy t.cpu fat_addr;
+        fs.sec_per_clus
+      | 0x2f when Bytes.length t.disk > 0 ->
+        (* Absolute logical-sector read: DE=first sector, H=count, L=drive.
+           The .dsk is a raw image, so a logical sector IS a file sector. *)
+        let sector = Z80.dump_de t.cpu in
+        let count = (Z80.dump_hl t.cpu lsr 8) land 0xff in
+        disk_transfer t ~write:false ~sector ~count ~addr:t.disk_dma;
         0x00
       | 0x27 -> (
         match t.disk_open with
