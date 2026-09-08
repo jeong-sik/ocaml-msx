@@ -382,11 +382,17 @@ let load_cartridge ?mapper t rom =
 let dpb_2dd : string =
   "\xf9\x09\x02\x02\x02\x01\x01\x02\x70\x00\x0a\xf5\x03\xf9\x02\x00"
 
+let disk_trap_counts_arr : int array = Array.make 8 0
+let disk_trap_index = function
+  | 0x4013 -> 0 | 0x4016 -> 1 | 0x4019 -> 2 | 0x401c -> 3 | 0x401f -> 4
+  | _ -> 5
+
 (* DISK BIOS 엔트리 서비스. 0x4013 DSKIO(읽기만: A=드라이브, C=섹터 수,
    DE=논리 섹터, HL=버퍼), 0x4016 DSKCHG(변경 없음), 0x4019 GETDPB(표준
    2DD), 0x401C CHOICE(빈 답), 0x401F DSKFMT(거부). 성공은 CF 를 내리고
    실패는 CF 와 A 에 코드를 싣는다 — 호출자가 보는 계약 그대로. *)
 let serve_disk_entry m pc =
+  disk_trap_counts_arr.(disk_trap_index pc) <- disk_trap_counts_arr.(disk_trap_index pc) + 1;
   match pc with
   | 0x4013 ->
       let cpu = m.cpu in
@@ -451,6 +457,8 @@ let boot_disk m =
           String.iteri (fun i c -> mem_write m (0xC000 + i) (Char.code c)) b;
           Z80.set_pc m.cpu 0xC000;
           Ok ())
+
+let disk_trap_counts () = disk_trap_counts_arr
 
 let set_key t k ~pressed =
   match key_target k with

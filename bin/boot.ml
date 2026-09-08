@@ -246,4 +246,5 @@ let () =
   let oc = open_out_bin (!out_prefix ^ ".ppm") in
   Printf.fprintf oc "P6\n256 192\n255\n%s" rgb;
   close_out oc;
+  Array.iteri (fun i n -> Printf.printf "trap %d: %d\n" i n) (Msx.disk_trap_counts ());
   Printf.printf "wrote %s.ppm\n" !out_prefix

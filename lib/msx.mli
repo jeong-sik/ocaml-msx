@@ -40,6 +40,11 @@ val create : machine:machine -> t
 val name : t -> string
 
 val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
+val disk_trap_counts : unit -> int array
+(** Per-entry DISK BIOS trap counts, for boot diagnosis: entry 0 is DSKIO,
+    1 DSKCHG, 2 GETDPB, 3 CHOICE, 4 DSKFMT, 5 the rest of the range. A
+    loader stuck with all zeros reads the FDC hardware itself. *)
+
 val load_disk : t -> string -> unit
 (** Attach a raw .dsk floppy image and arm the DISK BIOS entry trap: the
     DSKIO/DSKCHG/GETDPB entries in slot 1 page 1 are served from the image
