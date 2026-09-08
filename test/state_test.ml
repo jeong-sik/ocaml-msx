@@ -169,7 +169,7 @@ let () =
   (* The old FCB cannot silently return cached bytes from the removed disk. *)
   List.iteri (fun i byte -> Msx.mem_write disk (0xc080 + i) byte) [0xc3;0x90;0xc0];
   Msx.step disk ~frames:1;
-  check "removed disk FCB cache invalidated" (Msx.mem_read disk 0xc302 = 0xff && Msx.mem_read disk 0xc200 = 0x11);
+  check "removed disk FCB cache invalidated" (Msx.dump_pc disk = 0xc0a0 && Msx.mem_read disk 0xc302 = 0xff && Msx.mem_read disk 0xc200 = 0x11);
   let empty = fresh () in
   check "swap requires mounted drive" (Result.is_error (Msx.change_disk empty (String.make 512 '\000')));
   List.iter (fun n ->
