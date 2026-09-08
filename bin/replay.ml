@@ -11,6 +11,9 @@
 
 let roms_dir = ref ""
 let cart = ref ""
+let disk = ref ""
+let restore_state = ref ""
+let save_state = ref ""
 let ledger = ref ""
 let out_dir = ref "/tmp/msx-replay"
 let every = ref 5
@@ -98,6 +101,9 @@ let () =
   Arg.parse
     [ ("--roms", Arg.Set_string roms_dir, "DIR  C-BIOS roms directory");
       ("--cart", Arg.Set_string cart, "PATH  cartridge ROM the ledger was recorded on");
+      ("--disk", Arg.Set_string disk, "PATH  disk image to warm-boot");
+      ("--restore-state", Arg.Set_string restore_state, "FILE  resume a saved machine instead of booting");
+      ("--save-state", Arg.Set_string save_state, "FILE  atomically save the final machine state");
       ("--ledger", Arg.Set_string ledger, "FILE  the .masc/msx/ledger.jsonl to replay");
       ("--out-dir", Arg.Set_string out_dir, "DIR  where frame PPMs are written");
       ("--every", Arg.Set_int every, "N  dump one frame every N (default 5)");
@@ -105,6 +111,10 @@ let () =
     (fun _ -> ())
     "replay — reproduce a keeper's MSX session from its ledger";
   if !ledger = "" then (prerr_endline "replay: --ledger is required"; exit 2);
+  if !every < 1 || !tail < 0 then (prerr_endline "replay: --every must be positive and --tail nonnegative"; exit 2);
+  if (!restore_state <> "" && (!cart <> "" || !disk <> "" || !roms_dir <> ""))
+     || (!cart <> "" && !disk <> "") then
+    (prerr_endline "replay: choose cartridge, disk, or saved state"; exit 2);
   let roms =
     if !roms_dir = "" then [ ""; ""; "" ]
     else
@@ -114,14 +124,36 @@ let () =
           if Sys.file_exists p then read_file p else "")
         [ "cbios_main_msx2.rom"; "cbios_logo_msx2.rom"; "cbios_sub.rom" ]
   in
-  let t = Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms } in
-  if !cart <> "" then Msx.load_cartridge t (read_file !cart);
+  let t =
+    if !restore_state <> "" then
+      match Msx.restore ~state:(read_file !restore_state) with
+      | Ok t -> t | Error e -> prerr_endline e; exit 2
+    else begin
+      let t = Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms } in
+      if !cart <> "" then Msx.load_cartridge t (read_file !cart);
+      if !disk <> "" then begin
+        Msx.load_disk ~interface_rom:false t (read_file !disk);
+        Msx.step t ~frames:720;
+        match Msx.boot_disk t with
+        | Ok () -> () | Error e -> prerr_endline e; exit 2
+      end;
+      Msx.step t ~frames:boot_frames;
+      t
+    end
+  in
   (try Unix.mkdir !out_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  let initial_frame = Msx.frame_number t in
   let entries = parse_ledger !ledger in
-  let last = List.fold_left (fun m e -> max m e.at) boot_frames entries in
+  List.iter (fun e ->
+    if e.at < initial_frame then failwith "ledger entry predates initial machine state";
+    match key_of_string e.key with
+    | None -> failwith ("unknown ledger key: " ^ e.key)
+    | Some _ -> ()) entries;
+  let last = List.fold_left (fun m e -> max m e.at) initial_frame entries in
+  if !tail > max_int - last then
+    (prerr_endline "replay: final frame exceeds supported integer range"; exit 2);
   let total = last + !tail in
-  Msx.step t ~frames:boot_frames;
-  let frame = ref boot_frames in
+  let frame = ref initial_frame in
   let dumped = ref 0 in
   let dump () =
     if !frame mod !every = 0 then begin
@@ -135,16 +167,26 @@ let () =
       (fun e ->
         if e.at = f then
           match key_of_string e.key with
-          | Some k -> ignore (Msx.set_key t k ~pressed:e.down : bool)
+          | Some k -> if not (Msx.set_key t k ~pressed:e.down) then failwith ("unmapped ledger key: " ^ e.key)
           | None -> ())
       entries
   in
   while !frame < total do
-    incr frame;
     apply_at !frame;
     Msx.step t ~frames:1;
+    incr frame;
     dump ()
   done;
+  (* Apply an edge at the final boundary even when --tail is zero. *)
+  apply_at !frame;
+  write_ppm t (Filename.concat !out_dir "final.ppm");
+  if !save_state <> "" then begin
+    let tmp, oc = Filename.open_temp_file ~temp_dir:(Filename.dirname !save_state) ".msx-state-" ".tmp" in
+    Fun.protect ~finally:(fun () -> close_out_noerr oc; if Sys.file_exists tmp then Sys.remove tmp)
+      (fun () -> output_string oc (Msx.serialize t); close_out oc; Sys.rename tmp !save_state)
+  end;
+  Printf.printf "final frame=%d pc=%04x mode=%s\n"
+    (Msx.frame_number t) (Msx.dump_pc t) (Msx.display_mode_to_string (Msx.display_mode t));
   Printf.printf
     "replayed %d entries over %d frames (boot %d + play %d + tail %d); %d frames in %s\n"
-    (List.length entries) total boot_frames (last - boot_frames) !tail !dumped !out_dir
+    (List.length entries) total initial_frame (last - initial_frame) !tail !dumped !out_dir

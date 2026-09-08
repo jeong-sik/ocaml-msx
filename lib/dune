@@ -1,18 +1,26 @@
 (library
+ (name state_codec)
+ (public_name ocaml-msx.state_codec)
+ (wrapped false)
+ (modules state_codec))
+
+(library
  (name z80core)
  (public_name ocaml-msx.z80core)
  (wrapped false)
- (modules z80))
+ (modules z80)
+ (libraries state_codec))
 
 (library
  (name vdpcore)
  (public_name ocaml-msx.vdpcore)
  (wrapped false)
- (modules vdp))
+ (modules vdp)
+ (libraries state_codec))
 
 (library
  (name msx)
  (public_name ocaml-msx.msx)
  (wrapped false)
  (modules msx)
- (libraries z80core vdpcore))
+ (libraries z80core vdpcore state_codec))
