@@ -98,6 +98,11 @@ type t = {
       (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
           window); ASCII16 uses [.(0)]/[.(1)] as 16KB banks. *)
   mutable disk : Dsk.t option;  (** 플로피 이미지 — DSKIO 트랩이 서비스 *)
+  mutable bdos_dta : int;  (** _SETDTA 가 정한 전송 주소 *)
+  bdos_files : (int, string * int) Hashtbl.t;
+      (** FCB 주소 → (파일 내용, 읽은 위치) — BDOS 스텁의 서버 쪽 상태 *)
+  mutable rst30_pending : (int * int) list;
+      (** RST 30h 인터슬롯의 복귀 대기: (복귀 PC, 저장한 ppi_a) 최근 것 먼저 *)
   mutable fdc : fdc_state;
       (** WD279x 컨트롤러 근사: 명령/상태, 트랙·섹터 레지스터, 섹터 버퍼.
           포트 0xD0-0xD4 로 로더가 직접 말을 건다. *)
@@ -450,6 +455,9 @@ let create ~machine =
       cart_mapper = Flat;
       cart_banks = [| 0; 1; 2; 3 |];
       disk = None;
+      bdos_dta = 0x0080;
+      bdos_files = Hashtbl.create 4;
+      rst30_pending = [];
       fdc =
         { cmd = 0; track = 0; sector = 1; data = 0; side = 0; motor = false;
           busy = false; drq = false; intr = false; buf = Bytes.make 512 '\x00';
@@ -552,10 +560,175 @@ let disk_entry_pc = function
   | 0x4013 | 0x4016 | 0x4019 | 0x401c | 0x401f -> true
   | _ -> false
 
+(* ---------- BDOS 스텁(0xF37D) — MSX-DOS 함수 호출 서비스 ----------
+
+   Disk ROM 은 부트 섹터 코드를 부르기 전 F37D 에 DOS 엔트리를 깐다. DOS
+   커널 없이 그 엔트리를 트랩으로 서비스한다: 부트 섹터가 _OPEN/_SETDTA/
+   _RDBLK 로 시스템 파일(MSXDOS.SYS 나 KOEI.SYS)을 0x0100 에 실는 흐름을
+   대행한다. 파일 상태는 FCB 주소를 키로 서버 쪽에 둔다 — FCB 필드의 채움
+   규약을 흉내내는 대신 여는 시점의 내용을 통째로 기억한다. *)
+let bdos_call_counts : int array = Array.make 256 0
+
+let serve_bdos m =
+  let cpu = m.cpu in
+  let fn = Z80.dump_bc cpu land 0xff in
+  bdos_call_counts.(fn) <- bdos_call_counts.(fn) + 1;
+  let ret_a a = Z80.set_af cpu ((a lsl 8) land 0xff00) in
+  let read16 addr =
+    mem_read m addr lor (mem_read m ((addr + 1) land 0xffff) lsl 8)
+  in
+  let write16 addr v =
+    mem_write m addr (v land 0xff);
+    mem_write m ((addr + 1) land 0xffff) (v lsr 8)
+  in
+  let store bytes =
+    String.iteri
+      (fun i c -> mem_write m ((m.bdos_dta + i) land 0xffff) (Char.code c))
+      bytes
+  in
+  match fn with
+  | 0x09 ->
+      (* _STROUT: '$' 종결 문자열 출력. 콘손은 아직 없다 — 소비로 갈음. *)
+      let de = Z80.dump_de cpu in
+      let n = ref 0 in
+      while !n < 256 && mem_read m ((de + !n) land 0xffff) <> 0x24 do incr n done;
+      ret_a 0x00
+  | 0x0F ->
+      (* _OPEN: FCB+1..11 이름으로 디렉터리 검색. 성공이면 레코드 크기
+         기본값 128 을 FCB 에 적는다 — 호출자가 다시 쓸 수 있다. *)
+      let fcb = Z80.dump_de cpu in
+      let drive = mem_read m fcb in
+      let name = String.init 11 (fun i -> Char.chr (mem_read m (fcb + 1 + i))) in
+      let opened =
+        drive <= 1
+        &&
+        match m.disk with
+        | None -> false
+        | Some d -> (
+            match Dsk.find_file d name with
+            | Some entry -> (
+                match Dsk.read_entry d entry with
+                | Some content ->
+                    Hashtbl.replace m.bdos_files fcb (content, 0);
+                    write16 (fcb + 0x0E) 128;
+                    true
+                | None -> false)
+            | None -> false)
+      in
+      if opened then ret_a 0x00 else ret_a 0xFF
+  | 0x10 ->
+      Hashtbl.remove m.bdos_files (Z80.dump_de cpu);
+      ret_a 0x00
+  | 0x1A ->
+      m.bdos_dta <- Z80.dump_de cpu;
+      ret_a 0x00
+  | 0x14 ->
+      (* _RDSEQ: 파일 위치에서 레코드 크기(FCB+0x0E)만큼 DTA 로. *)
+      let fcb = Z80.dump_de cpu in
+      (match Hashtbl.find_opt m.bdos_files fcb with
+       | None -> ret_a 0xFF (* 열리지 않은 FCB *)
+       | Some (content, pos) -> (
+           let rs = max 1 (read16 (fcb + 0x0E)) in
+           let take = min rs (String.length content - pos) in
+           if take <= 0 then ret_a 0xFF (* 더 읽을 데이터 없음 *)
+           else begin
+             store (String.sub content pos take);
+             Hashtbl.replace m.bdos_files fcb (content, pos + take);
+             ret_a 0x00
+           end))
+  | 0x27 ->
+      (* _RDBLK: HL 레코드 × 레코드 크기를 DTA 로. 짧으면 읽은 만큼. *)
+      let fcb = Z80.dump_de cpu in
+      (match Hashtbl.find_opt m.bdos_files fcb with
+       | None -> ret_a 0xFF
+       | Some (content, pos) ->
+           let rs = max 1 (read16 (fcb + 0x0E)) in
+           let want = (Z80.dump_hl cpu * rs) land 0x1FFFF in
+           let take = max 0 (min want (String.length content - pos)) in
+           if take > 0 then store (String.sub content pos take);
+           Hashtbl.replace m.bdos_files fcb (content, pos + take);
+           Z80.set_hl cpu (take / rs);
+           ret_a (if take < want then 0x01 else 0x00))
+  | 0x2F ->
+      (* _RDABS: DE 시작 논리 섹터부터 H 섹터를 DTA 로 절대 읽기. L 은
+         드라이브. 부트 로더가 섹터 0 을 다시 읹는 데 쓴다. *)
+      let hl = Z80.dump_hl cpu in
+      let count = hl lsr 8 and drive = hl land 0xff in
+      let start = Z80.dump_de cpu in
+      let err =
+        if drive <> 0 then 0x0C (* no drive *)
+        else
+          match m.disk with
+          | None -> 0x0C
+          | Some d ->
+              let bad = ref false in
+              for s = 0 to count - 1 do
+                match Dsk.read_sector d (start + s) with
+                | Some b ->
+                    String.iteri
+                      (fun i c ->
+                         mem_write m
+                           ((m.bdos_dta + (s * Dsk.bytes_per_sector) + i) land 0xffff)
+                           (Char.code c))
+                      b
+                | None -> bad := true
+              done;
+              if !bad then 0x0D (* sector not found *) else 0x00
+      in
+      ret_a err
+  | _ ->
+      (* 모르는 함수: 실패로 답해 오류 경로가 드러나게 한다. *)
+      ret_a 0xFF
+
+(* RST 30h 트램펄린 — 실기의 디스크 ROM 이 0x0030 에 깔아 두던 인터슬롯
+   핸들러 대역. RST 30h 가 push 한 반환주소는 서술자(slot 1 + 주소 2)를
+   가리킨다: 서술자를 읽고, 그 자리에 서술자 건너뛴 복귀 주소를 심은 뒤
+   대상 페이지의 슬롯 배선을 돌려 대상으로 건다(Trap Call). 대상의 RET 이
+   복귀 주소로 돌아오면 엔트리 트랩이 배선을 되돌린다. 대상이 복귀 주소로
+   점프해 버리면 되돌림이 남는다 — 부트 로더 관찰 범위 밖의 위험. *)
+let serve_rst30 m =
+  let cpu = m.cpu in
+  let sp = Z80.dump_sp cpu in
+  let rd16 a =
+    mem_read m a lor (mem_read m ((a + 1) land 0xffff) lsl 8)
+  in
+  let wr16 a v =
+    mem_write m a (v land 0xff);
+    mem_write m ((a + 1) land 0xffff) (v lsr 8)
+  in
+  let desc = rd16 sp in
+  let slot = mem_read m desc in
+  let addr = rd16 ((desc + 1) land 0xffff) in
+  wr16 sp ((desc + 3) land 0xffff);
+  let page = addr lsr 14 in
+  let shift = page * 2 in
+  m.rst30_pending <- ((desc + 3) land 0xffff, m.ppi_a) :: m.rst30_pending;
+  m.ppi_a <-
+    (m.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
+  addr
+
 let load_disk m image =
   m.disk <- Some (Dsk.parse image);
+  m.rst30_pending <- [];
   Z80.set_entry_trap m.cpu
-    (Some (fun pc -> if disk_entry_pc pc then begin serve_disk_entry m pc; true end else false))
+    (Some (fun pc ->
+         match m.rst30_pending with
+         | (cont, saved) :: rest when pc = cont ->
+             (* 인터슬롯 대상이 복귀했다 — 슬롯 배선을 되돌리고 실행 계속. *)
+             m.rst30_pending <- rest;
+             m.ppi_a <- saved;
+             Z80.Not_mine
+         | _ ->
+             if disk_entry_pc pc then begin
+               serve_disk_entry m pc;
+               Z80.Ret
+             end
+             else if pc = 0xF37D then begin
+               serve_bdos m;
+               Z80.Ret
+             end
+             else if pc = 0x0030 then Z80.Call (serve_rst30 m)
+             else Z80.Not_mine))
 
 let boot_disk m =
   match m.disk with
@@ -564,11 +737,21 @@ let boot_disk m =
       match Dsk.read_sector d 0 with
       | None -> Error "boot sector unreadable"
       | Some b ->
+          (* Disk ROM 이 부트 섹터를 부르는 상태(MSX2 Technical Handbook
+             3장 7단계): 부트 섹터는 0xC000 에, RAM 은 페이지0(그래서
+             DTA 0x0100 에 쓴다), DISK BIOS 는 페이지1, 스택은 페이지3.
+             CY=1 로 0xC01E 를 호출한다 — 표준 섹터의 RET NC 는 캐리에
+             막혀 복귀하지 못하고 0xC01F 의 로더로 떨어진다. *)
+          m.ppi_a <- 0xFB;
+          m.slot3_sel <- m.slot3_sel lor 0x02;
           String.iteri (fun i c -> mem_write m (0xC000 + i) (Char.code c)) b;
-          Z80.set_pc m.cpu 0xC000;
+          Z80.set_sp m.cpu 0xF51F;
+          Z80.set_af m.cpu 0x0001;
+          Z80.set_pc m.cpu 0xC01E;
           Ok ())
 
 let disk_trap_counts () = disk_trap_counts_arr
+let bdos_counts () = bdos_call_counts
 
 let set_key t k ~pressed =
   match key_target k with
@@ -728,7 +911,9 @@ let debug_dump t =
   Printf.eprintf "ppi_a=%02x slot3=%02x vram_nz=%d regs=%s\nblocks=%s\n%!"
     t.ppi_a t.slot3_sel !nz
     (String.concat " "
-       (List.init 8 (fun i -> Printf.sprintf "R%d=%02x" i (Vdp.regs v).(i))))
+       (List.init 14 (fun i -> Printf.sprintf "R%d=%02x" i (Vdp.regs v).(i)))
+       ^ Printf.sprintf " R9=%02x R23=%02x R25=%02x R26=%02x" (Vdp.regs v).(9)
+         (Vdp.regs v).(23) (Vdp.regs v).(25) (Vdp.regs v).(26))
     blocks
 
 let frame_dims _ = (256, 192)

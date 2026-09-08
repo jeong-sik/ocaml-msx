@@ -20,11 +20,16 @@ val create :
     것도 하지 않고 4 를 반환한다. *)
 val step : t -> int
 
-val set_entry_trap : t -> (int -> bool) option -> unit
-(** An optional hook consulted before each instruction fetch: when it answers
-    true for the current PC the call was already served by the hook and the
-    step returns to the caller instead of executing -- the RET a BIOS entry
-    would have run. Set [None] to disable. *)
+(** How an entry-trap handler answers for a PC: [Not_mine] executes normally,
+    [Ret] means the call was already served and the step returns to the pushed
+    caller instead of executing, [Call target] redirects the PC leaving the
+    stack as the handler prepared it -- the trampoline shape a real ROM
+    installs at a restart vector. *)
+type trap_serve = Not_mine | Ret | Call of int
+
+val set_entry_trap : t -> (int -> trap_serve) option -> unit
+(** An optional hook consulted before each instruction fetch; see
+    {!trap_serve}. Set [None] to disable. *)
 
 val set_pc : t -> int -> unit
 (** 하네스가 TPA 시작(0x100)을 강제하는 자리. 이미지 헤더의 JP 를 믿지

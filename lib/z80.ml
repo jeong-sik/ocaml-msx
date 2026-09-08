@@ -4,6 +4,9 @@
    콜백 — MSX 슬롯/PPI 배선(P1)도 이 경로로 들어온다.
    T-state 는 Z80 매뉴얼 표 값. 인터럽트 주입은 P1 자리. *)
 
+(* 엔트리 트랩 핸들러의 답: 서비스 안 함 / RET 대행 / 대상 CALL. *)
+type trap_serve = Not_mine | Ret | Call of int
+
 type t = {
   mutable a : int;
   mutable f : int;
@@ -32,7 +35,7 @@ type t = {
   mutable im : int;
   mutable halted : bool;
   mutable after_ei : bool;
-  mutable entry_trap : (int -> bool) option;
+  mutable entry_trap : (int -> trap_serve) option;
   mutable t : int;
   rb : int -> int;
   wb : int -> int -> unit;
@@ -809,20 +812,28 @@ and main_exec z op p =
 
 let set_entry_trap z h = z.entry_trap <- h
 
-(* 엔트리 트랩: fetch 전에 PC 를 본다. 핸들러가 true 를 돌려주면 호출을
-   이미 서비스한 것 — 명령을 실행하는 대신 스택의 반환주소를 팝해 PC 로
-   삼는다(RET 대행). 명령이 돌지 않으니 R 은 오르지 않는다. 24 T 는
-   CALL+RET의 대략. *)
+(* 엔트리 트랩: fetch 전에 PC 를 본다. 핸들러의 답에 따라:
+   - Ret: 호출을 이미 서비스한 것 — 스택 반환주소를 팝해 PC 로(RET 대행).
+   - Call target: 대상을 부른다 — PC 만 바꾸고 SP 는 그대로. 호출자가
+     반환주소를 미리 심어 둔 경우(0x30 트램펄린)에 쓴다.
+   어느 쪽도 명령이 돌지 않으니 R 은 오르지 않는다. 24 T 는 대략. *)
 let entry_trap_step z =
   match z.entry_trap with
-  | Some h when h z.pc ->
-      let lo = z.rb z.sp in
-      let hi = z.rb ((z.sp + 1) land 0xffff) in
-      z.sp <- (z.sp + 2) land 0xffff;
-      z.pc <- (lo lor (hi lsl 8)) land 0xffff;
-      z.t <- z.t + 24;
-      true
-  | _ -> false
+  | Some h -> (
+      match h z.pc with
+      | Not_mine -> false
+      | Ret ->
+          let lo = z.rb z.sp in
+          let hi = z.rb ((z.sp + 1) land 0xffff) in
+          z.sp <- (z.sp + 2) land 0xffff;
+          z.pc <- (lo lor (hi lsl 8)) land 0xffff;
+          z.t <- z.t + 24;
+          true
+      | Call target ->
+          z.pc <- target land 0xffff;
+          z.t <- z.t + 24;
+          true)
+  | None -> false
 
 let step z =
   dt := 0;

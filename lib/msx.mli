@@ -53,11 +53,18 @@ val fdc_recent_calls : unit -> (int * int * int) array
 val load_disk : t -> string -> unit
 (** Attach a raw .dsk floppy image and arm the DISK BIOS entry trap: the
     DSKIO/DSKCHG/GETDPB entries in slot 1 page 1 are served from the image
-    instead of executing ROM code. *)
+    instead of executing ROM code, and 0xF37D serves as a minimal BDOS
+    (_OPEN/_SETDTA/_RDSEQ/_RDBLK) reading files through the FAT12 layer. *)
+
+val bdos_counts : unit -> int array
+(** Per-function BDOS call counts indexed by function number, for boot
+    diagnosis alongside {!disk_trap_counts}. *)
 
 val boot_disk : t -> (unit, string) result
-(** Load the boot sector to 0xC000 and jump to it, the IPL step the disk
-    bootstrap would have run. Needs a disk attached first. *)
+(** Play the Disk ROM's second-stage call (MSX2 Technical Handbook ch.3 step
+    7): boot sector to 0xC000, RAM in page 0, and a call to 0xC01E with carry
+    set so its [RET NC] falls through into the sector's loader code. Needs a
+    disk attached first. *)
 
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
     ({!guess_mapper}); pass it to override a wrong guess. The bank registers
