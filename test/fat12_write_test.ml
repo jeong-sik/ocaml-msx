@@ -175,6 +175,36 @@ let test_bdos () =
   ignore (success t 0x26 0xc200 0);
   check "zero-count block write truncates at random record" (file_bytes (exported t) = String.sub first 0 257);
   check "truncate releases trailing allocation" (fat (exported t) 3 = 0 && fat (exported t) 4 = 0);
+  (* Explicit random record zero must seek to byte zero even after a read. *)
+  ignore (success t 0x1a 0xc800 0);
+  record t 0; ignore (success t 0x27 0xc200 10);
+  record t 0; ignore (success t 0x27 0xc200 10);
+  check "random record zero rereads the beginning"
+    (String.init 10 (fun i -> Char.chr (Msx.mem_read t (0xc800 + i))) = String.sub first 0 10);
+  (* Records >=64 bytes ignore the fourth random-record byte. The final
+     partial record is padded and counts as one returned record. *)
+  Msx.mem_write t 0xc20e 128; Msx.mem_write t 0xc20f 0;
+  record t 2; Msx.mem_write t 0xc224 0x7f;
+  check "partial final record is returned" (success t 0x27 0xc200 1 = 1);
+  check "partial data and zero padding reach DMA"
+    (Msx.mem_read t 0xc800 = Char.code first.[256]
+     && String.init 127 (fun i -> Char.chr (Msx.mem_read t (0xc801 + i))) = String.make 127 '\000');
+  record t 2;
+  for i = 0 to 255 do Msx.mem_write t (0xc800 + i) 0xa5 done;
+  let error, returned = bdos t 0x27 0xc200 2 in
+  check "partial short read reports EOF and actual count" (error = 1 && returned = 1);
+  check "short read advances by the returned record" (Msx.mem_read t 0xc221 = 3);
+  check "short read leaves the next record untouched"
+    (String.init 128 (fun i -> Char.chr (Msx.mem_read t (0xc880 + i))) = String.make 128 '\165');
+  let error, returned = bdos t 0x27 0xc200 1 in
+  check "subsequent EOF returns no records without moving the cursor"
+    (error = 1 && returned = 0 && Msx.mem_read t 0xc221 = 3);
+  Msx.mem_write t 0xc224 0x7f;
+  check "ignored high byte is preserved" (Msx.mem_read t 0xc224 = 0x7f);
+  Msx.mem_write t 0xc20e 0; Msx.mem_write t 0xc20f 0; record t 0;
+  check "uninitialized FCB retains default 128-byte records" (success t 0x27 0xc200 1 = 1);
+  check "default record copies the expected bytes"
+    (String.init 128 (fun i -> Char.chr (Msx.mem_read t (0xc800 + i))) = String.sub first 0 128);
   let before_extent_create = Msx.disk_image t in
   Msx.mem_write t 0xc20c 1;
   ignore (success t 0x16 0xc200 0);
@@ -203,7 +233,45 @@ let test_bdos () =
   check "nonzero extent CREATE rejects invalid BPB without mutating media"
     (result = 0xff && Msx.disk_image t = Some invalid)
 
+let test_disk_slots_still_dispatch () =
+  List.iter (fun (label, call) ->
+    let t, _ = machine () in
+    (* boot_disk selected slot2 in page1. RST30 temporarily switches it to
+       slot1, then restores the caller's mapping on return. *)
+    let code = [0x01;0x34;0x12] @ call
+      @ [0xed;0x43;0x20;0xc3;0xc3;0x00;0xc1] in
+    List.iteri (fun i byte -> Msx.mem_write t (0xc040 + i) byte) code;
+    List.iteri (fun i byte -> Msx.mem_write t (0xc080 + i) byte) [0xc3;0x40;0xc0];
+    List.iteri (fun i byte -> Msx.mem_write t (0xc100 + i) byte) [0x18;0xfe];
+    Msx.step t ~frames:1;
+    check label (Msx.mem_read t 0xc320 = 0 && Msx.mem_read t 0xc321 = 0x12
+                 && Msx.dump_pc t = 0xc100 && Msx.port_in t 0xa8 = 0xfb)
+  ) ["slot2 direct disk entry", [0xcd;0x16;0x40];
+     "slot1 inter-slot disk entry restores caller mapping", [0xf7;0x01;0x16;0x40]]
+
+let test_ram_disk_entry_collisions () =
+  let t, _ = machine () in
+  (* The same numeric addresses are ordinary instructions when page1 maps
+     RAM. Executing them must not call HLE disk BIOS or pop a return address. *)
+  Msx.port_out t 0xfd 2; (* page1 must not alias page3 test control code *)
+  Msx.port_out t 0xa8 0xff;
+  List.iter (fun address ->
+    List.iteri (fun i byte -> Msx.mem_write t (address + i) byte)
+      [0x3e;0x5a;0x32;0x10;0xc3;0xc3;0x80;0xc1];
+    List.iteri (fun i byte -> Msx.mem_write t (0xc180 + i) byte)
+      [0x21;0x18;0xfe;0x22;0x00;0xc1;0xc3;0x00;0xc1];
+    let pc = Msx.dump_pc t in
+    List.iteri (fun i byte -> Msx.mem_write t (pc + i) byte)
+      [0xc3;address land 255;address lsr 8];
+    Msx.mem_write t 0xc310 0;
+    Msx.step t ~frames:1;
+    check (Printf.sprintf "RAM %04x is guest code, not disk BIOS" address)
+      (Msx.mem_read t 0xc310 = 0x5a && Msx.dump_pc t = 0xc100)
+  ) [0x4010;0x4013;0x4016;0x4019;0x401c;0x401f;0x4030;0x4100]
+
 let () =
   test_fat ();
   test_bdos ();
+  test_disk_slots_still_dispatch ();
+  test_ram_disk_entry_collisions ();
   print_endline "FAT12: fragmented atomic writes and CPU BDOS checkpoint continuation passed"
