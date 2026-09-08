@@ -1,0 +1,38 @@
+name: Core CI
+on:
+  push:
+    branches: [main, 'fix/**', 'feat/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: '5.3'
+      - run: opam install . --deps-only --with-test -y
+      - run: opam exec -- dune build @all
+      - run: opam exec -- dune runtest
+      - name: Package exact-source diagnostic runners
+        run: |
+          mkdir -p artifacts
+          cp _build/default/bin/boot.exe _build/default/bin/replay.exe artifacts/
+          git rev-parse HEAD > artifacts/source-commit.txt
+          tar -czf msx-runners.tar.gz -C artifacts .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: msx-runners-${{ matrix.os }}
+          path: msx-runners.tar.gz

@@ -1093,7 +1093,7 @@ let debug_dump t =
        (List.init 8 (fun i -> Printf.sprintf "R%d=%02x" i (Vdp.regs v).(i))))
     blocks
 
-let frame_dims _ = (256, 192)
+let frame_dims t = Vdp.frame_dims t.vdp
 
 let frame_rgb t = Vdp.frame_rgb t.vdp
 

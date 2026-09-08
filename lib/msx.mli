@@ -169,6 +169,7 @@ val debug_dump : t -> unit
 (** VDP 레지스터·VRAM 통계·PPI 를 stderr 로 — 부트 디버깅용. *)
 
 val frame_dims : t -> int * int
+(** Native frame size; query again after a display mode change. *)
 val frame_rgb : t -> string
 
 val serialize : t -> string

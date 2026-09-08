@@ -1,7 +1,4 @@
-(* 팔레트 0x9A 두 번 쓰기의 비트 배치 증명 — 정본 MSX2 Technical Handbook
-   2.1.2: 첫 바이트는 하위 3비트 R, 비트 4-6 B (xRRRxBBB); 둘째 바이트는
-   하위 3비트 G. 두 번 쓰면 R#16 이 다음 색으로 증가한다. 예전 해석은 R 과
-   B 를 뒤집고 G 를 상위 니블에서 읽어 부트 화면의 채널이 통째로 죽었다. *)
+(* V9938 palette: first byte 0RRR0BBB, second byte 00000GGG. *)
 
 let failures = ref 0
 
@@ -21,15 +18,15 @@ let set_reg m n v =
 let () =
   let m = Msx.create ~machine in
   set_reg m 16 5;
-  Msx.port_out m 0x9A 0x27; (* R=7, B=2 *)
+  Msx.port_out m 0x9A 0x72; (* R=7, B=2 *)
   Msx.port_out m 0x9A 0x03; (* G=3 *)
   let r, g, b = (Msx.palette_entries m).(5) in
-  check "byte1 low nibble is R" (r = 255);
+  check "byte1 high nibble is R" (r = 255);
   check "byte2 low nibble is G" (g = (3 * 255) / 7);
-  check "byte1 high nibble is B" (b = (2 * 255) / 7);
+  check "byte1 low nibble is B" (b = (2 * 255) / 7);
 
   (* 두 번 쓰면 R#16 이 증가한다 — 다음 색은 인덱스 지정 없이 간다. *)
-  Msx.port_out m 0x9A 0x45; (* R=5, B=4 *)
+  Msx.port_out m 0x9A 0x54; (* R=5, B=4 *)
   Msx.port_out m 0x9A 0x05; (* G=5 *)
   let r6, g6, b6 = (Msx.palette_entries m).(6) in
   check "R#16 auto-increments after two writes" (r6 = (5 * 255) / 7);
@@ -40,7 +37,7 @@ let () =
      색의 채널이 한 칸 어긋난다. *)
   Msx.port_out m 0x9A 0x11; (* 고아가 될 첫 바이트 *)
   set_reg m 16 0;
-  Msx.port_out m 0x9A 0x01; (* R=1, B=0 *)
+  Msx.port_out m 0x9A 0x10; (* R=1, B=0 *)
   Msx.port_out m 0x9A 0x02; (* G=2 *)
   let r0, g0, b0 = (Msx.palette_entries m).(0) in
   check "R#16 rewrite discards a half-written color" (r0 = (1 * 255) / 7);
