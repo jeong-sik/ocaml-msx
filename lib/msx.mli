@@ -100,10 +100,11 @@ val bdos_counts : unit -> int array
     functions a loader actually exercises. For boot diagnosis. *)
 
 val set_key : t -> key -> pressed:bool -> bool
-(** 논리 키를 누르거나 뗀다. 키보드 매트릭스 키와 조이스틱 1 버튼
-    (Trigger_a/b) 은 true. 자리가 없는 키(표 밖 글자, F6 이상) 는 아무것도
-    바꾸지 않고 false. 커서 키는 키보드 행 8 이고 조이스틱 방향은 배선하지
-    않는다 — BIOS GTSTCK(0)/GTTRIG(0) 경로. *)
+(** 논리 키를 누르거나 뗀다. 키보드 매트릭스 키와 조이스틱 1 입력
+    (Trigger_a/b, 방향키) 은 true. 자리가 없는 키(표 밖 글자, F6 이상) 는
+    아무것도 바꾸지 않고 false. 방향키(Up/Down/Left/Right)는 커서(키보드 행 8)
+    와 조이스틱 1 방향 비트(PSG R#14 비트 0-3)를 함께 구동한다 — BIOS
+    GTSTCK(0)(커서)과 GTSTCK(1)/PSG 직독(조이스틱)을 한 키로 커버한다. *)
 
 val port_in : t -> int -> int
 val port_out : t -> int -> int -> unit

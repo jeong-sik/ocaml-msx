@@ -21,7 +21,7 @@ MSX2+ 를 OCaml 로 에뮬레이트한다. 최종 목표는 두 개다:
 | 단계 | 내용 | 완료 기준 |
 |---|---|---|
 | P0 | Z80 코어 + zexall/zexdoc 하네스 | **완료 (2026-09-07)** — zexall·zexdoc 전 그룹 PASS, 5.76B 명령 / 46.7G T-state. 하네스: `bin/zex.exe`, 단위 벡터 `bin/vectors.exe`, C 오라클 차등 `bin/trace.exe` + `test/zex/diff_driver.c` |
-| P1 | MSX1 — V9938 의 TMS 호환 모드, PPI, RAM, C-BIOS | **완료 (2026-09-07)** — XSpelunker(32KB 카트리지, SCREEN 2 + 스프라이트 모드 1) 가 부트 로고 → 타이틀 → LEVEL 1-1 → 게임플레이. 하네스 `bin/boot.exe --roms roms/cbios --cart <rom> --tap-space 340,420`. 남은 틈: 색 0 투명 → R#7 배경색, 조이스틱 방향(커서 키는 키보드 행 8 만), 스프라이트 라인 제한·충돌 플래그, 멀티컬러(SCREEN 3) |
+| P1 | MSX1 — V9938 의 TMS 호환 모드, PPI, RAM, C-BIOS | **완료 (2026-09-07)** — XSpelunker(32KB 카트리지, SCREEN 2 + 스프라이트 모드 1) 가 부트 로고 → 타이틀 → LEVEL 1-1 → 게임플레이. 하네스 `bin/boot.exe --roms roms/cbios --cart <rom> --tap-space 340,420`. 남은 틈: 색 0 투명 → R#7 배경색, 스프라이트 라인 제한·충돌 플래그, 멀티컬러(SCREEN 3). 조이스틱 방향은 방향키가 커서(행 8)와 joy1 비트(PSG R#14)를 함께 구동해 닫힘 |
 | P2 | MSX2 — command engine, 라인 인터럽트, 128KB VRAM, 팔레트 | 바리스 1·2 (사람이 TUI 로) |
 | P3 | 디스크·사운드 — FDC(.DSK), PSG, YM2413, PAC | 이스 II (FM 음악, 세이브) |
 | P4 | MSX2+ — V9958 (YJK/YAE 등) | MSX2+ 타이틀 확정 시 지정 |

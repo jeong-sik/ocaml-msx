@@ -116,6 +116,25 @@ let () =
   ignore (Msx.set_key t Trigger_a ~pressed:false);
   ignore (Msx.set_key t Trigger_b ~pressed:false);
   check "released = 0x3F" (psg_read t 14 = 0x3f);
+
+  (* 방향키는 커서(매트릭스 행 8)와 조이스틱 방향 비트를 함께 구동한다.
+     openMSX JoystickDevice: UP=0x01 DOWN=0x02 LEFT=0x04 RIGHT=0x08 (active low).
+     GTSTCK(0) 게임은 행 8 을, GTSTCK(1)/PSG 직독 게임은 R#14 를 읽는다 —
+     한 키가 두 경로를 모두 채운다. *)
+  ignore (Msx.set_key t Up ~pressed:true);
+  check "Up clears joy1 bit 0" (psg_read t 14 = 0x3e);
+  check "Up still drives cursor row 8 bit 5" (row_read t 8 = 0xdf);
+  ignore (Msx.set_key t Up ~pressed:false);
+  check "Up release restores joy1 and row 8"
+    (psg_read t 14 = 0x3f && row_read t 8 = 0xff);
+  ignore (Msx.set_key t Left ~pressed:true);
+  ignore (Msx.set_key t Down ~pressed:true);
+  check "Left+Down clear joy1 bits 2,1" (psg_read t 14 = 0x39);
+  check "Left+Down still drive row 8 bits 4,6" (row_read t 8 = 0xaf);
+  ignore (Msx.set_key t Left ~pressed:false);
+  ignore (Msx.set_key t Down ~pressed:false);
+  check "directions released = idle" (psg_read t 14 = 0x3f && row_read t 8 = 0xff);
+
   psg_write t 7 0xb8;
   check "other registers read back" (psg_read t 7 = 0xb8);
 
