@@ -9,6 +9,7 @@ let vlog = ref false
 let watch_mem = ref ""
 let cart = ref ""
 let disk = ref ""
+let disk_warm = ref false
 let cart_mapper = ref ""
 let tap_space : int list ref = ref []
 let assert_boot = ref false
@@ -44,6 +45,9 @@ let () =
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
       ("--disk", Arg.Set_string disk, "PATH  플로피 이미지(.dsk) — 드라이브 A.");
+      ( "--disk-warm",
+        Arg.Set disk_warm,
+        "  720프레임 워밍업 뒤 Disk ROM 2차 호출 재생 (게임 화면 경로)" );
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
         "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
@@ -82,7 +86,7 @@ let () =
     Msx.load_cartridge ?mapper t (read_file !cart)
   end;
   if !disk <> "" then begin
-    Msx.load_disk t (read_file !disk);
+    Msx.load_disk ~interface_rom:(not !disk_warm) t (read_file !disk);
     Msx.set_disk_call_log true
   end;
   Msx.set_ldirvm_log true;
@@ -176,6 +180,16 @@ let () =
     Printf.printf "assert boot ok: logo=%d final=%d\n" nb_logo nb_final;
     exit 0
   end;
+  (* --disk-warm: C-BIOS 를 720 프레임 정주행시켜 F380 인터슬롯 프리미티브를
+     RAM 에 심은 뒤 Disk ROM 의 2차 호출(0xC01E CY=1)을 재생한다 — 카트
+     INIT 경로가 KOEI.SYS 진입 후 재부트하는 동안 (실측 f≈330), 게임 화면
+     까지 가는 쪽이다. *)
+  (if !disk_warm && !disk <> "" then begin
+     run_frame (min !frames 720);
+     match Msx.boot_disk t with
+     | Ok () -> ()
+     | Error m -> Printf.ksprintf failwith "disk boot: %s" m
+   end);
   run_frame !frames;
   Printf.printf "last pcs:";
   for i = !ridx - 16 to !ridx - 1 do
@@ -278,6 +292,22 @@ let () =
      let i = String.index env ',' in
      Msx.ram_hex t (int_of_string ("0x" ^ String.sub env 0 i))
        (int_of_string ("0x" ^ String.sub env (i + 1) (String.length env - i - 1)))
+   with Not_found -> ());
+  (* MEM_DUMP: RAM_DUMP 가 매퍼 세그먼트 0 기준이라 페이지3(부트섹터·KOEI
+     코드)을 못 본다 — Z80 이 보는 주소 그대로 (mem_read) 덤프. *)
+  (try
+     let env = Sys.getenv "MEM_DUMP" in
+     let i = String.index env ',' in
+     let a0 = int_of_string ("0x" ^ String.sub env 0 i) in
+     let n = int_of_string ("0x" ^ String.sub env (i + 1) (String.length env - i - 1)) in
+     for row = 0 to (n - 1) / 16 do
+       Printf.eprintf "mem %04x:" (a0 + (row * 16));
+       for j = 0 to 15 do
+         Printf.eprintf " %02x"
+           (Msx.mem_read t ((a0 + (row * 16) + j) land 0xffff))
+       done;
+       Printf.eprintf "\n%!"
+     done
    with Not_found -> ());
   print_string (Msx.screen_text t);
   (if !vlog then
