@@ -16,17 +16,24 @@ type key =
 (* 논리 키가 닿는 자리. 키보드 매트릭스 (행 0-10, 비트 0-7) 의 정본은
    openMSX share/unicodemaps/unicodemap.int (국제 배열, <ROW><COL>).
    글자는 대소문자를 같은 키로 본다 — SHIFT 는 매트릭스의 다른 키다.
-   Trigger_a/b 는 조이스틱 1 의 버튼이라 PSG R#14 로 읽히고, 표에 없는
+   조이스틱 1 은 PSG R#14 의 비트로 읽힌다: 방향 0-3(위·아래·왼·오),
+   트리거 4-5 (전부 active-low). 방향키는 커서(매트릭스 행 8)와 조이스틱
+   방향 비트를 함께 구동한다(Matrix_joy) — GTSTCK(0) 게임(커서 읽기)과
+   GTSTCK(1)·PSG 직독 게임(조이스틱 읽기)을 한 키로 커버한다. 표에 없는
    글자와 F6 이상은 Unmapped. *)
-type key_target = Matrix of int * int | Joy1_button of int | Unmapped
+type key_target =
+  | Matrix of int * int
+  | Joy1_bit of int
+  | Matrix_joy of (int * int) * int
+  | Unmapped
 
 let key_rows = 11
 
 let key_target = function
-  | Up -> Matrix (8, 5)
-  | Down -> Matrix (8, 6)
-  | Left -> Matrix (8, 4)
-  | Right -> Matrix (8, 7)
+  | Up -> Matrix_joy ((8, 5), 0)
+  | Down -> Matrix_joy ((8, 6), 1)
+  | Left -> Matrix_joy ((8, 4), 2)
+  | Right -> Matrix_joy ((8, 7), 3)
   | Space -> Matrix (8, 0)
   | Esc -> Matrix (7, 2)
   | Return -> Matrix (7, 7)
@@ -36,8 +43,8 @@ let key_target = function
   | Function 4 -> Matrix (7, 0)
   | Function 5 -> Matrix (7, 1)
   | Function _ -> Unmapped
-  | Trigger_a -> Joy1_button 4
-  | Trigger_b -> Joy1_button 5
+  | Trigger_a -> Joy1_bit 4
+  | Trigger_b -> Joy1_bit 5
   | Char c -> (
     match Char.uppercase_ascii c with
     | '0' .. '7' as d -> Matrix (0, Char.code d - Char.code '0')
@@ -1004,12 +1011,20 @@ let disk_trap t pc =
   else false
 
 let set_key t k ~pressed =
+  let set_matrix row bit = t.keys.((row * 8) + bit) <- pressed in
+  let set_joy bit =
+    t.joy1 <- (if pressed then t.joy1 land lnot (1 lsl bit) else t.joy1 lor (1 lsl bit))
+  in
   match key_target k with
   | Matrix (row, bit) ->
-    t.keys.((row * 8) + bit) <- pressed;
+    set_matrix row bit;
     true
-  | Joy1_button b ->
-    t.joy1 <- (if pressed then t.joy1 land lnot (1 lsl b) else t.joy1 lor (1 lsl b));
+  | Joy1_bit bit ->
+    set_joy bit;
+    true
+  | Matrix_joy ((row, bit), joy) ->
+    set_matrix row bit;
+    set_joy joy;
     true
   | Unmapped -> false
 
