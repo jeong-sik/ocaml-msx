@@ -43,6 +43,12 @@ val create : machine:machine -> t
 
 val name : t -> string
 
+
+val fdc_recent_calls : unit -> (int * int * int) array
+(** Recent FDC port touches (kind, port, value), newest last, ring of 256.
+    kind 0 = read, 1 = write. Boot diagnosis for loaders that program the
+    WD279x directly instead of calling the disk BIOS entries. *)
+
 val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
     ({!guess_mapper}); pass it to override a wrong guess. The bank registers

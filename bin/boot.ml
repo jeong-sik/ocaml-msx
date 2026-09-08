@@ -359,4 +359,11 @@ let () =
   let w, h = Msx.frame_dims t in
   Printf.fprintf oc "P6\n%d %d\n255\n%s" w h rgb;
   close_out oc;
+  (* 8d349c6 의 fdc 관측 출력 — disk_trap_counts 는 현 main 서명에 없다. *)
+  let calls = Msx.fdc_recent_calls () in
+  Printf.printf "fdc touches: %d\n" (Array.length calls);
+  Array.iter
+    (fun (k, port, v) ->
+      Printf.printf "fdc %s %02x <- %02x\n" (if k = 0 then "R" else "W") port v)
+    (Array.sub calls (max 0 (Array.length calls - 24)) (min 24 (Array.length calls)));
   Printf.printf "wrote %s.ppm\n" !out_prefix
