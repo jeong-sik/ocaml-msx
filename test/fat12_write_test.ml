@@ -249,6 +249,7 @@ let test_ram_disk_entry_collisions () =
   let t, _ = machine () in
   (* The same numeric addresses are ordinary instructions when page1 maps
      RAM. Executing them must not call HLE disk BIOS or pop a return address. *)
+  Msx.port_out t 0xfd 2; (* page1 must not alias page3 test control code *)
   Msx.port_out t 0xa8 0xff;
   List.iter (fun address ->
     List.iteri (fun i byte -> Msx.mem_write t (address + i) byte)
