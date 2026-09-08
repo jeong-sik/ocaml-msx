@@ -71,15 +71,7 @@ let () =
   in
   Printf.eprintf "CREATE-OK
 %!";
-  (if !disk_path <> "" then begin
-     Msx.load_disk t (read_file !disk_path);
-     match Msx.boot_disk t with
-     | Ok () -> ()
-     | Error m -> Printf.ksprintf failwith "disk boot: %s" m
-   end);
-  (* [begin/end] 는 필수: 없으면 let ... in 뒤의 세미콜론 체인 전체가
-     then 몸통에 묶여, 카트리지 없는 부트가 run_frame 없이 조용히 끝난다. *)
-  if !cart <> "" then begin
+  (if !cart <> "" then begin
     let mapper = match !cart_mapper with
       | "plain" -> Some Msx.Flat
       | "ascii8" -> Some Msx.Ascii8
@@ -90,7 +82,7 @@ let () =
       | other -> Printf.ksprintf failwith "unknown --cart-mapper %s" other
     in
     Msx.load_cartridge ?mapper t (read_file !cart)
-  end;
+  end);
   Printf.eprintf "M1
 %!";
   Msx.set_ldirvm_log true;
@@ -188,6 +180,19 @@ let () =
     Printf.printf "assert boot ok: logo=%d final=%d\n" nb_logo nb_final;
     exit 0
   end;
+  (* 실기의 디스크 부트는 메인 BIOS 초기화가 끝난 뒤 온다. C-BIOS 는 부트
+     중 인터슬롯 프리미티브(F380 RDPRIM/WRPRIM/CLPRIM)를 RAM 에 심는데
+     (main.asm "Transmit RDPRIM to RAM"), 디스크 환경의 인터슬롯 호출이 그
+     위에서 돈다. C-BIOS 를 정주행시켜 초기화를 끝내게 한 뒤 Disk ROM 의
+     2차 호출(0xC01E CY=1)로 넘어간다. *)
+  (if !disk_path <> "" then begin
+     let warmup = min !frames 720 in
+     run_frame warmup;
+     Msx.load_disk t (read_file !disk_path);
+     match Msx.boot_disk t with
+     | Ok () -> ()
+     | Error m -> Printf.ksprintf failwith "disk boot: %s" m
+   end);
   Printf.eprintf "PRE-RUN
 %!";
   run_frame !frames;
@@ -207,8 +212,28 @@ let () =
       if i mod 3 = 0 && (b > 8 || Char.code rgb.[i + 1] > 8 || Char.code rgb.[i + 2] > 8) then
         incr nonblack)
     rgb;
-  Printf.printf "frames=%d pc=%04x nonblack=%d\n%!" !frames (Msx.dump_pc t) !nonblack;
+  Printf.printf "frames=%d pc=%04x nonblack=%d mode=%s\n%!" !frames (Msx.dump_pc t) !nonblack
+    (Msx.display_mode_to_string (Msx.display_mode t));
   Msx.debug_dump t;
+  (* SCREEN7 판정 보조: 64K 페이지별로 256바이트 줄(한 표시 줄)의 non-zero
+     바이트 수. 한 줄 걸러 비면 인터레이스, 반대 페이지에 있으면 베이스
+     오산정, 골고루 차 있으면 렌더 버그. *)
+  (try
+     ignore (Sys.getenv "ROWSTAT");
+     for p = 0 to 1 do
+       let base = p * 0x10000 in
+       Printf.eprintf "rows page%d:\n%!" p;
+       for y = 0 to 211 do
+         let c = ref 0 in
+         for x = 0 to 255 do
+           if Msx.vram_read t (base + (y * 256) + x) <> 0 then incr c
+         done;
+         Printf.eprintf "%d " !c;
+         if y mod 32 = 31 then Printf.eprintf "\n%!"
+       done;
+       Printf.eprintf "\n%!"
+     done
+   with Not_found -> ());
   let (active, n, ny, anx, dy) = Msx.tx_state t in
   Printf.printf "tx active=%b count=%d ny=%d anx=%d dy=%d\n" active n ny anx dy;
   List.iter
@@ -246,7 +271,33 @@ let () =
   let oc = open_out_bin (!out_prefix ^ ".ppm") in
   Printf.fprintf oc "P6\n256 192\n255\n%s" rgb;
   close_out oc;
+  (* SCREEN7 진단: 64K 페이지마다 같은 패킹(2px/바이트, 256B/줄)으로 덤프.
+     R#2 가 고른 페이지와 그림이 실제로 있는 페이지가 갈리는지 본다. *)
+  (try
+     let n = int_of_string (Sys.getenv "G6_PAGES") in
+     let pal = Msx.palette_entries t in
+     for p = 0 to n - 1 do
+       let base = p * 0x10000 in
+       (* 전폭 512×212 — 다운샘플 없이 VRAM 내용 그대로. *)
+       let img = Bytes.make (512 * 212 * 3) '\000' in
+       for y = 0 to 211 do
+         for x = 0 to 511 do
+           let b = Msx.vram_read t (base + (y * 256) + (x lsr 1)) in
+           let nib = if x land 1 = 0 then b lsr 4 else b land 15 in
+           let r, g, bl = pal.(nib) in
+           let i = (y * 512 + x) * 3 in
+           Bytes.set img i (Char.chr r);
+           Bytes.set img (i + 1) (Char.chr g);
+           Bytes.set img (i + 2) (Char.chr bl)
+         done
+       done;
+       let oc = open_out_bin (Printf.sprintf "%s.g6p%d.ppm" !out_prefix p) in
+       Printf.fprintf oc "P6\n512 212\n255\n%s" (Bytes.to_string img);
+       close_out oc
+     done
+   with Not_found -> ());
   Array.iteri (fun i n -> Printf.printf "trap %d: %d\n" i n) (Msx.disk_trap_counts ());
+  Array.iteri (fun i n -> if n > 0 then Printf.printf "bdos %02x: %d\n" i n) (Msx.bdos_counts ());
   let calls = Msx.fdc_recent_calls () in
   Printf.printf "fdc touches: %d\n" (Array.length calls);
   Array.iter
