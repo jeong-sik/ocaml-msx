@@ -644,6 +644,9 @@ let bdos_counts () = bdos_call_counts
    Success drops carry, failure sets carry and a code in A. *)
 let serve_disk_entry t pc =
   let cpu = t.cpu in
+  if !disk_call_log then
+    disk_calls := (pc, Z80.dump_a cpu, Z80.dump_bc cpu, Z80.dump_de cpu,
+                   Z80.dump_hl cpu, Z80.dump_f cpu) :: !disk_calls;
   let ret =
     let sp = Z80.dump_sp cpu in
     let r = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in

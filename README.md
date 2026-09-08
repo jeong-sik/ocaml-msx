@@ -13,3 +13,5 @@ dune exec bin/msx_demo.exe -- --frames 3  # 3프레임만 찍고 종료 (CI/확�
 ```
 
 라이선스: MIT. 기계 BIOS 는 C-BIOS(2-clause BSD)만 실는다. 게임 덤프는 사용자 소관.
+
+Use `replay --restore-state checkpoint.state --change-disk next.dsk --ledger input.jsonl --trace-disk` to diagnose the exact BIOS/BDOS calls after a media change. The trace includes extended disk BIOS entries and is opt-in.

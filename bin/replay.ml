@@ -16,6 +16,7 @@ let restore_state = ref ""
 let save_state = ref ""
 let change_disk = ref ""
 let ledger = ref ""
+let trace_disk = ref false
 let out_dir = ref "/tmp/msx-replay"
 let every = ref 5
 let tail = ref 120
@@ -106,6 +107,7 @@ let () =
       ("--change-disk", Arg.Set_string change_disk, "PATH  replace disk in restored machine without rebooting");
       ("--restore-state", Arg.Set_string restore_state, "FILE  resume a saved machine instead of booting");
       ("--save-state", Arg.Set_string save_state, "FILE  atomically save the final machine state");
+      ("--trace-disk", Arg.Set trace_disk, "log disk BIOS and BDOS calls during replay");
       ("--ledger", Arg.Set_string ledger, "FILE  the .masc/msx/ledger.jsonl to replay");
       ("--out-dir", Arg.Set_string out_dir, "DIR  where frame PPMs are written");
       ("--every", Arg.Set_int every, "N  dump one frame every N (default 5)");
@@ -150,6 +152,7 @@ let () =
     | Ok () -> () | Error message -> prerr_endline message; exit 2
   end;
   (try Unix.mkdir !out_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+  Msx.set_disk_call_log !trace_disk;
   let initial_frame = Msx.frame_number t in
   let entries = parse_ledger !ledger in
   List.iter (fun e ->
@@ -192,6 +195,14 @@ let () =
     let tmp, oc = Filename.open_temp_file ~temp_dir:(Filename.dirname !save_state) ".msx-state-" ".tmp" in
     Fun.protect ~finally:(fun () -> close_out_noerr oc; if Sys.file_exists tmp then Sys.remove tmp)
       (fun () -> output_string oc (Msx.serialize t); close_out oc; Sys.rename tmp !save_state)
+  end;
+  if !trace_disk then begin
+    List.iter (fun (pc, a, bc, de, hl, f) ->
+      Printf.printf "disk @%04x a=%02x bc=%04x de=%04x hl=%04x f=%02x\n"
+        pc a bc de hl f) (Msx.disk_call_entries ());
+    Array.iteri (fun function_number count ->
+      if count > 0 then Printf.printf "bdos %02x: %d\n" function_number count)
+      (Msx.bdos_counts ())
   end;
   Printf.printf "final frame=%d pc=%04x mode=%s\n"
     (Msx.frame_number t) (Msx.dump_pc t) (Msx.display_mode_to_string (Msx.display_mode t));
