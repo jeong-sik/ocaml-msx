@@ -8,6 +8,6 @@
  (maintainers "Jeong-Sik Yun <yousleepwhen@gmail.com>")
  (authors "Jeong-Sik Yun")
  (source
-  (uri "https://github.com/jeong-sik/ocaml-msx"))
+  (uri git+https://github.com/jeong-sik/ocaml-msx.git))
  (license MIT)
  (depends ocaml dune))

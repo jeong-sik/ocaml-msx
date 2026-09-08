@@ -25,4 +25,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
-dev-repo: "https://github.com/jeong-sik/ocaml-msx"
+dev-repo: "git+https://github.com/jeong-sik/ocaml-msx.git"
