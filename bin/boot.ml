@@ -221,6 +221,10 @@ let () =
       (Msx.bdos_counts ())
   end;
   Msx.debug_dump t;
+  (* SCREEN7 logical bytes alternate between the two physical 64K banks. *)
+  let g6_read a =
+    Msx.vram_read t (((a land 1) lsl 16) lor ((a land 0x1ffff) lsr 1))
+  in
   (* SCREEN7 판정 보조: 64K 페이지별로 256바이트 줄(한 표시 줄)의 non-zero
      바이트 수. 한 줄 걸러 비면 인터레이스, 반대 페이지에 있으면 베이스
      오산정, 골고루 차 있으면 렌더 버그. *)
@@ -232,7 +236,7 @@ let () =
        for y = 0 to 211 do
          let c = ref 0 in
          for x = 0 to 255 do
-           if Msx.vram_read t (base + (y * 256) + x) <> 0 then incr c
+           if g6_read (base + (y * 256) + x) <> 0 then incr c
          done;
          Printf.eprintf "%d " !c;
          if y mod 32 = 31 then Printf.eprintf "\n%!"
@@ -251,7 +255,7 @@ let () =
        let img = Bytes.make (512 * 212 * 3) '\000' in
        for y = 0 to 211 do
          for x = 0 to 511 do
-           let b = Msx.vram_read t (base + (y * 256) + (x lsr 1)) in
+           let b = g6_read (base + (y * 256) + (x lsr 1)) in
            let nib = if x land 1 = 0 then b lsr 4 else b land 15 in
            let r, g, bl = pal.(nib) in
            let i = (y * 512 + x) * 3 in

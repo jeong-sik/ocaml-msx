@@ -54,6 +54,25 @@ let () =
   check "last native pixel in 212-line mode" (pixel t 511 211 = (255,255,255));
   reg t 23 211;
   check "vertical scroll uses selected display page" (pixel t 511 0 = (255,255,255));
+  (* R2 selects page 3 in SCREEN5/6, page 1 in SCREEN7/8. Scroll
+     wraps from line 255 to line 0 within that page, not into page 0. *)
+  List.iter (fun (name, mode, page_base, stride, last_physical, first_physical, color, rgb) ->
+    let t = fresh mode in white t;
+    reg t 2 0x60;
+    seek t ~write:true (page_base + 255 * stride); data t [color];
+    seek t ~write:true page_base; data t [color];
+    check (name ^ " selected page physical addresses")
+      (raw t last_physical = color && raw t first_physical = color);
+    reg t 23 255;
+    check (name ^ " scroll selects last line of nonzero page") (pixel t 0 0 = rgb);
+    check (name ^ " scroll wraps within nonzero page") (pixel t 0 1 = rgb);
+    reg t 2 0;
+    check (name ^ " page zero remains distinct")
+      (pixel t 0 0 = (0,0,0) && pixel t 0 1 = (0,0,0))
+  ) [ "SCREEN5", 0x06, 0x18000, 128, 0x1ff80, 0x18000, 0x10, (255,255,255);
+      "SCREEN6", 0x08, 0x18000, 128, 0x1ff80, 0x18000, 0x40, (255,255,255);
+      "SCREEN7", 0x0a, 0x10000, 256, 0x0ff80, 0x08000, 0x10, (255,255,255);
+      "SCREEN8", 0x0e, 0x10000, 256, 0x0ff80, 0x08000, 0x1c, (255,0,0) ];
   (* NX is pixels even for byte transfer commands. Two bytes, not four. *)
   let t = fresh 0x0a in
   command t ~cmd:0xf0 ~dx:0 ~dy:0 ~nx:4 ~ny:1 ~arg:0 ~color:0x12;
@@ -76,7 +95,7 @@ let () =
   check "NOT is masked to one pixel" (raw t 0 = 0xae);
   let t = fresh 0x0a in
   command t ~cmd:0xc0 ~dx:510 ~dy:257 ~nx:20 ~ny:1 ~arg:0 ~color:0x5a;
-  check "HMMV clips at right edge and honors high Y" (raw t 0x180ff = 0x5a && raw t 0x0100 = 0);
+  check "HMMV clips at right edge and honors high Y" (raw t 0x180ff = 0x5a && raw t 0x8080 = 0);
   let t = fresh 0x06 in
   seek t ~write:true 0; data t [0x12;0x34;0x56];
   xy t 32 0; xy t 34 0;
