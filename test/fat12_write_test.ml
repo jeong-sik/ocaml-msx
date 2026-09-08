@@ -175,6 +175,21 @@ let test_bdos () =
   ignore (success t 0x26 0xc200 0);
   check "zero-count block write truncates at random record" (file_bytes (exported t) = String.sub first 0 257);
   check "truncate releases trailing allocation" (fat (exported t) 3 = 0 && fat (exported t) 4 = 0);
+  (* Explicit random record zero must seek to byte zero even after a read. *)
+  ignore (success t 0x1a 0xc800 0);
+  record t 0; ignore (success t 0x27 0xc200 10);
+  record t 0; ignore (success t 0x27 0xc200 10);
+  check "random record zero rereads the beginning"
+    (String.init 10 (fun i -> Char.chr (Msx.mem_read t (0xc800 + i))) = String.sub first 0 10);
+  (* Records >=64 bytes ignore the fourth random-record byte. The final
+     partial record is padded and counts as one returned record. *)
+  Msx.mem_write t 0xc20e 128; Msx.mem_write t 0xc20f 0;
+  record t 2; Msx.mem_write t 0xc224 0x7f;
+  check "partial final record is returned" (success t 0x27 0xc200 1 = 1);
+  check "partial data and zero padding reach DMA"
+    (Msx.mem_read t 0xc800 = Char.code first.[256]
+     && String.init 127 (fun i -> Char.chr (Msx.mem_read t (0xc801 + i))) = String.make 127 '\000');
+  check "ignored high byte is preserved" (Msx.mem_read t 0xc224 = 0x7f);
   let before_extent_create = Msx.disk_image t in
   Msx.mem_write t 0xc20c 1;
   ignore (success t 0x16 0xc200 0);

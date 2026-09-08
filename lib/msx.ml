@@ -963,31 +963,27 @@ let disk_trap t pc =
       | 0x27 -> (
         match Hashtbl.find_opt t.bdos_files de with
         | None -> 0xff
-        | Some (data, pos) ->
-          let rec_size =
-            let r = fcb 0x0e lor (fcb 0x0f lsl 8) in
-            if r = 0 then 128 else r
-          in
-          let rand_rec =
-            fcb 0x21 lor (fcb 0x22 lsl 8) lor (fcb 0x23 lsl 16) lor (fcb 0x24 lsl 24)
-          in
+        | Some (data, _) ->
+          let size = fcb 0x0e lor (fcb 0x0f lsl 8) in
+          let record = fcb 0x21 lor (fcb 0x22 lsl 8) lor (fcb 0x23 lsl 16)
+            lor (if size < 64 then fcb 0x24 lsl 24 else 0) in
           let count = Z80.dump_hl t.cpu in
-          (* 랜덤 레코드 0 은 "서버의 순차 위치" — 호출부가 새 FCB 없이 이어
-             부르는 경우 실기처럼 이어진다. *)
-          let start = if rand_rec = 0 then pos else rand_rec * rec_size in
-          let want = count * rec_size in
-          let avail = max 0 (Bytes.length data - start) in
-          let n = min want avail in
-          for i = 0 to n - 1 do
-            mem_write t ((t.disk_dma + i) land 0xffff) (Char.code (Bytes.get data (start + i)))
-          done;
-          let next_rec = (start / rec_size) + (n / rec_size) in
-          mem_write t ((de + 0x21) land 0xffff) (next_rec land 0xff);
-          mem_write t ((de + 0x22) land 0xffff) ((next_rec lsr 8) land 0xff);
-          mem_write t ((de + 0x23) land 0xffff) ((next_rec lsr 16) land 0xff);
-          Hashtbl.replace t.bdos_files de (data, start + n);
-          Z80.set_hl t.cpu (n / rec_size);
-          if n < want then 0x01 else 0x00)
+          let start = record * size and want = count * size in
+          if size = 0 || want > 65536 then (Z80.set_hl t.cpu 0; 0x01)
+          else
+            let available = max 0 (Bytes.length data - start) in
+            let amount = min want available in
+            let records = (amount + size - 1) / size in
+            for i = 0 to records * size - 1 do
+              let byte = if i < amount then Char.code (Bytes.get data (start + i)) else 0 in
+              mem_write t ((t.disk_dma + i) land 0xffff) byte
+            done;
+            for i = 0 to (if size < 64 then 3 else 2) do
+              mem_write t ((de + 0x21 + i) land 0xffff) (((record + records) lsr (8 * i)) land 255)
+            done;
+            Hashtbl.replace t.bdos_files de (data, start + amount);
+            Z80.set_hl t.cpu records;
+            if records < count then 0x01 else 0x00)
       | _ -> 0xff
     in
     if c = 0x16 then Z80.set_hl t.cpu ((Z80.dump_hl t.cpu land 0xff00) lor a);
