@@ -111,13 +111,13 @@ let detection () =
   check "scc from 0x5000/0x9000/0xB000"
     (Msx.guess_mapper (rom_with_writes [ 0x5000; 0x9000; 0xb000 ]) = Msx.Konami_scc);
   check "ascii8 from 0x6800/0x7800"
-    (Msx.guess_mapper (rom_with_writes [ 0x6800; 0x7800 ]) = Msx.Ascii8);
+    (Msx.guess_mapper (rom_with_writes [ 0x6800; 0x7800 ]) = Msx.Ascii8_sram);
   (* An ASCII8 game also writes 0x6000/0x7000 (two of its four registers), so a
      naive count reads it as ASCII16. The 0x6800/0x7800 writes must still win.
      This is the Deep Dungeon case. *)
   check "ascii8 wins over ascii16 when both register sets appear"
     (Msx.guess_mapper (rom_with_writes [ 0x6000; 0x6800; 0x7000; 0x7800; 0x6000; 0x7000 ])
-     = Msx.Ascii8);
+     = Msx.Ascii8_sram);
   check "ascii16 from 0x6000/0x7000"
     (Msx.guess_mapper (rom_with_writes [ 0x6000; 0x7000 ]) = Msx.Ascii16);
   (* a flat 32KB cart reads through the flat path, not a bank register *)
@@ -125,11 +125,33 @@ let detection () =
   Msx.load_cartridge t (synth 4);
   check "a 32KB cart is Flat" (Msx.cart_mapper t = Msx.Flat)
 
+(* Koei ASCII8 with battery RAM: a 256KB cart has 32 segments, so bank bit 0x20
+   is the first above the segment range and selects SRAM. A store into an SRAM
+   window stays; a ROM bank still reads its segment. *)
+let koei_sram () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Ascii8_sram t (synth 32);
+  show_cart t;
+  (* register 0x7000 selects window 2 (0x8000); a plain segment reads ROM *)
+  Msx.mem_write t 0x7000 5;
+  check "koei rom bank reads its segment" (win t 0x8000 = 5);
+  (* bank 0x20 maps SRAM into the window; a store there is read back *)
+  Msx.mem_write t 0x7000 0x20;
+  Msx.mem_write t 0x8000 0xab;
+  check "koei sram store is read back" (win t 0x8000 = 0xab);
+  check "koei sram starts clear" (win t 0x8001 = 0);
+  (* back to a ROM bank shows ROM again; the SRAM keeps its byte *)
+  Msx.mem_write t 0x7000 5;
+  check "koei rom again after sram" (win t 0x8000 = 5);
+  Msx.mem_write t 0x7000 0x20;
+  check "koei sram retained across bank switch" (win t 0x8000 = 0xab)
+
 let () =
   konami ();
   konami_scc ();
   ascii8 ();
   ascii16 ();
+  koei_sram ();
   detection ();
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;

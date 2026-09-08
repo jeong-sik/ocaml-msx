@@ -16,20 +16,9 @@ val create :
   port_out:(int -> int -> unit) ->
   t
 
+val step : t -> int
 (** 한 명령을 실행하고 그 명령이 쓴 T-state 를 반환. HALT 상태면 아무
     것도 하지 않고 4 를 반환한다. *)
-val step : t -> int
-
-(** How an entry-trap handler answers for a PC: [Not_mine] executes normally,
-    [Ret] means the call was already served and the step returns to the pushed
-    caller instead of executing, [Call target] redirects the PC leaving the
-    stack as the handler prepared it -- the trampoline shape a real ROM
-    installs at a restart vector. *)
-type trap_serve = Not_mine | Ret | Call of int
-
-val set_entry_trap : t -> (int -> trap_serve) option -> unit
-(** An optional hook consulted before each instruction fetch; see
-    {!trap_serve}. Set [None] to disable. *)
 
 val set_pc : t -> int -> unit
 (** 하네스가 TPA 시작(0x100)을 강제하는 자리. 이미지 헤더의 JP 를 믿지
@@ -64,4 +53,6 @@ val dump_hl : t -> int
 val dump_f : t -> int
 val dump_ix : t -> int
 val dump_iy : t -> int
+val set_ix : t -> int -> unit
+val set_iy : t -> int -> unit
 val dump_sp : t -> int

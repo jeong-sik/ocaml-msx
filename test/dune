@@ -34,6 +34,6 @@
  (libraries msx))
 
 (test
- (name dsk_test)
- (modules dsk_test)
- (libraries dsk))
+ (name disk_test)
+ (modules disk_test)
+ (libraries msx))

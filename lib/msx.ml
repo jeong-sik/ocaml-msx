@@ -67,24 +67,7 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    register. [Flat] is the plain 16/32KB cart with no banking. The four here are
    the common ones (openMSX RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16);
    the SCC sound chip is not modelled, only its banking. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16
-
-(* WD279x 근사 상태. 즉시-완료 모델: 명령을 받으면 상태 읽기 한 번 안에
-   seek/read 준비를 끝낸다 — 실기 타이밍의 근사이고, 로더가 상태 비트를
-   폴링하는 한 관측상 같다. [buf] 는 READ SECTOR 가 채운 섹터 한 개. *)
-type fdc_state = {
-  mutable cmd : int;         (** 마지막 명령 바이트 — 상태 산출용 *)
-  mutable track : int;       (** 트랙 레지스터 *)
-  mutable sector : int;      (** 섹터 레지스터 *)
-  mutable data : int;        (** 데이터 레지스터 (seek 목적지 포함) *)
-  mutable side : int;        (** 0xD4 bit1 *)
-  mutable motor : bool;      (** 0xD4 bit3 *)
-  mutable busy : bool;
-  mutable drq : bool;
-  mutable intr : bool;
-  buf : Bytes.t;             (** READ SECTOR 버퍼, 512 *)
-  mutable pos : int;
-}
+type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
 
 type t = {
   cpu : Z80.t;
@@ -97,15 +80,23 @@ type t = {
   cart_banks : int array;
       (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
           window); ASCII16 uses [.(0)]/[.(1)] as 16KB banks. *)
-  mutable disk : Dsk.t option;  (** 플로피 이미지 — DSKIO 트랩이 서비스 *)
-  mutable bdos_dta : int;  (** _SETDTA 가 정한 전송 주소 *)
-  bdos_files : (int, string * int) Hashtbl.t;
-      (** FCB 주소 → (파일 내용, 읽은 위치) — BDOS 스텁의 서버 쪽 상태 *)
-  mutable rst30_pending : (int * int) list;
-      (** RST 30h 인터슬롯의 복귀 대기: (복귀 PC, 저장한 ppi_a) 최근 것 먼저 *)
-  mutable fdc : fdc_state;
-      (** WD279x 컨트롤러 근사: 명령/상태, 트랙·섹터 레지스터, 섹터 버퍼.
-          포트 0xD0-0xD4 로 로더가 직접 말을 건다. *)
+  mutable cart_sram : Bytes.t;
+      (** battery RAM for an [Ascii8_sram] (Koei) cart: a bank whose value has
+          [cart_sram_bit] set reads/writes here instead of ROM. Empty otherwise. *)
+  mutable cart_sram_bit : int;
+      (** the bank-value bit that selects SRAM (just above the ROM's segment
+          range), e.g. 0x20 for a 256KB cart. *)
+  mutable disk : Bytes.t;
+      (** the floppy image, 512 bytes a sector (empty = no drive). The disk
+          interface ROM itself rides in [cart]; see [load_disk]. *)
+  mutable disk_dma : int;  (** BDOS transfer address, set by function 0x1A *)
+  bdos_files : (int, Bytes.t * int) Hashtbl.t;
+      (** FCB 주소 → (파일 내용, 읽은 위치) — BDOS 스텁의 서버 쪽 상태.
+          로더가 여러 FCB 를 번갈아 열기 때문에 마지막 파일 하나로는
+          부족하다 (삼국지2 는 _OPEN 을 6번 부른다). *)
+  mutable con_esc : int;
+      (** VT52 escape-sequence state for the BDOS console: 0=plain, 1=after
+          ESC, 2=after "ESC Y" (row byte next), 3=column byte next. *)
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
@@ -125,7 +116,7 @@ let rom_or_empty = function "" -> Bytes.make 0x4000 '\000' | s -> Bytes.of_strin
    16KB bank into its two 8KB halves. *)
 let cart_seg8 m w =
   match m.cart_mapper with
-  | Konami | Konami_scc | Ascii8 -> m.cart_banks.(w)
+  | Konami | Konami_scc | Ascii8 | Ascii8_sram -> m.cart_banks.(w)
   | Ascii16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
   | Flat -> w
 
@@ -145,7 +136,7 @@ let cart_bank_write m a v =
   | Konami_scc ->
     (* Register at 0x5000/0x7000/0x9000/0xB000: (a land 0x1800) = 0x1000. *)
     if a land 0x1800 = 0x1000 then m.cart_banks.((a lsr 13) - 2) <- v
-  | Ascii8 ->
+  | Ascii8 | Ascii8_sram ->
     (match a land 0xf800 with
      | 0x6000 -> m.cart_banks.(0) <- v
      | 0x6800 -> m.cart_banks.(1) <- v
@@ -182,21 +173,15 @@ let guess_mapper rom =
         (match addr with 0x6000 | 0x7000 -> incr a16 | _ -> ())
       end
     done;
-    if !a8 > 0 && !a8 >= !scc && !a8 >= !konami then Ascii8
+    (* ASCII8 detection returns the SRAM-capable variant: the SRAM only engages
+       when a bank sets its select bit (Koei games do; plain ASCII8 never does),
+       so it is a safe superset and lets Koei carts boot without an override. *)
+    if !a8 > 0 && !a8 >= !scc && !a8 >= !konami then Ascii8_sram
     else if !scc > 0 && !scc >= !konami then Konami_scc
     else if !konami > 0 then Konami
     else if !a16 > 0 then Ascii16
     else Konami
   end
-
-(* 슬롯1 0x4000-0x7FFF: "AB" 헤더, 0x4002 장치 코드 0, 나머지 RET. *)
-let disk_rom_bytes =
-  let b = Bytes.make 0x4000 '\xc9' in
-  Bytes.set b 0 'A';
-  Bytes.set b 1 'B';
-  Bytes.set b 2 '\x00';
-  Bytes.set b 3 '\xc9';
-  b
 
 let mem_read m addr =
   let a = addr land 0xffff in
@@ -215,9 +200,23 @@ let mem_read m addr =
   then begin
     (* MegaROM: 0x4000-0xBFFF is four 8KB windows, each showing the segment its
        bank register selects. The cart sits in slot 2 (see load_cartridge). *)
-    let seg = cart_seg8 m ((a lsr 13) - 2) in
-    let off = (seg * 0x2000) + (a land 0x1fff) in
-    Char.code (Bytes.get m.cart (off mod Bytes.length m.cart))
+    let w = (a lsr 13) - 2 in
+    let bank = m.cart_banks.(w) in
+    if
+      m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
+      && bank land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
+    then begin
+      (* A Koei cart maps its battery RAM into a window whose bank has the SRAM
+         bit; the low bits pick the 8KB SRAM page. *)
+      let pages = Bytes.length m.cart_sram / 0x2000 in
+      let off = ((bank land (pages - 1)) * 0x2000) + (a land 0x1fff) in
+      Char.code (Bytes.get m.cart_sram off)
+    end
+    else begin
+      let seg = cart_seg8 m w in
+      let off = (seg * 0x2000) + (a land 0x1fff) in
+      Char.code (Bytes.get m.cart (off mod Bytes.length m.cart))
+    end
   end
   else begin
     let off = a land 0x3fff in
@@ -230,12 +229,7 @@ let mem_read m addr =
       let rom, roff =
         match slot, page with
         | 0, 0 | 0, 1 -> (m.main_rom, off)
-        | 1, 1 when Option.is_some m.disk ->
-        (* 디스크 장착 중 슬롯1 페이지1 은 가상 DISK BIOS: "AB" 시그니처와
-           엔트리들. 실행은 트랩이 진입을 가로채니 바이트는 RET — 놓친 호출이
-           조용히 복귀하는 것으로 끝난다. *)
-        (disk_rom_bytes, off)
-    | 1, 0 | 1, 1 -> (m.main_rom, off)
+        | 1, 0 | 1, 1 -> (m.main_rom, off)
         (* calslt 가 init 호출 시 전 페이지를 카트리지 슬롯으로 스왑하므로
            부트 초반 로고(슬롯0 페이지2)와는 시점이 갈린다. *)
         | 0, 2 | 1, 2 -> (m.logo_rom, off)
@@ -279,9 +273,21 @@ let mem_write m addr v =
   if a = 0xffff && slot = 3 then m.slot3_sel <- v land 0xff
   else if
     slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
-  then
-    (* A write into the cart window is a bank select, not a store. *)
-    cart_bank_write m a (v land 0xff)
+  then begin
+    let w = (a lsr 13) - 2 in
+    if
+      a >= 0x8000 && m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
+      && m.cart_banks.(w) land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
+    then begin
+      (* A store into a window mapped to battery RAM lands in the SRAM. *)
+      let pages = Bytes.length m.cart_sram / 0x2000 in
+      let off = ((m.cart_banks.(w) land (pages - 1)) * 0x2000) + (a land 0x1fff) in
+      Bytes.set m.cart_sram off (Char.chr (v land 0xff))
+    end
+    else
+      (* Otherwise a write into the cart window is a bank select, not a store. *)
+      cart_bank_write m a (v land 0xff)
+  end
   else if slot = 3 && (m.slot3_sel land 3 = 2 || page = 3) then begin
     let seg = m.mapper.(page) in
     let base = ((seg * 0x4000) + (a land 0x3fff)) mod (Bytes.length m.ram) in
@@ -301,93 +307,8 @@ let psg_read m =
   | r when r < 16 -> m.psg.(r)
   | _ -> 0xff
 
-(* ---------- FDC (WD279x 근사) — 포트 0xD0-0xD4 ----------
-
-   정본은 openMSX src/fdc/WD2793.cc. 즉시-완료 모델: RESTORE/SEEK 은 상태
-   읽기 한 번 안에 끝나고, READ SECTOR 는 명령 받는 순간 버퍼를 채워
-   DRQ 를 올린다 — 로더가 상태 비트를 폴링하는 한 실기와 관측이 같다.
-   논리 섹터 = (track*2 + side)*9 + (sector-1). *)
-
-let fdc_log : (int * int * int) array = Array.make 256 (0, 0, 0)
-let fdc_log_i = ref 0
-let fdc_note kind port v =
-  fdc_log.(!fdc_log_i land 255) <- (kind, port, v);
-  incr fdc_log_i
-
-let fdc_status m =
-  let f = m.fdc in
-  (* READ 계열 진행 중이면 DRQ, 아니면 ready(0). not-ready 는 디스크가
-     없을 때만 — 있으면 언제나 ready. *)
-  let base = if Option.is_none m.disk then 0x80 else 0x00 in
-  let drq = if f.drq then 0x02 else 0x00 in
-  let busy = if f.busy then 0x01 else 0x00 in
-  base lor drq lor busy
-
-let fdc_load_sector m =
-  let f = m.fdc in
-  match m.disk with
-  | None -> f.drq <- false
-  | Some d -> (
-      let logical = ((f.track * 2) + f.side) * 9 + (f.sector - 1) in
-      match Dsk.read_sector d logical with
-      | Some (b : string) ->
-          Bytes.blit_string b 0 f.buf 0 (String.length b);
-          f.pos <- 0;
-          f.drq <- true;
-          f.busy <- true
-      | None -> f.drq <- false)
-
-let fdc_write m port v =
-  let f = m.fdc in
-  match port land 0xff with
-  | 0xD0 ->
-      fdc_note 1 0xD0 v;
-      f.cmd <- v land 0xf0;
-      (match v land 0xf0 with
-       | 0x00 -> f.track <- 0; f.intr <- true (* RESTORE *)
-       | 0x10 -> f.track <- f.data; f.intr <- true (* SEEK *)
-       | 0x80 | 0x90 | 0xA0 | 0xB0 -> fdc_load_sector m (* READ SECTOR *)
-       | 0xC0 -> f.intr <- true (* READ ADDRESS — 최소 *)
-       | 0xD0 -> f.busy <- false; f.intr <- true (* FORCE INTERRUPT *)
-       | _ -> f.intr <- true)
-  | 0xD1 -> f.track <- v land 0xff
-  | 0xD2 -> f.sector <- v land 0xff
-  | 0xD3 -> f.data <- v land 0xff
-  | 0xD4 ->
-      (* 시스템 컨트롤: bit1 side, bit3 motor (배선은 로더 로그로 맞춘다). *)
-      fdc_note 1 0xD4 v;
-      f.side <- (v lsr 1) land 1;
-      f.motor <- v land 0x08 <> 0
-  | _ -> ()
-
-let fdc_read m port =
-  let f = m.fdc in
-  match port land 0xff with
-  | 0xD0 ->
-      let st = fdc_status m in
-      fdc_note 0 0xD0 st;
-      (* 상태 읽기가 seek 완료를 소비한다 — 즉시-완료 모델의 표현. *)
-      f.busy <- false;
-      st
-  | 0xD1 -> f.track
-  | 0xD2 -> f.sector
-  | 0xD3 ->
-      let b = Char.code (Bytes.get f.buf f.pos) in
-      if f.pos < 511 then f.pos <- f.pos + 1
-      else begin
-        f.drq <- false;
-        f.intr <- true
-      end;
-      fdc_note 0 0xD3 b;
-      b
-  | _ -> 0xff
-
-let fdc_recent_calls () =
-  Array.init (min !fdc_log_i 256) (fun k -> fdc_log.((!fdc_log_i - min !fdc_log_i 256 + k) land 255))
-
 let port_read m port =
   match port land 0xff with
-  | 0xD0 | 0xD1 | 0xD2 | 0xD3 -> fdc_read m port
   | 0x98 -> Vdp.io_read m.vdp ~port:0x98
   | 0x99 -> Vdp.io_read m.vdp ~port:0x99
   | 0xA8 -> m.ppi_a
@@ -409,7 +330,6 @@ let port_read m port =
 
 let port_write m port v =
   match port land 0xff with
-  | 0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xD4 -> fdc_write m port v
   | 0x98 | 0x99 | 0x9A | 0x9B -> Vdp.io_write m.vdp ~port:(port land 0xff) v
   | 0xA8 -> m.ppi_a <- v land 0xff
   | 0xAA -> m.ppi_c <- v land 0xff
@@ -454,14 +374,12 @@ let create ~machine =
       cart = Bytes.make 0 '\000';
       cart_mapper = Flat;
       cart_banks = [| 0; 1; 2; 3 |];
-      disk = None;
-      bdos_dta = 0x0080;
+      cart_sram = Bytes.make 0 '\000';
+      cart_sram_bit = 0;
+      disk = Bytes.make 0 '\000';
+      disk_dma = 0x0080;
       bdos_files = Hashtbl.create 4;
-      rst30_pending = [];
-      fdc =
-        { cmd = 0; track = 0; sector = 1; data = 0; side = 0; motor = false;
-          busy = false; drq = false; intr = false; buf = Bytes.make 512 '\x00';
-          pos = 0 };
+      con_esc = 0;
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
       ppi_a = 0x00;
@@ -491,267 +409,395 @@ let load_cartridge ?mapper t rom =
   t.cart_banks.(1) <- 1;
   t.cart_banks.(2) <- 2;
   t.cart_banks.(3) <- 3;
+  (* A Koei cart gets 32KB of battery RAM (covers KoeiSRAM8 and KoeiSRAM32); the
+     SRAM-select bit is the first bit above the ROM's segment range. *)
+  (match t.cart_mapper with
+   | Ascii8_sram ->
+     let nseg = (String.length rom + 0x1fff) / 0x2000 in
+     let bit = ref 1 in
+     while !bit < nseg do bit := !bit lsl 1 done;
+     t.cart_sram_bit <- !bit;
+     t.cart_sram <- Bytes.make 0x8000 '\000'
+   | _ ->
+     t.cart_sram_bit <- 0;
+     t.cart_sram <- Bytes.make 0 '\000');
   (* mem_read 은 카트리지를 슬롯2 페이지0·1 에 둔다. 페이지0 을 슬롯2 로
      돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
   t.ppi_a <- (t.ppi_a land 0xf3) lor 0x08
 
-(* 표준 2DD(9섹터 2헤드) DPB — 게임이 파일시스템을 물을 때 돌려주는 값. *)
-let dpb_2dd : string =
-  "\xf9\x09\x02\x02\x02\x01\x01\x02\x70\x00\x0a\xf5\x03\xf9\x02\x00"
+(* --- Disk interface (HLE) -------------------------------------------------
+   A game disk boots through a disk interface ROM that rides in the cartridge
+   slot: C-BIOS finds its "AB" header and calls INIT, the same slot path a game
+   cart uses. The ROM's BIOS entries are not WD2793 code but addresses the step
+   loop traps ([disk_trap]); the trap moves whole 512-byte sectors between the
+   .dsk image and RAM in OCaml. No floppy controller is emulated -- the sector
+   transfer is the whole model. *)
 
-let disk_trap_counts_arr : int array = Array.make 8 0
-let disk_trap_index = function
-  | 0x4013 -> 0 | 0x4016 -> 1 | 0x4019 -> 2 | 0x401c -> 3 | 0x401f -> 4
-  | _ -> 5
+let disk_sector_bytes = 512
+let disk_init_entry = 0x4100 (* the "AB" INIT vector; C-BIOS CALLSLTs here *)
+let disk_dskio_entry = 0x4010 (* DSKIO; the standard disk BIOS jumptable offset *)
+let disk_inienv_entry = 0x4030 (* INIENV; the MSX-DOS kernel init calls this first *)
+let disk_bdos_entry = 0xf37d (* MSX DISK-BASIC system-call entry; C = function *)
+let disk_boot_addr = 0xc000 (* boot sector lands here; entry at +0x1e *)
 
-(* DISK BIOS 엔트리 서비스. 0x4013 DSKIO(읽기만: A=드라이브, C=섹터 수,
-   DE=논리 섹터, HL=버퍼), 0x4016 DSKCHG(변경 없음), 0x4019 GETDPB(표준
-   2DD), 0x401C CHOICE(빈 답), 0x401F DSKFMT(거부). 성공은 CF 를 내리고
-   실패는 CF 와 A 에 코드를 싣는다 — 호출자가 보는 계약 그대로. *)
-let serve_disk_entry m pc =
-  disk_trap_counts_arr.(disk_trap_index pc) <- disk_trap_counts_arr.(disk_trap_index pc) + 1;
-  match pc with
-  | 0x4013 ->
-      let cpu = m.cpu in
-      let drive = Z80.dump_a cpu in
-      let count = Z80.dump_bc cpu land 0xff in
-      let start = Z80.dump_de cpu in
-      let buf = Z80.dump_hl cpu in
-      let fail code = Z80.set_af cpu ((code lsl 8) lor 0x01) in
-      if drive <> 0 then fail 0x0c (* no drive *)
-      else begin
-        match m.disk with
-        | None -> fail 0x0c
-        | Some d ->
-            let ok = ref true in
-            for i = 0 to count - 1 do
-              match Dsk.read_sector d (start + i) with
-              | Some b ->
-                  String.iteri
-                    (fun j c ->
-                      mem_write m ((buf + (i * 512) + j) land 0xffff)
-                        (Char.code c))
-                    b
-              | None -> ok := false
-            done;
-            if !ok then Z80.set_af cpu ((Z80.dump_a cpu lsl 8) land 0xff00)
-            else fail 0x0d (* sector not found *)
-      end
-  | 0x4016 ->
-      let cpu = m.cpu in
-      Z80.set_bc cpu (Z80.dump_bc cpu land 0xff00);
-      Z80.set_af cpu ((Z80.dump_a cpu lsl 8) land 0xff00)
-  | 0x4019 ->
-      let cpu = m.cpu in
-      let hl = Z80.dump_hl cpu in
-      String.iteri
-        (fun j c -> mem_write m ((hl + j) land 0xffff) (Char.code c))
-        dpb_2dd;
-      Z80.set_af cpu ((Z80.dump_a cpu lsl 8) land 0xff00)
-  | 0x401c ->
-      let cpu = m.cpu in
-      Z80.set_bc cpu (Z80.dump_bc cpu land 0xff00);
-      Z80.set_af cpu ((Z80.dump_a cpu lsl 8) land 0xff00)
-  | 0x401f -> Z80.set_af m.cpu ((0x0d lsl 8) lor 0x01) (* write-protect *)
-  | _ -> ()
+(* Observation: every disk BIOS entry the boot code hits, so an offline run can
+   show what convention the .dsk expects (which addresses, which registers). *)
+let disk_calls : (int * int * int * int * int * int) list ref = ref []
+let disk_call_log = ref false
+let set_disk_call_log b = disk_call_log := b
+let disk_call_entries () = List.rev !disk_calls
 
-let disk_entry_pc = function
-  | 0x4013 | 0x4016 | 0x4019 | 0x401c | 0x401f -> true
-  | _ -> false
-
-(* ---------- BDOS 스텁(0xF37D) — MSX-DOS 함수 호출 서비스 ----------
-
-   Disk ROM 은 부트 섹터 코드를 부르기 전 F37D 에 DOS 엔트리를 깐다. DOS
-   커널 없이 그 엔트리를 트랩으로 서비스한다: 부트 섹터가 _OPEN/_SETDTA/
-   _RDBLK 로 시스템 파일(MSXDOS.SYS 나 KOEI.SYS)을 0x0100 에 실는 흐름을
-   대행한다. 파일 상태는 FCB 주소를 키로 서버 쪽에 둔다 — FCB 필드의 채움
-   규약을 흉내내는 대신 여는 시점의 내용을 통째로 기억한다. *)
+(* Per-function BDOS call counts, for boot diagnosis: which functions a
+   loader actually exercises (_RDBLK 27 calls in Sangokushi II's loader). *)
 let bdos_call_counts : int array = Array.make 256 0
 
-let serve_bdos m =
-  let cpu = m.cpu in
-  let fn = Z80.dump_bc cpu land 0xff in
-  bdos_call_counts.(fn) <- bdos_call_counts.(fn) + 1;
-  let ret_a a = Z80.set_af cpu ((a lsl 8) land 0xff00) in
-  let read16 addr =
-    mem_read m addr lor (mem_read m ((addr + 1) land 0xffff) lsl 8)
-  in
-  let write16 addr v =
-    mem_write m addr (v land 0xff);
-    mem_write m ((addr + 1) land 0xffff) (v lsr 8)
-  in
-  let store bytes =
-    String.iteri
-      (fun i c -> mem_write m ((m.bdos_dta + i) land 0xffff) (Char.code c))
-      bytes
-  in
-  match fn with
-  | 0x09 ->
-      (* _STROUT: '$' 종결 문자열 출력. 콘손은 아직 없다 — 소비로 갈음. *)
-      let de = Z80.dump_de cpu in
-      let n = ref 0 in
-      while !n < 256 && mem_read m ((de + !n) land 0xffff) <> 0x24 do incr n done;
-      ret_a 0x00
-  | 0x0F ->
-      (* _OPEN: FCB+1..11 이름으로 디렉터리 검색. 성공이면 레코드 크기
-         기본값 128 을 FCB 에 적는다 — 호출자가 다시 쓸 수 있다. *)
-      let fcb = Z80.dump_de cpu in
-      let drive = mem_read m fcb in
-      let name = String.init 11 (fun i -> Char.chr (mem_read m (fcb + 1 + i))) in
-      let opened =
-        drive <= 1
-        &&
-        match m.disk with
-        | None -> false
-        | Some d -> (
-            match Dsk.find_file d name with
-            | Some entry -> (
-                match Dsk.read_entry d entry with
-                | Some content ->
-                    Hashtbl.replace m.bdos_files fcb (content, 0);
-                    write16 (fcb + 0x0E) 128;
-                    true
-                | None -> false)
-            | None -> false)
-      in
-      if opened then ret_a 0x00 else ret_a 0xFF
-  | 0x10 ->
-      Hashtbl.remove m.bdos_files (Z80.dump_de cpu);
-      ret_a 0x00
-  | 0x1A ->
-      m.bdos_dta <- Z80.dump_de cpu;
-      ret_a 0x00
-  | 0x14 ->
-      (* _RDSEQ: 파일 위치에서 레코드 크기(FCB+0x0E)만큼 DTA 로. *)
-      let fcb = Z80.dump_de cpu in
-      (match Hashtbl.find_opt m.bdos_files fcb with
-       | None -> ret_a 0xFF (* 열리지 않은 FCB *)
-       | Some (content, pos) -> (
-           let rs = max 1 (read16 (fcb + 0x0E)) in
-           let take = min rs (String.length content - pos) in
-           if take <= 0 then ret_a 0xFF (* 더 읽을 데이터 없음 *)
-           else begin
-             store (String.sub content pos take);
-             Hashtbl.replace m.bdos_files fcb (content, pos + take);
-             ret_a 0x00
-           end))
-  | 0x27 ->
-      (* _RDBLK: HL 레코드 × 레코드 크기를 DTA 로. 짧으면 읽은 만큼. *)
-      let fcb = Z80.dump_de cpu in
-      (match Hashtbl.find_opt m.bdos_files fcb with
-       | None -> ret_a 0xFF
-       | Some (content, pos) ->
-           let rs = max 1 (read16 (fcb + 0x0E)) in
-           let want = (Z80.dump_hl cpu * rs) land 0x1FFFF in
-           let take = max 0 (min want (String.length content - pos)) in
-           if take > 0 then store (String.sub content pos take);
-           Hashtbl.replace m.bdos_files fcb (content, pos + take);
-           Z80.set_hl cpu (take / rs);
-           ret_a (if take < want then 0x01 else 0x00))
-  | 0x2F ->
-      (* _RDABS: DE 시작 논리 섹터부터 H 섹터를 DTA 로 절대 읽기. L 은
-         드라이브. 부트 로더가 섹터 0 을 다시 읹는 데 쓴다. *)
-      let hl = Z80.dump_hl cpu in
-      let count = hl lsr 8 and drive = hl land 0xff in
-      let start = Z80.dump_de cpu in
-      let err =
-        if drive <> 0 then 0x0C (* no drive *)
-        else
-          match m.disk with
-          | None -> 0x0C
-          | Some d ->
-              let bad = ref false in
-              for s = 0 to count - 1 do
-                match Dsk.read_sector d (start + s) with
-                | Some b ->
-                    String.iteri
-                      (fun i c ->
-                         mem_write m
-                           ((m.bdos_dta + (s * Dsk.bytes_per_sector) + i) land 0xffff)
-                           (Char.code c))
-                      b
-                | None -> bad := true
-              done;
-              if !bad then 0x0D (* sector not found *) else 0x00
-      in
-      ret_a err
-  | _ ->
-      (* 모르는 함수: 실패로 답해 오류 경로가 드러나게 한다. *)
-      ret_a 0xFF
+let disk_rom_bytes () =
+  let rom = Bytes.make 0x4000 '\xc9' (* every unentered byte is a RET *) in
+  Bytes.set rom 0 'A';
+  Bytes.set rom 1 'B';
+  Bytes.set rom 2 (Char.chr (disk_init_entry land 0xff));
+  Bytes.set rom 3 (Char.chr ((disk_init_entry lsr 8) land 0xff));
+  Bytes.to_string rom
 
-(* RST 30h 트램펄린 — 실기의 디스크 ROM 이 0x0030 에 깔아 두던 인터슬롯
-   핸들러 대역. RST 30h 가 push 한 반환주소는 서술자(slot 1 + 주소 2)를
-   가리킨다: 서술자를 읽고, 그 자리에 서술자 건너뛴 복귀 주소를 심은 뒤
-   대상 페이지의 슬롯 배선을 돌려 대상으로 건다(Trap Call). 대상의 RET 이
-   복귀 주소로 돌아오면 엔트리 트랩이 배선을 되돌린다. 대상이 복귀 주소로
-   점프해 버리면 되돌림이 남는다 — 부트 로더 관찰 범위 밖의 위험. *)
-let serve_rst30 m =
-  let cpu = m.cpu in
-  let sp = Z80.dump_sp cpu in
-  let rd16 a =
-    mem_read m a lor (mem_read m ((a + 1) land 0xffff) lsl 8)
+(* Move [count] 512-byte sectors between the disk image and RAM. [write] false
+   reads disk -> RAM. Sectors past the image read as zero and drop on write, the
+   way a real controller reports a seek error; the caller sets the flags. *)
+let disk_transfer t ~write ~sector ~count ~addr =
+  let len = Bytes.length t.disk in
+  for s = 0 to count - 1 do
+    let disk_off = (sector + s) * disk_sector_bytes in
+    for i = 0 to disk_sector_bytes - 1 do
+      let mem = (addr + (s * disk_sector_bytes) + i) land 0xffff in
+      let doff = disk_off + i in
+      if write then begin
+        if doff < len then Bytes.set t.disk doff (Char.chr (mem_read t mem))
+      end
+      else begin
+        let v = if doff < len then Char.code (Bytes.get t.disk doff) else 0 in
+        mem_write t mem v
+      end
+    done
+  done
+
+(* --- FAT12 read-only file system on the .dsk image -----------------------
+   Enough of FAT12 to find a file in the root directory and read its bytes, so
+   the BDOS trap can load MSXDOS.SYS (and whatever the boot opens). The BPB is in
+   the boot sector; only fields the reader needs are decoded. *)
+
+let dsk_u8 t off = if off < Bytes.length t.disk then Char.code (Bytes.get t.disk off) else 0
+let dsk_u16 t off = dsk_u8 t off lor (dsk_u8 t (off + 1) lsl 8)
+
+let rec ilog2 n = if n <= 1 then 0 else 1 + ilog2 (n / 2)
+
+type fat12 = {
+  bytes_per_sec : int;
+  sec_per_clus : int;
+  sec_per_fat : int;
+  root_start_sec : int;
+  root_entries : int;
+  data_start_sec : int;
+  fat_start_sec : int;
+}
+
+let fat12_of t =
+  let bytes_per_sec = dsk_u16 t 0x0b in
+  let sec_per_clus = dsk_u8 t 0x0d in
+  let reserved = dsk_u16 t 0x0e in
+  let num_fats = dsk_u8 t 0x10 in
+  let root_entries = dsk_u16 t 0x11 in
+  let sec_per_fat = dsk_u16 t 0x16 in
+  let root_start_sec = reserved + (num_fats * sec_per_fat) in
+  let root_sectors = ((root_entries * 32) + bytes_per_sec - 1) / bytes_per_sec in
+  { bytes_per_sec; sec_per_clus; sec_per_fat; root_start_sec; root_entries;
+    data_start_sec = root_start_sec + root_sectors; fat_start_sec = reserved }
+
+(* Next cluster in the FAT12 chain (12 bits packed, low/high nibble by parity). *)
+let fat12_next t fs cluster =
+  let base = fs.fat_start_sec * fs.bytes_per_sec in
+  let off = base + (cluster * 3 / 2) in
+  let v = dsk_u8 t off lor (dsk_u8 t (off + 1) lsl 8) in
+  if cluster land 1 = 0 then v land 0xfff else (v lsr 4) land 0xfff
+
+(* The 11-byte directory name (8+3, space padded) of the root entry, uppercased
+   the way a stored FAT name already is. *)
+let fat12_find t fs name11 =
+  let entry_at i = (fs.root_start_sec * fs.bytes_per_sec) + (i * 32) in
+  let rec scan i =
+    if i >= fs.root_entries then None
+    else
+      let e = entry_at i in
+      let first = dsk_u8 t e in
+      if first = 0x00 then None (* no more entries *)
+      else if first = 0xe5 then scan (i + 1) (* deleted *)
+      else
+        let matches = ref true in
+        for k = 0 to 10 do
+          if dsk_u8 t (e + k) <> Char.code name11.[k] then matches := false
+        done;
+        if !matches then Some e else scan (i + 1)
   in
-  let wr16 a v =
-    mem_write m a (v land 0xff);
-    mem_write m ((a + 1) land 0xffff) (v lsr 8)
+  scan 0
+
+(* The whole file's bytes, walking its cluster chain up to the directory size. *)
+let fat12_read t fs dir_entry =
+  let start = dsk_u16 t (dir_entry + 0x1a) in
+  let size =
+    dsk_u8 t (dir_entry + 0x1c)
+    lor (dsk_u8 t (dir_entry + 0x1d) lsl 8)
+    lor (dsk_u8 t (dir_entry + 0x1e) lsl 16)
+    lor (dsk_u8 t (dir_entry + 0x1f) lsl 24)
   in
-  let desc = rd16 sp in
-  let slot = mem_read m desc in
-  let addr = rd16 ((desc + 1) land 0xffff) in
-  wr16 sp ((desc + 3) land 0xffff);
-  let page = addr lsr 14 in
-  let shift = page * 2 in
-  m.rst30_pending <- ((desc + 3) land 0xffff, m.ppi_a) :: m.rst30_pending;
-  m.ppi_a <-
-    (m.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
-  addr
+  let out = Buffer.create size in
+  let clus_bytes = fs.sec_per_clus * fs.bytes_per_sec in
+  let rec walk cluster =
+    if cluster < 2 || cluster >= 0xff8 || Buffer.length out >= size then ()
+    else begin
+      let sec = fs.data_start_sec + ((cluster - 2) * fs.sec_per_clus) in
+      let off = sec * fs.bytes_per_sec in
+      for i = 0 to clus_bytes - 1 do
+        if Buffer.length out < size then Buffer.add_char out (Bytes.get t.disk (off + i))
+      done;
+      walk (fat12_next t fs cluster)
+    end
+  in
+  walk start;
+  Buffer.to_bytes out
 
-let load_disk m image =
-  m.disk <- Some (Dsk.parse image);
-  m.rst30_pending <- [];
-  Z80.set_entry_trap m.cpu
-    (Some (fun pc ->
-         match m.rst30_pending with
-         | (cont, saved) :: rest when pc = cont ->
-             (* 인터슬롯 대상이 복귀했다 — 슬롯 배선을 되돌리고 실행 계속. *)
-             m.rst30_pending <- rest;
-             m.ppi_a <- saved;
-             Z80.Not_mine
-         | _ ->
-             if disk_entry_pc pc then begin
-               serve_disk_entry m pc;
-               Z80.Ret
-             end
-             else if pc = 0xF37D then begin
-               serve_bdos m;
-               Z80.Ret
-             end
-             else if pc = 0x0030 then Z80.Call (serve_rst30 m)
-             else Z80.Not_mine))
+let fat12_open t name11 =
+  if Bytes.length t.disk = 0 then None
+  else
+    let fs = fat12_of t in
+    match fat12_find t fs name11 with
+    | None -> None
+    | Some e -> Some (fat12_read t fs e)
 
-let boot_disk m =
-  match m.disk with
-  | None -> Error "no disk loaded"
-  | Some d -> (
-      match Dsk.read_sector d 0 with
-      | None -> Error "boot sector unreadable"
-      | Some b ->
-          (* Disk ROM 이 부트 섹터를 부르는 상태(MSX2 Technical Handbook
-             3장 7단계): 부트 섹터는 0xC000 에, RAM 은 페이지0(그래서
-             DTA 0x0100 에 쓴다), DISK BIOS 는 페이지1, 스택은 페이지3.
-             CY=1 로 0xC01E 를 호출한다 — 표준 섹터의 RET NC 는 캐리에
-             막혀 복귀하지 못하고 0xC01F 의 로더로 떨어진다. *)
-          m.ppi_a <- 0xFB;
-          m.slot3_sel <- m.slot3_sel lor 0x02;
-          String.iteri (fun i c -> mem_write m (0xC000 + i) (Char.code c)) b;
-          Z80.set_sp m.cpu 0xF51F;
-          Z80.set_af m.cpu 0x0001;
-          Z80.set_pc m.cpu 0xC01E;
-          Ok ())
+let load_disk t dsk =
+  t.disk <- Bytes.of_string dsk;
+  Hashtbl.reset t.bdos_files;
+  t.disk_dma <- 0x0080;
+  (* The interface ROM occupies the cartridge slot; loading it the cart way puts
+     it in slot 2 page 1 with page 1 selected, so C-BIOS finds the "AB" header
+     and calls INIT -- the proven path a game cart takes. *)
+  load_cartridge ~mapper:Flat t (disk_rom_bytes ())
 
-let disk_trap_counts () = disk_trap_counts_arr
 let bdos_counts () = bdos_call_counts
+
+(* Serviced in the step loop before the opcode at [pc] runs. Returns true when
+   [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
+let disk_trap t pc =
+  if Bytes.length t.disk = 0 then false
+  else if pc = disk_init_entry then begin
+    if !disk_call_log then
+      disk_calls := (pc, Z80.dump_a t.cpu, Z80.dump_bc t.cpu, Z80.dump_de t.cpu,
+                     Z80.dump_hl t.cpu, Z80.dump_f t.cpu) :: !disk_calls;
+    (* INIT: read the boot sector to 0xC000 and enter it at +0x1e with carry
+       clear -- the boot code's first byte is RET NC, a check that the read
+       succeeded. *)
+    disk_transfer t ~write:false ~sector:0 ~count:1 ~addr:disk_boot_addr;
+    (* A real disk ROM's boot procedure enables RAM in the low pages before it
+       loads the DOS kernel. Do the same: pages 0 and 2 to slot 3 (the RAM
+       mapper), with the sub-slot on the RAM bank. Page 0 holds the kernel at
+       0x0100; page 2 holds its stack (the kernel sets SP=0x9000). Page 1 stays
+       the disk ROM -- the kernel calls INIENV/DSKIO there -- and page 3 keeps
+       the boot sector + system area. Without RAM in page 2 the stack lands on
+       the logo ROM and CALL/RET reads back garbage. *)
+    t.ppi_a <- (t.ppi_a land 0xcc) lor 0x33;
+    t.slot3_sel <- (t.slot3_sel land 0xfc) lor 0x02;
+    (* Enter the boot sector at +0x1e with carry SET: its first byte is RET NC,
+       which the disk ROM uses to bail when the sector is not bootable. Carry
+       set means "boot this", so the code runs instead of returning. *)
+    Z80.set_af t.cpu ((0x00 lsl 8) lor 0x01) (* A=0 (drive 0), carry set *);
+    Z80.set_pc t.cpu (disk_boot_addr + 0x1e);
+    true
+  end
+  else if pc = disk_inienv_entry then begin
+    (* INIENV, observation stub: just return. Measures how far the kernel
+       gets before it needs what a real INIENV installs. *)
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in
+    Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+    Z80.set_pc t.cpu ret;
+    true
+  end
+  else if pc = disk_dskio_entry then begin
+    (* DSKIO: A=drive, B=sectors, C=media, DE=first sector, HL=addr, carry=write
+       on entry. Success returns carry clear, B=0 remaining; then RET. *)
+    let a = Z80.dump_a t.cpu in
+    let f = Z80.dump_f t.cpu in
+    let write = f land 0x01 <> 0 in
+    let count = (Z80.dump_bc t.cpu lsr 8) land 0xff in
+    let sector = Z80.dump_de t.cpu in
+    let addr = Z80.dump_hl t.cpu in
+    if !disk_call_log then
+      disk_calls := (pc, a, Z80.dump_bc t.cpu, sector, addr, f) :: !disk_calls;
+    disk_transfer t ~write ~sector ~count ~addr;
+    Z80.set_af t.cpu ((a lsl 8) lor (f land 0xfe)) (* carry clear = success *);
+    Z80.set_bc t.cpu (Z80.dump_bc t.cpu land 0x00ff) (* B=0 remaining *);
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in
+    Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+    Z80.set_pc t.cpu ret;
+    true
+  end
+  else if pc = disk_bdos_entry then begin
+    (* MSX DISK-BASIC system call (C = function). The file-load path the boot
+       uses is served against the FAT12 image; per-file state lives in
+       [bdos_files] keyed by the FCB address. A=0 success, A=0xFF failure --
+       the boot does INC A / JR Z, so 0 continues and 0xFF branches to its
+       error path. _RDBLK reads from the FCB's random-record field and
+       advances it, the way a real MSX-DOS leaves it for the next call --
+       Sangokushi II's loader issues 27 back-to-back _RDBLK calls this way. *)
+    let c = Z80.dump_bc t.cpu land 0xff in
+    let de = Z80.dump_de t.cpu in
+    let fcb i = mem_read t ((de + i) land 0xffff) in
+    bdos_call_counts.(c) <- bdos_call_counts.(c) + 1;
+    if !disk_call_log then
+      disk_calls := (pc, c, Z80.dump_bc t.cpu, de, Z80.dump_hl t.cpu, Z80.dump_f t.cpu)
+                    :: !disk_calls;
+    let a =
+      match c with
+      | 0x06 ->
+        (* _DIRIO: console in/out. No console -- an input poll (E=0xFF) gets
+           "no character ready" (A=0), output is consumed. *)
+        0x00
+      | 0x09 ->
+        (* _STROUT: print a '$'-terminated string -- consumed, no console. *)
+        0x00
+      | 0x0f -> (
+        let name = String.init 11 (fun i -> Char.chr (fcb (1 + i))) in
+        match fat12_open t name with
+        | Some data ->
+          if !disk_call_log then
+            Printf.eprintf "BDOS open '%s' -> %d bytes\n%!" name (Bytes.length data);
+          Hashtbl.replace t.bdos_files de (data, 0);
+          let sz = Bytes.length data in
+          mem_write t ((de + 0x10) land 0xffff) (sz land 0xff);
+          mem_write t ((de + 0x11) land 0xffff) ((sz lsr 8) land 0xff);
+          mem_write t ((de + 0x12) land 0xffff) ((sz lsr 16) land 0xff);
+          mem_write t ((de + 0x13) land 0xffff) ((sz lsr 24) land 0xff);
+          0x00
+        | None ->
+          if !disk_call_log then Printf.eprintf "BDOS open '%s' -> NOT FOUND\n%!" name;
+          0xff)
+      | 0x10 ->
+        (* _CLOSE: drop the server-side file state. *)
+        Hashtbl.remove t.bdos_files de;
+        0x00
+      | 0x14 -> (
+        (* _RDSEQ: one record (FCB+0x0E, default 128) from the sequential
+           position to the DMA address. A=1 on end-of-file, the CP/M code. *)
+        match Hashtbl.find_opt t.bdos_files de with
+        | None -> 0xff
+        | Some (data, pos) ->
+          let rec_size =
+            let r = fcb 0x0e lor (fcb 0x0f lsl 8) in
+            if r = 0 then 128 else r
+          in
+          let take = min rec_size (Bytes.length data - pos) in
+          if take <= 0 then 1
+          else begin
+            for i = 0 to take - 1 do
+              mem_write t ((t.disk_dma + i) land 0xffff)
+                (Char.code (Bytes.get data (pos + i)))
+            done;
+            Hashtbl.replace t.bdos_files de (data, pos + take);
+            0x00
+          end)
+      | 0x1a ->
+        t.disk_dma <- de;
+        0x00
+      | 0x0d ->
+        (* Disk reset: default drive A, DMA back to 0x0080. *)
+        t.disk_dma <- 0x0080;
+        0x00
+      | 0x19 ->
+        (* Default drive: A. *)
+        0x00
+      | 0x1b when Bytes.length t.disk > 0 ->
+        (* Disk information (MSX-DOS specific). A=sectors/cluster, BC=sector
+           size, DE=clusters+1, IX=DPB address, IY=FAT in memory. The FAT copy
+           and DPB live above the boot sector image: FAT @ 0xC800 (one FAT),
+           DPB right after it -- what a real disk ROM installs for the boot
+           loader to parse. *)
+        let fs = fat12_of t in
+        let fat_bytes = fs.sec_per_fat * fs.bytes_per_sec in
+        let fat_addr = 0xc800 in
+        let dpb = fat_addr + fat_bytes in
+        let w off v =
+          mem_write t (dpb + off) (v land 0xff);
+          mem_write t (dpb + off + 1) ((v lsr 8) land 0xff)
+        in
+        for i = 0 to fat_bytes - 1 do
+          mem_write t (fat_addr + i)
+            (dsk_u8 t ((fs.fat_start_sec * fs.bytes_per_sec) + i))
+        done;
+        let clusters = (dsk_u16 t 0x13 - fs.data_start_sec) / fs.sec_per_clus in
+        mem_write t dpb 0; (* drive A *)
+        mem_write t (dpb + 1) (dsk_u8 t 0x15); (* media ID *)
+        w 2 fs.bytes_per_sec;
+        mem_write t (dpb + 4) ((fs.bytes_per_sec / 32) - 1); (* dir mask *)
+        mem_write t (dpb + 5) (ilog2 (fs.bytes_per_sec / 32));
+        mem_write t (dpb + 6) (fs.sec_per_clus - 1); (* cluster mask *)
+        mem_write t (dpb + 7) (ilog2 fs.sec_per_clus);
+        w 8 fs.fat_start_sec; (* top sector of FAT *)
+        mem_write t (dpb + 10) (dsk_u8 t 0x10); (* number of FATs *)
+        mem_write t (dpb + 11) fs.root_entries;
+        w 12 fs.data_start_sec; (* top sector of data area *)
+        w 14 (clusters + 1);
+        mem_write t (dpb + 16) fs.sec_per_fat;
+        w 17 fs.root_start_sec;
+        w 19 fat_addr; (* FAT address in memory *)
+        Z80.set_bc t.cpu fs.bytes_per_sec;
+        Z80.set_de t.cpu (clusters + 1);
+        Z80.set_ix t.cpu dpb;
+        Z80.set_iy t.cpu fat_addr;
+        fs.sec_per_clus
+      | 0x2f when Bytes.length t.disk > 0 ->
+        (* Absolute logical-sector read: DE=first sector, H=count, L=drive.
+           The .dsk is a raw image, so a logical sector IS a file sector. *)
+        let sector = Z80.dump_de t.cpu in
+        let count = (Z80.dump_hl t.cpu lsr 8) land 0xff in
+        disk_transfer t ~write:false ~sector ~count ~addr:t.disk_dma;
+        0x00
+      | 0x27 -> (
+        match Hashtbl.find_opt t.bdos_files de with
+        | None -> 0xff
+        | Some (data, pos) ->
+          let rec_size =
+            let r = fcb 0x0e lor (fcb 0x0f lsl 8) in
+            if r = 0 then 128 else r
+          in
+          let rand_rec =
+            fcb 0x21 lor (fcb 0x22 lsl 8) lor (fcb 0x23 lsl 16) lor (fcb 0x24 lsl 24)
+          in
+          let count = Z80.dump_hl t.cpu in
+          (* 랜덤 레코드 0 은 "서버의 순차 위치" — 호출부가 새 FCB 없이 이어
+             부르는 경우 실기처럼 이어진다. *)
+          let start = if rand_rec = 0 then pos else rand_rec * rec_size in
+          let want = count * rec_size in
+          let avail = max 0 (Bytes.length data - start) in
+          let n = min want avail in
+          for i = 0 to n - 1 do
+            mem_write t ((t.disk_dma + i) land 0xffff) (Char.code (Bytes.get data (start + i)))
+          done;
+          let next_rec = (start / rec_size) + (n / rec_size) in
+          mem_write t ((de + 0x21) land 0xffff) (next_rec land 0xff);
+          mem_write t ((de + 0x22) land 0xffff) ((next_rec lsr 8) land 0xff);
+          mem_write t ((de + 0x23) land 0xffff) ((next_rec lsr 16) land 0xff);
+          Hashtbl.replace t.bdos_files de (data, start + n);
+          Z80.set_hl t.cpu (n / rec_size);
+          if n < want then 0x01 else 0x00)
+      | _ -> 0xff
+    in
+    Z80.set_af t.cpu ((a lsl 8) lor (Z80.dump_f t.cpu land 0xff));
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in
+    Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+    Z80.set_pc t.cpu ret;
+    true
+  end
+  else false
 
 let set_key t k ~pressed =
   match key_target k with
@@ -814,7 +860,9 @@ let step t ~frames =
         ldirvm_calls :=
           (Z80.dump_hl t.cpu, Z80.dump_de t.cpu, Z80.dump_bc t.cpu)
           :: !ldirvm_calls;
-      let used = Z80.step t.cpu in
+      (* A disk BIOS entry is served in OCaml (HLE), not by fetching the ROM's
+         opcode there; the trap moves PC on, so charge a nominal call's cycles. *)
+      let used = if disk_trap t pc then 18 else Z80.step t.cpu in
       incr instr_count;
       ignore (Vdp.advance t.vdp ~cycles:used);
       budget := !budget - used
@@ -911,9 +959,7 @@ let debug_dump t =
   Printf.eprintf "ppi_a=%02x slot3=%02x vram_nz=%d regs=%s\nblocks=%s\n%!"
     t.ppi_a t.slot3_sel !nz
     (String.concat " "
-       (List.init 14 (fun i -> Printf.sprintf "R%d=%02x" i (Vdp.regs v).(i)))
-       ^ Printf.sprintf " R9=%02x R23=%02x R25=%02x R26=%02x" (Vdp.regs v).(9)
-         (Vdp.regs v).(23) (Vdp.regs v).(25) (Vdp.regs v).(26))
+       (List.init 8 (fun i -> Printf.sprintf "R%d=%02x" i (Vdp.regs v).(i))))
     blocks
 
 let frame_dims _ = (256, 192)

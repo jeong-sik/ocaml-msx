@@ -8,7 +8,7 @@ let out_prefix = ref "/tmp/msxboot"
 let vlog = ref false
 let watch_mem = ref ""
 let cart = ref ""
-let disk_path = ref ""
+let disk = ref ""
 let cart_mapper = ref ""
 let tap_space : int list ref = ref []
 let assert_boot = ref false
@@ -39,13 +39,11 @@ let read_file p =
   s
 
 let () =
-  Printf.eprintf "BOOT-START
-%!";
   Arg.parse
     [ ("--vlog", Arg.Set vlog, "  VDP 포트 쓰기 로그");
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
-      ("--disk", Arg.Set_string disk_path, "PATH  .dsk 플로피 — 부트 섹터로 IPL");
+      ("--disk", Arg.Set_string disk, "PATH  플로피 이미지(.dsk) — 드라이브 A.");
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
         "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
@@ -64,31 +62,31 @@ let () =
       (fun f -> read_file (Filename.concat !rom_dir f))
       [ "cbios_main_msx2.rom"; "cbios_logo_msx2.rom"; "cbios_sub.rom" ]
   in
-  Printf.eprintf "ROMS-OK
-%!";
   let t =
     Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms }
   in
-  Printf.eprintf "CREATE-OK
-%!";
-  (if !cart <> "" then begin
+  (* [begin..end] bounds the then-branch: without it the [let mapper = .. in]
+     swallows every following statement (run loop, prints), so a no-cart boot
+     (BIOS only or disk) ran nothing and exited silently. *)
+  if !cart <> "" then begin
     let mapper = match !cart_mapper with
       | "plain" -> Some Msx.Flat
       | "ascii8" -> Some Msx.Ascii8
       | "ascii16" -> Some Msx.Ascii16
       | "konami" -> Some Msx.Konami
       | "konami-scc" -> Some Msx.Konami_scc
+      | "koei" -> Some Msx.Ascii8_sram
       | "" -> None
       | other -> Printf.ksprintf failwith "unknown --cart-mapper %s" other
     in
     Msx.load_cartridge ?mapper t (read_file !cart)
-  end);
-  Printf.eprintf "M1
-%!";
+  end;
+  if !disk <> "" then begin
+    Msx.load_disk t (read_file !disk);
+    Msx.set_disk_call_log true
+  end;
   Msx.set_ldirvm_log true;
   Msx.set_pc_hist true;
-  Printf.eprintf "M2
-%!";
   if !watch_mem <> "" then
     Msx.set_watch_mem
       (List.map (fun s -> int_of_string ("0x" ^ s)) (String.split_on_char ',' !watch_mem));
@@ -110,8 +108,6 @@ let () =
    let c = String.index v (char_of_int 58) in let n = int_of_string (String.sub v (c + 1) (String.length v - c - 1)) in
    Msx.set_trace_from (int_of_string ("0x" ^ String.sub v 0 4)) n
  with Not_found -> ());
-  Printf.eprintf "M3
-%!";
   let () = ignore (Msx.ldirvm_log_calls ()) in
   (* 마지막 30개 고유 PC 구간을 남긴다 — 루프 구조 확인용. *)
   let ring = Array.make 64 0 in
@@ -180,24 +176,7 @@ let () =
     Printf.printf "assert boot ok: logo=%d final=%d\n" nb_logo nb_final;
     exit 0
   end;
-  (* 실기의 디스크 부트는 메인 BIOS 초기화가 끝난 뒤 온다. C-BIOS 는 부트
-     중 인터슬롯 프리미티브(F380 RDPRIM/WRPRIM/CLPRIM)를 RAM 에 심는데
-     (main.asm "Transmit RDPRIM to RAM"), 디스크 환경의 인터슬롯 호출이 그
-     위에서 돈다. C-BIOS 를 정주행시켜 초기화를 끝내게 한 뒤 Disk ROM 의
-     2차 호출(0xC01E CY=1)로 넘어간다. *)
-  (if !disk_path <> "" then begin
-     let warmup = min !frames 720 in
-     run_frame warmup;
-     Msx.load_disk t (read_file !disk_path);
-     match Msx.boot_disk t with
-     | Ok () -> ()
-     | Error m -> Printf.ksprintf failwith "disk boot: %s" m
-   end);
-  Printf.eprintf "PRE-RUN
-%!";
   run_frame !frames;
-  Printf.eprintf "POST-RUN
-%!";
   Printf.printf "last pcs:";
   for i = !ridx - 16 to !ridx - 1 do
     Printf.printf " %04x" ring.(i land 63)
@@ -214,6 +193,19 @@ let () =
     rgb;
   Printf.printf "frames=%d pc=%04x nonblack=%d mode=%s\n%!" !frames (Msx.dump_pc t) !nonblack
     (Msx.display_mode_to_string (Msx.display_mode t));
+  if !disk <> "" then begin
+    let calls = Msx.disk_call_entries () in
+    Printf.printf "disk calls=%d\n" (List.length calls);
+    List.iteri
+      (fun i (pc, a, bc, de, hl, f) ->
+        if i < 20 then
+          Printf.printf "  disk @%04x a=%02x bc=%04x de(sec)=%04x hl(addr)=%04x f=%02x\n"
+            pc a bc de hl f)
+      calls;
+    Array.iteri
+      (fun i n -> if n > 0 then Printf.printf "bdos %02x: %d\n" i n)
+      (Msx.bdos_counts ())
+  end;
   Msx.debug_dump t;
   (* SCREEN7 판정 보조: 64K 페이지별로 256바이트 줄(한 표시 줄)의 non-zero
      바이트 수. 한 줄 걸러 비면 인터레이스, 반대 페이지에 있으면 베이스
@@ -232,6 +224,31 @@ let () =
          if y mod 32 = 31 then Printf.eprintf "\n%!"
        done;
        Printf.eprintf "\n%!"
+     done
+   with Not_found -> ());
+  (* SCREEN7 진단: 페이지마다 렌더러와 같은 패킹(2px/바이트, 256B/줄)으로
+     전폭 512×212 덤프 — R#2 가 고른 페이지와 그림이 실제로 있는 페이지가
+     갈리는지, 다운샘플이 무늬를 부수는지 본다 (삼국지2 moire 실측). *)
+  (try
+     let n = int_of_string (Sys.getenv "G6_PAGES") in
+     let pal = Msx.palette_entries t in
+     for p = 0 to n - 1 do
+       let base = p * 0x10000 in
+       let img = Bytes.make (512 * 212 * 3) '\000' in
+       for y = 0 to 211 do
+         for x = 0 to 511 do
+           let b = Msx.vram_read t (base + (y * 256) + (x lsr 1)) in
+           let nib = if x land 1 = 0 then b lsr 4 else b land 15 in
+           let r, g, bl = pal.(nib) in
+           let i = (y * 512 + x) * 3 in
+           Bytes.set img i (Char.chr r);
+           Bytes.set img (i + 1) (Char.chr g);
+           Bytes.set img (i + 2) (Char.chr bl)
+         done
+       done;
+       let oc = open_out_bin (Printf.sprintf "%s.g6p%d.ppm" !out_prefix p) in
+       Printf.fprintf oc "P6\n512 212\n255\n%s" (Bytes.to_string img);
+       close_out oc
      done
    with Not_found -> ());
   let (active, n, ny, anx, dy) = Msx.tx_state t in
@@ -271,37 +288,4 @@ let () =
   let oc = open_out_bin (!out_prefix ^ ".ppm") in
   Printf.fprintf oc "P6\n256 192\n255\n%s" rgb;
   close_out oc;
-  (* SCREEN7 진단: 64K 페이지마다 같은 패킹(2px/바이트, 256B/줄)으로 덤프.
-     R#2 가 고른 페이지와 그림이 실제로 있는 페이지가 갈리는지 본다. *)
-  (try
-     let n = int_of_string (Sys.getenv "G6_PAGES") in
-     let pal = Msx.palette_entries t in
-     for p = 0 to n - 1 do
-       let base = p * 0x10000 in
-       (* 전폭 512×212 — 다운샘플 없이 VRAM 내용 그대로. *)
-       let img = Bytes.make (512 * 212 * 3) '\000' in
-       for y = 0 to 211 do
-         for x = 0 to 511 do
-           let b = Msx.vram_read t (base + (y * 256) + (x lsr 1)) in
-           let nib = if x land 1 = 0 then b lsr 4 else b land 15 in
-           let r, g, bl = pal.(nib) in
-           let i = (y * 512 + x) * 3 in
-           Bytes.set img i (Char.chr r);
-           Bytes.set img (i + 1) (Char.chr g);
-           Bytes.set img (i + 2) (Char.chr bl)
-         done
-       done;
-       let oc = open_out_bin (Printf.sprintf "%s.g6p%d.ppm" !out_prefix p) in
-       Printf.fprintf oc "P6\n512 212\n255\n%s" (Bytes.to_string img);
-       close_out oc
-     done
-   with Not_found -> ());
-  Array.iteri (fun i n -> Printf.printf "trap %d: %d\n" i n) (Msx.disk_trap_counts ());
-  Array.iteri (fun i n -> if n > 0 then Printf.printf "bdos %02x: %d\n" i n) (Msx.bdos_counts ());
-  let calls = Msx.fdc_recent_calls () in
-  Printf.printf "fdc touches: %d\n" (Array.length calls);
-  Array.iter
-    (fun (k, port, v) ->
-      Printf.printf "fdc %s %02x <- %02x\n" (if k = 0 then "R" else "W") port v)
-    (Array.sub calls (max 0 (Array.length calls - 24)) (min 24 (Array.length calls)));
   Printf.printf "wrote %s.ppm\n" !out_prefix

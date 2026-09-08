@@ -33,39 +33,13 @@ type t
 (** MegaROM cartridge mapper. [Flat] is a plain 16/32KB cart; the others bank
     8KB/16KB windows the way the named hardware does (openMSX RomKonami /
     RomKonamiSCC / RomAscii8 / RomAscii16). SCC sound is not modelled. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16
+type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
 
 val create : machine:machine -> t
 
 val name : t -> string
 
 val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
-
-(** Per-entry DISK BIOS trap counts, for boot diagnosis: entry 0 is DSKIO,
-    1 DSKCHG, 2 GETDPB, 3 CHOICE, 4 DSKFMT, 5 the rest of the range. A
-    loader stuck with all zeros reads the FDC hardware itself. *)
-val disk_trap_counts : unit -> int array
-
-(** The last port touches on 0xD0-0xD4 as (kind, port, value) -- kind 0 is a
-    read, 1 a write -- newest last, for matching a loader's FDC pattern. *)
-val fdc_recent_calls : unit -> (int * int * int) array
-
-val load_disk : t -> string -> unit
-(** Attach a raw .dsk floppy image and arm the DISK BIOS entry trap: the
-    DSKIO/DSKCHG/GETDPB entries in slot 1 page 1 are served from the image
-    instead of executing ROM code, and 0xF37D serves as a minimal BDOS
-    (_OPEN/_SETDTA/_RDSEQ/_RDBLK) reading files through the FAT12 layer. *)
-
-val bdos_counts : unit -> int array
-(** Per-function BDOS call counts indexed by function number, for boot
-    diagnosis alongside {!disk_trap_counts}. *)
-
-val boot_disk : t -> (unit, string) result
-(** Play the Disk ROM's second-stage call (MSX2 Technical Handbook ch.3 step
-    7): boot sector to 0xC000, RAM in page 0, and a call to 0xC01E with carry
-    set so its [RET NC] falls through into the sector's loader code. Needs a
-    disk attached first. *)
-
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
     ({!guess_mapper}); pass it to override a wrong guess. The bank registers
     reset linear so the ROM boots from segment 0. *)
@@ -88,6 +62,23 @@ val mem_read : t -> int -> int
 val mem_write : t -> int -> int -> unit
 (** Write a byte at a 16-bit address as the Z80 would — into RAM, or as a bank
     select in a MegaROM's cart window. For tests and debugging. *)
+
+val load_disk : t -> string -> unit
+(** Plug a floppy image (raw .dsk, 512 bytes a sector) into drive A. A disk
+    interface ROM rides in the cartridge slot; C-BIOS finds its "AB" header and
+    calls INIT, whose BIOS entries are HLE traps the step loop services against
+    the image. *)
+
+val set_disk_call_log : bool -> unit
+(** Record each disk BIOS entry the running code reaches — for learning the
+    convention a given .dsk expects. Off by default. *)
+
+val disk_call_entries : unit -> (int * int * int * int * int * int) list
+(** [(pc, a, bc, de, hl, f)] per disk BIOS entry, in order. *)
+
+val bdos_counts : unit -> int array
+(** Per-function BDOS call counts indexed by function number — which
+    functions a loader actually exercises. For boot diagnosis. *)
 
 val set_key : t -> key -> pressed:bool -> bool
 (** 논리 키를 누르거나 뗀다. 키보드 매트릭스 키와 조이스틱 1 버튼
