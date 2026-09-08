@@ -201,6 +201,10 @@ let test_bdos () =
     (error = 1 && returned = 0 && Msx.mem_read t 0xc221 = 3);
   Msx.mem_write t 0xc224 0x7f;
   check "ignored high byte is preserved" (Msx.mem_read t 0xc224 = 0x7f);
+  Msx.mem_write t 0xc20e 0; Msx.mem_write t 0xc20f 0; record t 0;
+  check "uninitialized FCB retains default 128-byte records" (success t 0x27 0xc200 1 = 1);
+  check "default record copies the expected bytes"
+    (String.init 128 (fun i -> Char.chr (Msx.mem_read t (0xc800 + i))) = String.sub first 0 128);
   let before_extent_create = Msx.disk_image t in
   Msx.mem_write t 0xc20c 1;
   ignore (success t 0x16 0xc200 0);

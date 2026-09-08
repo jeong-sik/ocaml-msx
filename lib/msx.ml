@@ -966,7 +966,8 @@ let disk_trap t pc =
         match Hashtbl.find_opt t.bdos_files de with
         | None -> 0xff
         | Some (data, _) ->
-          let size = fcb 0x0e lor (fcb 0x0f lsl 8) in
+          let configured_size = fcb 0x0e lor (fcb 0x0f lsl 8) in
+          let size = if configured_size = 0 then 128 else configured_size in
           let record = fcb 0x21 lor (fcb 0x22 lsl 8) lor (fcb 0x23 lsl 16)
             lor (if size < 64 then fcb 0x24 lsl 24 else 0) in
           let count = Z80.dump_hl t.cpu in
