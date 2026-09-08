@@ -14,6 +14,7 @@ let cart = ref ""
 let disk = ref ""
 let restore_state = ref ""
 let save_state = ref ""
+let change_disk = ref ""
 let ledger = ref ""
 let out_dir = ref "/tmp/msx-replay"
 let every = ref 5
@@ -102,6 +103,7 @@ let () =
     [ ("--roms", Arg.Set_string roms_dir, "DIR  C-BIOS roms directory");
       ("--cart", Arg.Set_string cart, "PATH  cartridge ROM the ledger was recorded on");
       ("--disk", Arg.Set_string disk, "PATH  disk image to warm-boot");
+      ("--change-disk", Arg.Set_string change_disk, "PATH  replace disk in restored machine without rebooting");
       ("--restore-state", Arg.Set_string restore_state, "FILE  resume a saved machine instead of booting");
       ("--save-state", Arg.Set_string save_state, "FILE  atomically save the final machine state");
       ("--ledger", Arg.Set_string ledger, "FILE  the .masc/msx/ledger.jsonl to replay");
@@ -115,6 +117,8 @@ let () =
   if (!restore_state <> "" && (!cart <> "" || !disk <> "" || !roms_dir <> ""))
      || (!cart <> "" && !disk <> "") then
     (prerr_endline "replay: choose cartridge, disk, or saved state"; exit 2);
+  if !change_disk <> "" && !restore_state = "" then
+    (prerr_endline "replay: --change-disk requires --restore-state"; exit 2);
   let roms =
     if !roms_dir = "" then [ ""; ""; "" ]
     else
@@ -141,6 +145,10 @@ let () =
       t
     end
   in
+  if !change_disk <> "" then begin
+    match Msx.change_disk t (read_file !change_disk) with
+    | Ok () -> () | Error message -> prerr_endline message; exit 2
+  end;
   (try Unix.mkdir !out_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   let initial_frame = Msx.frame_number t in
   let entries = parse_ledger !ledger in

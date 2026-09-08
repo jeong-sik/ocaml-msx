@@ -70,6 +70,16 @@ val load_disk : ?interface_rom:bool -> t -> string -> unit
     services against the image. [~interface_rom:false] leaves the slot empty
     for the warm-up replay ({!boot_disk}). *)
 
+val disk_image : t -> string option
+(** Copy of the current floppy bytes, including guest writes, for multi-disk
+    session retention. None when no disk is mounted. *)
+
+val change_disk : t -> string -> (unit, string) result
+(** Replace the mounted floppy without rebooting or changing CPU, RAM, VDP,
+    keyboard, frame count or DMA address. Invalid images preserve the machine.
+    Cached open files are invalidated: callers must reopen against new media.
+    Persist {!serialize} first to retain outgoing disk writes. *)
+
 val boot_disk : t -> (unit, string) result
 (** Replay the Disk ROM's second-stage call onto a machine whose C-BIOS boot
     has already run: boot sector to 0xC000, RAM in page 0, CALL 0xC01E with
@@ -77,12 +87,6 @@ val boot_disk : t -> (unit, string) result
     frames of C-BIOS stepped before it, so the inter-slot primitives sit in
     RAM. This is the path a game's loader runs to its title on; the
     cart-INIT path reboots mid-boot (see the implementation note). *)
-
-val change_disk : t -> string -> (unit, string) result
-(** Swap the floppy while the machine keeps running: image bytes and the BDOS
-    server state reset, nothing else moves. A multi-disk game waiting on
-    "insert disk 2" unblocks here without a reboot. Errors when no disk is
-    loaded ({!load_disk} first). *)
 
 val set_disk_call_log : bool -> unit
 (** Record each disk BIOS entry the running code reaches — for learning the

@@ -597,17 +597,18 @@ let load_disk ?(interface_rom = true) t dsk =
      (observed), so the replay path wants a plain BIOS boot first. *)
   if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ())
 
-(* Swap the floppy while the machine keeps running: the image bytes and the
-   BDOS server state (open files, DMA) reset — a different disk names
-   different files — and nothing else moves. The running game notices the way
-   real software does: its next read sees the new image. A multi-disk game
-   waiting on "insert disk 2" unblocks here without a reboot. *)
-let change_disk t dsk =
-  if Bytes.length t.disk = 0 then Error "no disk loaded"
+let disk_image t =
+  if Bytes.length t.disk = 0 then None else Some (Bytes.to_string t.disk)
+
+let change_disk t image =
+  let size = String.length image in
+  if Bytes.length t.disk = 0 then Error "no disk drive is loaded"
+  else if size = 0 || size mod disk_sector_bytes <> 0 then
+    Error "disk image must contain complete 512-byte sectors"
   else begin
-    t.disk <- Bytes.of_string dsk;
+    let disk = Bytes.of_string image in
+    t.disk <- disk;
     Hashtbl.reset t.bdos_files;
-    t.disk_dma <- 0x0080;
     Ok ()
   end
 
