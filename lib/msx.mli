@@ -63,11 +63,20 @@ val mem_write : t -> int -> int -> unit
 (** Write a byte at a 16-bit address as the Z80 would — into RAM, or as a bank
     select in a MegaROM's cart window. For tests and debugging. *)
 
-val load_disk : t -> string -> unit
-(** Plug a floppy image (raw .dsk, 512 bytes a sector) into drive A. A disk
-    interface ROM rides in the cartridge slot; C-BIOS finds its "AB" header and
-    calls INIT, whose BIOS entries are HLE traps the step loop services against
-    the image. *)
+val load_disk : ?interface_rom:bool -> t -> string -> unit
+(** Plug a floppy image (raw .dsk, 512 bytes a sector) into drive A. By
+    default a disk interface ROM rides in the cartridge slot: C-BIOS finds its
+    "AB" header and calls INIT, whose BIOS entries are HLE traps the step loop
+    services against the image. [~interface_rom:false] leaves the slot empty
+    for the warm-up replay ({!boot_disk}). *)
+
+val boot_disk : t -> (unit, string) result
+(** Replay the Disk ROM's second-stage call onto a machine whose C-BIOS boot
+    has already run: boot sector to 0xC000, RAM in page 0, CALL 0xC01E with
+    carry set. Needs {!load_disk ~interface_rom:false} first and ~720 frames
+    of C-BIOS stepped before it, so the inter-slot primitives sit in RAM.
+    This is the path a game's loader runs to its title on; the cart-INIT path
+    reboots mid-boot (see the implementation note). *)
 
 val set_disk_call_log : bool -> unit
 (** Record each disk BIOS entry the running code reaches — for learning the

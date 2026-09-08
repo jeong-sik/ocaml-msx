@@ -6,6 +6,9 @@
 
 let cycles_per_frame = 262 * 228
 
+(* RAM 매퍼 포트(0xFC-0xFF) 쓰기 — 세그먼트 스왑 관찰용. 페이지별 쓰기 수. *)
+let mapper_writes : int array = Array.make 4 0
+
 type key =
   | Up | Down | Left | Right | Space | Trigger_a | Trigger_b
   | Esc | Return | Function of int | Char of char
@@ -97,6 +100,10 @@ type t = {
   mutable con_esc : int;
       (** VT52 escape-sequence state for the BDOS console: 0=plain, 1=after
           ESC, 2=after "ESC Y" (row byte next), 3=column byte next. *)
+  mutable rst30_pending : (int * int) list;
+      (** RST 30h 인터슬롯의 복귀 대기: (복귀 PC, 저장한 ppi_a) 최근 것 먼저.
+          워밍업 재생 경로(page0 = RAM)에서 디스크 로더가 쓰는 벡터를
+          트램페린이 대신 서기 위한 상태. *)
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
@@ -335,7 +342,9 @@ let port_write m port v =
   | 0xAA -> m.ppi_c <- v land 0xff
   | 0xA0 -> m.psg_latch <- v land 0xff
   | 0xA1 -> if m.psg_latch < 16 then m.psg.(m.psg_latch) <- v land 0xff
-  | 0xFC | 0xFD | 0xFE | 0xFF -> m.mapper.(port land 3) <- v land 0x3f
+  | 0xFC | 0xFD | 0xFE | 0xFF ->
+    mapper_writes.(port land 3) <- mapper_writes.(port land 3) + 1;
+    m.mapper.(port land 3) <- v land 0x3f
   | 0xB4 -> rtc_reg := v
   | _ -> ()
 
@@ -380,6 +389,7 @@ let create ~machine =
       disk_dma = 0x0080;
       bdos_files = Hashtbl.create 4;
       con_esc = 0;
+      rst30_pending = [];
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
       ppi_a = 0x00;
@@ -439,6 +449,7 @@ let disk_init_entry = 0x4100 (* the "AB" INIT vector; C-BIOS CALLSLTs here *)
 let disk_dskio_entry = 0x4010 (* DSKIO; the standard disk BIOS jumptable offset *)
 let disk_inienv_entry = 0x4030 (* INIENV; the MSX-DOS kernel init calls this first *)
 let disk_bdos_entry = 0xf37d (* MSX DISK-BASIC system-call entry; C = function *)
+let disk_rst30_entry = 0x0030 (* inter-slot call vector the disk ROM plants *)
 let disk_boot_addr = 0xc000 (* boot sector lands here; entry at +0x1e *)
 
 (* Observation: every disk BIOS entry the boot code hits, so an offline run can
@@ -572,21 +583,132 @@ let fat12_open t name11 =
     | None -> None
     | Some e -> Some (fat12_read t fs e)
 
-let load_disk t dsk =
+let load_disk ?(interface_rom = true) t dsk =
   t.disk <- Bytes.of_string dsk;
   Hashtbl.reset t.bdos_files;
   t.disk_dma <- 0x0080;
   (* The interface ROM occupies the cartridge slot; loading it the cart way puts
      it in slot 2 page 1 with page 1 selected, so C-BIOS finds the "AB" header
-     and calls INIT -- the proven path a game cart takes. *)
-  load_cartridge ~mapper:Flat t (disk_rom_bytes ())
+     and calls INIT -- the proven path a game cart takes. [~interface_rom:false]
+     leaves the slot empty for the warm-up replay ({!boot_disk}): a C-BIOS boot
+     that finds the interface ROM re-enters the sector boot every boot cycle
+     (observed), so the replay path wants a plain BIOS boot first. *)
+  if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ())
+
+(* The warm-up replay of the Disk ROM's second-stage call (MSX2 Technical
+   Handbook ch.3 step 7), for harnesses and lanes: after the C-BIOS boot run
+   (720 frames plants the F380 inter-slot primitives in RAM), this puts the
+   machine where that call leaves it -- boot sector at 0xC000, RAM in page 0,
+   a call to 0xC01E with carry set so the sector's [RET NC] falls through
+   into its loader. The cart-INIT path this module also wires boots the same
+   sector, but a game's first stage then calls back into C-BIOS BIOS entries
+   that reboot the machine (observed: Sangokushi II restarts at f~330); this
+   replay is the path that reaches the title screen. *)
+let boot_disk t =
+  if Bytes.length t.disk = 0 then Error "no disk loaded"
+  else if Bytes.length t.disk < 512 then Error "boot sector unreadable"
+  else begin
+    disk_transfer t ~write:false ~sector:0 ~count:1 ~addr:0xc000;
+    t.ppi_a <- 0xfb;
+    t.slot3_sel <- t.slot3_sel lor 0x02;
+    t.rst30_pending <- [];
+    Z80.set_sp t.cpu 0xf51f;
+    Z80.set_af t.cpu ((0x00 lsl 8) lor 0x01);
+    Z80.set_pc t.cpu 0xc01e;
+    Ok ()
+  end
 
 let bdos_counts () = bdos_call_counts
+
+(* The standard disk BIOS jumptable entries at 0x4013+ (DSKCHG/GETDPB/CHOICE/
+   DSKFMT) and the loader-observed DSKIO convention at 0x4013 (A=drive,
+   C=sectors, DE=logical sector, HL=buffer — not the 0x4010 B-register one):
+   a Sangokushi II boot sector calls these on its side of the interface ROM.
+   Success drops carry, failure sets carry and a code in A. *)
+let serve_disk_entry t pc =
+  let cpu = t.cpu in
+  let ret =
+    let sp = Z80.dump_sp cpu in
+    let r = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in
+    Z80.set_sp cpu ((sp + 2) land 0xffff);
+    r
+  in
+  let af_ok a = Z80.set_af cpu ((a lsl 8) land 0xff00) in
+  (match pc with
+   | 0x4013 ->
+     let drive = Z80.dump_a cpu in
+     let count = Z80.dump_bc cpu land 0xff in
+     let start = Z80.dump_de cpu in
+     let buf = Z80.dump_hl cpu in
+     if drive <> 0 || Bytes.length t.disk = 0 then
+       Z80.set_af cpu ((0x0c lsl 8) lor 0x01)
+     else begin
+       disk_transfer t ~write:false ~sector:start ~count ~addr:buf;
+       (* 이미지 밖 섹터는 0으로 읽힌다 — 디스크 트랩 계약상 성공. *)
+       af_ok (Z80.dump_a cpu)
+     end
+   | 0x4016 ->
+     Z80.set_bc cpu (Z80.dump_bc cpu land 0xff00);
+     af_ok (Z80.dump_a cpu)
+   | 0x4019 ->
+     let hl = Z80.dump_hl cpu in
+     (* 표준 2DD(9섹터 2헤드) DPB. *)
+     String.iteri
+       (fun j c -> mem_write t ((hl + j) land 0xffff) (Char.code c))
+       "\xf9\x09\x02\x02\x02\x01\x01\x02\x70\x00\x0a\xf5\x03\xf9\x02\x00";
+     af_ok (Z80.dump_a cpu)
+   | 0x401c ->
+     Z80.set_bc cpu (Z80.dump_bc cpu land 0xff00);
+     af_ok (Z80.dump_a cpu)
+   | 0x401f ->
+     Z80.set_af cpu ((0x0d lsl 8) lor 0x01) (* write-protect *)
+   | _ -> ());
+  Z80.set_pc cpu ret
+
+let disk_entry_pc = function
+  | 0x4013 | 0x4016 | 0x4019 | 0x401c | 0x401f -> true
+  | _ -> false
+
+(* RST 30h 트램펄린 — 실기의 디스크 ROM 이 0x0030 에 깔아 두던 인터슬롯
+   핸들러 대역. RST 30h 가 push 한 반환주소는 서술자(slot 1 + 주소 2)를
+   가리킨다: 서술자를 읽고, 그 자리에 서술자 건너뛴 복귀 주소를 심은 뒤
+   대상 페이지의 슬롯 배선을 돌려 대상으로 건다. 대상의 RET 이 복귀 주소로
+   돌아오면 disk_trap 이 배선을 되돌린다. page0 이 RAM(워밍업 재생 경로)
+   일 때만 건다 — C-BIOS 부팅 중(page0 = main ROM)의 자기 RST 30h 사용은
+   ROM 코드가 직접 처리한다 (실측: 카트 INIT 호출). *)
+let serve_rst30 t =
+  let cpu = t.cpu in
+  let sp = Z80.dump_sp cpu in
+  let rd16 a = mem_read t a lor (mem_read t ((a + 1) land 0xffff) lsl 8) in
+  let wr16 a v =
+    mem_write t a (v land 0xff);
+    mem_write t ((a + 1) land 0xffff) (v lsr 8)
+  in
+  let desc = rd16 sp in
+  let slot = mem_read t desc in
+  let addr = rd16 ((desc + 1) land 0xffff) in
+  wr16 sp ((desc + 3) land 0xffff);
+  let page = addr lsr 14 in
+  let shift = page * 2 in
+  t.rst30_pending <- ((desc + 3) land 0xffff, t.ppi_a) :: t.rst30_pending;
+  t.ppi_a <-
+    (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
+  addr
 
 (* Serviced in the step loop before the opcode at [pc] runs. Returns true when
    [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
 let disk_trap t pc =
+  (match t.rst30_pending with
+   | (cont, saved) :: rest when pc = cont ->
+     (* 인터슬롯 대상이 복귀했다 — 슬롯 배선을 되돌리고 실행 계속. *)
+     t.rst30_pending <- rest;
+     t.ppi_a <- saved
+   | _ -> ());
   if Bytes.length t.disk = 0 then false
+  else if pc = disk_rst30_entry && t.ppi_a land 3 = 3 then begin
+    Z80.set_pc t.cpu (serve_rst30 t);
+    true
+  end
   else if pc = disk_init_entry then begin
     if !disk_call_log then
       disk_calls := (pc, Z80.dump_a t.cpu, Z80.dump_bc t.cpu, Z80.dump_de t.cpu,
@@ -797,6 +919,10 @@ let disk_trap t pc =
     Z80.set_pc t.cpu ret;
     true
   end
+  else if disk_entry_pc pc then begin
+    serve_disk_entry t pc;
+    true
+  end
   else false
 
 let set_key t k ~pressed =
@@ -956,8 +1082,13 @@ let debug_dump t =
          done;
          if !c > 0 then Printf.sprintf "%x:%d" (b * 0x400) !c else ""))
   in
-  Printf.eprintf "ppi_a=%02x slot3=%02x vram_nz=%d regs=%s\nblocks=%s\n%!"
-    t.ppi_a t.slot3_sel !nz
+  Printf.eprintf
+    "ppi_a=%02x slot3=%02x mapper=%d,%d,%d,%d (writes %d,%d,%d,%d)\n%!"
+    t.ppi_a t.slot3_sel
+    t.mapper.(0) t.mapper.(1) t.mapper.(2) t.mapper.(3)
+    mapper_writes.(0) mapper_writes.(1) mapper_writes.(2) mapper_writes.(3);
+  Printf.eprintf "vram_nz=%d regs=%s\nblocks=%s\n%!"
+    !nz
     (String.concat " "
        (List.init 8 (fun i -> Printf.sprintf "R%d=%02x" i (Vdp.regs v).(i))))
     blocks
