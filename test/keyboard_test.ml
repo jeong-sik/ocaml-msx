@@ -87,6 +87,22 @@ let () =
   ignore (Msx.set_key t (Function 4) ~pressed:false);
   ignore (Msx.set_key t Esc ~pressed:false);
   ignore (Msx.set_key t Return ~pressed:false);
+
+  (* 모디파이어: SHIFT 행 6 비트 0 · CTRL 비트 1 · GRAPH 비트 2. 단독으로는
+     매트릭스만 친다. SHIFT+글자 는 chord(동시 누름)로 만든다 — BIOS·게임이
+     행 6 과 글자 행을 함께 스캔한다. *)
+  ignore (Msx.set_key t Shift ~pressed:true);
+  check "Shift = row 6 bit 0" (row_read t 6 = 0xfe);
+  ignore (Msx.set_key t Ctrl ~pressed:true);
+  ignore (Msx.set_key t Graph ~pressed:true);
+  check "Shift+Ctrl+Graph = row 6 bits 0,1,2" (row_read t 6 = 0xf8);
+  ignore (Msx.set_key t Ctrl ~pressed:false);
+  ignore (Msx.set_key t Graph ~pressed:false);
+  ignore (Msx.set_key t (Char 'a') ~pressed:true);
+  check "Shift held + a = row 6 bit 0 and row 2 bit 6"
+    (row_read t 6 = 0xfe && row_read t 2 = 0xbf);
+  ignore (Msx.set_key t Shift ~pressed:false);
+  ignore (Msx.set_key t (Char 'a') ~pressed:false);
   all_rows_idle t "end of keyboard";
   check "Backspace maps" (Msx.set_key t Backspace ~pressed:true);
   check "Backspace = row 7 bit 5" (row_read t 7 = 0xdf);

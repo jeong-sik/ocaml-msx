@@ -25,6 +25,9 @@ let key_of_name = function
   | "esc" -> Msx.Esc
   | "trigger_a" -> Msx.Trigger_a
   | "trigger_b" -> Msx.Trigger_b
+  | "shift" -> Msx.Shift
+  | "ctrl" -> Msx.Ctrl
+  | "graph" -> Msx.Graph
   | s when String.length s = 2 && s.[0] = 'f' ->
     Msx.Function (Char.code s.[1] - Char.code '0')
   | s when String.length s = 1 -> Msx.Char s.[0]

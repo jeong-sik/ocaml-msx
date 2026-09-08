@@ -11,15 +11,17 @@ let mapper_writes : int array = Array.make 4 0
 
 type key =
   | Up | Down | Left | Right | Space | Trigger_a | Trigger_b
+  | Shift | Ctrl | Graph
   | Esc | Return | Function of int | Char of char | Backspace
 
 (* 논리 키가 닿는 자리. 키보드 매트릭스 (행 0-10, 비트 0-7) 의 정본은
    openMSX share/unicodemaps/unicodemap.int (국제 배열, <ROW><COL>).
-   글자는 대소문자를 같은 키로 본다 — SHIFT 는 매트릭스의 다른 키다.
-   조이스틱 1 은 PSG R#14 의 비트로 읽힌다: 방향 0-3(위·아래·왼·오),
-   트리거 4-5 (전부 active-low). 방향키는 커서(매트릭스 행 8)와 조이스틱
-   방향 비트를 함께 구동한다(Matrix_joy) — GTSTCK(0) 게임(커서 읽기)과
-   GTSTCK(1)·PSG 직독 게임(조이스틱 읽기)을 한 키로 커버한다. 표에 없는
+   글자는 대소문자를 같은 키로 본다 — SHIFT 는 매트릭스의 다른 키(행 6 비트 0)라
+   별도 키로 두고, SHIFT+글자 는 둘을 동시에 눌러 만든다. Shift/Ctrl/Graph 는
+   행 6 의 모디파이어(비트 0/1/2). 조이스틱 1 은 PSG R#14 의 비트로 읽힌다:
+   방향 0-3(위·아래·왼·오), 트리거 4-5 (전부 active-low). 방향키는 커서(매트릭스
+   행 8)와 조이스틱 방향 비트를 함께 구동한다(Matrix_joy) — GTSTCK(0) 게임(커서
+   읽기)과 GTSTCK(1)·PSG 직독 게임(조이스틱 읽기)을 한 키로 커버한다. 표에 없는
    글자와 F6 이상은 Unmapped. *)
 type key_target =
   | Matrix of int * int
@@ -38,6 +40,9 @@ let key_target = function
   | Esc -> Matrix (7, 2)
   | Return -> Matrix (7, 7)
   | Backspace -> Matrix (7, 5)
+  | Shift -> Matrix (6, 0)
+  | Ctrl -> Matrix (6, 1)
+  | Graph -> Matrix (6, 2)
   | Function 1 -> Matrix (6, 5)
   | Function 2 -> Matrix (6, 6)
   | Function 3 -> Matrix (6, 7)
