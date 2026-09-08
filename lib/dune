@@ -16,3 +16,8 @@
  (wrapped false)
  (modules msx)
  (libraries z80core vdpcore))
+
+(library
+ (name dsk)
+ (public_name ocaml-msx.dsk)
+ (modules dsk))
