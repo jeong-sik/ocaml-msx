@@ -32,6 +32,7 @@ type t = {
   mutable im : int;
   mutable halted : bool;
   mutable after_ei : bool;
+  mutable entry_trap : (int -> bool) option;
   mutable t : int;
   rb : int -> int;
   wb : int -> int -> unit;
@@ -51,6 +52,7 @@ let create ~read ~write ~port_in ~port_out =
     iff1 = false; iff2 = false; im = 0;
     halted = false;
     after_ei = false;
+    entry_trap = None;
     t = 0;
     rb = read;
     wb = write;
@@ -805,9 +807,27 @@ and main_exec z op p =
       add_t 11
     | _ -> add_t 4
 
+let set_entry_trap z h = z.entry_trap <- h
+
+(* 엔트리 트랩: fetch 전에 PC 를 본다. 핸들러가 true 를 돌려주면 호출을
+   이미 서비스한 것 — 명령을 실행하는 대신 스택의 반환주소를 팝해 PC 로
+   삼는다(RET 대행). 명령이 돌지 않으니 R 은 오르지 않는다. 24 T 는
+   CALL+RET의 대략. *)
+let entry_trap_step z =
+  match z.entry_trap with
+  | Some h when h z.pc ->
+      let lo = z.rb z.sp in
+      let hi = z.rb ((z.sp + 1) land 0xffff) in
+      z.sp <- (z.sp + 2) land 0xffff;
+      z.pc <- (lo lor (hi lsl 8)) land 0xffff;
+      z.t <- z.t + 24;
+      true
+  | _ -> false
+
 let step z =
   dt := 0;
   if z.halted then begin z.t <- z.t + 4; 4 end
+  else if entry_trap_step z then 24
   else begin
     z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
     let op = fetch z in

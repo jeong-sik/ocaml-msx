@@ -40,6 +40,15 @@ val create : machine:machine -> t
 val name : t -> string
 
 val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
+val load_disk : t -> string -> unit
+(** Attach a raw .dsk floppy image and arm the DISK BIOS entry trap: the
+    DSKIO/DSKCHG/GETDPB entries in slot 1 page 1 are served from the image
+    instead of executing ROM code. *)
+
+val boot_disk : t -> (unit, string) result
+(** Load the boot sector to 0xC000 and jump to it, the IPL step the disk
+    bootstrap would have run. Needs a disk attached first. *)
+
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
     ({!guess_mapper}); pass it to override a wrong guess. The bank registers
     reset linear so the ROM boots from segment 0. *)

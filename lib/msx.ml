@@ -80,6 +80,7 @@ type t = {
   cart_banks : int array;
       (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
           window); ASCII16 uses [.(0)]/[.(1)] as 16KB banks. *)
+  mutable disk : Dsk.t option;  (** 플로피 이미지 — DSKIO 트랩이 서비스 *)
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
@@ -163,6 +164,15 @@ let guess_mapper rom =
     else Konami
   end
 
+(* 슬롯1 0x4000-0x7FFF: "AB" 헤더, 0x4002 장치 코드 0, 나머지 RET. *)
+let disk_rom_bytes =
+  let b = Bytes.make 0x4000 '\xc9' in
+  Bytes.set b 0 'A';
+  Bytes.set b 1 'B';
+  Bytes.set b 2 '\x00';
+  Bytes.set b 3 '\xc9';
+  b
+
 let mem_read m addr =
   let a = addr land 0xffff in
   let page = a lsr 14 in
@@ -195,7 +205,12 @@ let mem_read m addr =
       let rom, roff =
         match slot, page with
         | 0, 0 | 0, 1 -> (m.main_rom, off)
-        | 1, 0 | 1, 1 -> (m.main_rom, off)
+        | 1, 1 when Option.is_some m.disk ->
+        (* 디스크 장착 중 슬롯1 페이지1 은 가상 DISK BIOS: "AB" 시그니처와
+           엔트리들. 실행은 트랩이 진입을 가로채니 바이트는 RET — 놓친 호출이
+           조용히 복귀하는 것으로 끝난다. *)
+        (disk_rom_bytes, off)
+    | 1, 0 | 1, 1 -> (m.main_rom, off)
         (* calslt 가 init 호출 시 전 페이지를 카트리지 슬롯으로 스왑하므로
            부트 초반 로고(슬롯0 페이지2)와는 시점이 갈린다. *)
         | 0, 2 | 1, 2 -> (m.logo_rom, off)
@@ -328,6 +343,7 @@ let create ~machine =
       cart = Bytes.make 0 '\000';
       cart_mapper = Flat;
       cart_banks = [| 0; 1; 2; 3 |];
+      disk = None;
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
       ppi_a = 0x00;
@@ -361,6 +377,80 @@ let load_cartridge ?mapper t rom =
      돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
   t.ppi_a <- (t.ppi_a land 0xf3) lor 0x08
+
+(* 표준 2DD(9섹터 2헤드) DPB — 게임이 파일시스템을 물을 때 돌려주는 값. *)
+let dpb_2dd : string =
+  "\xf9\x09\x02\x02\x02\x01\x01\x02\x70\x00\x0a\xf5\x03\xf9\x02\x00"
+
+(* DISK BIOS 엔트리 서비스. 0x4013 DSKIO(읽기만: A=드라이브, C=섹터 수,
+   DE=논리 섹터, HL=버퍼), 0x4016 DSKCHG(변경 없음), 0x4019 GETDPB(표준
+   2DD), 0x401C CHOICE(빈 답), 0x401F DSKFMT(거부). 성공은 CF 를 내리고
+   실패는 CF 와 A 에 코드를 싣는다 — 호출자가 보는 계약 그대로. *)
+let serve_disk_entry m pc =
+  match pc with
+  | 0x4013 ->
+      let cpu = m.cpu in
+      let drive = Z80.dump_a cpu in
+      let count = Z80.dump_bc cpu land 0xff in
+      let start = Z80.dump_de cpu in
+      let buf = Z80.dump_hl cpu in
+      let fail code = Z80.set_af cpu ((code lsl 8) lor 0x01) in
+      if drive <> 0 then fail 0x0c (* no drive *)
+      else begin
+        match m.disk with
+        | None -> fail 0x0c
+        | Some d ->
+            let ok = ref true in
+            for i = 0 to count - 1 do
+              match Dsk.read_sector d (start + i) with
+              | Some b ->
+                  String.iteri
+                    (fun j c ->
+                      mem_write m ((buf + (i * 512) + j) land 0xffff)
+                        (Char.code c))
+                    b
+              | None -> ok := false
+            done;
+            if !ok then Z80.set_af cpu ((Z80.dump_a cpu lsl 8) land 0xff00)
+            else fail 0x0d (* sector not found *)
+      end
+  | 0x4016 ->
+      let cpu = m.cpu in
+      Z80.set_bc cpu (Z80.dump_bc cpu land 0xff00);
+      Z80.set_af cpu ((Z80.dump_a cpu lsl 8) land 0xff00)
+  | 0x4019 ->
+      let cpu = m.cpu in
+      let hl = Z80.dump_hl cpu in
+      String.iteri
+        (fun j c -> mem_write m ((hl + j) land 0xffff) (Char.code c))
+        dpb_2dd;
+      Z80.set_af cpu ((Z80.dump_a cpu lsl 8) land 0xff00)
+  | 0x401c ->
+      let cpu = m.cpu in
+      Z80.set_bc cpu (Z80.dump_bc cpu land 0xff00);
+      Z80.set_af cpu ((Z80.dump_a cpu lsl 8) land 0xff00)
+  | 0x401f -> Z80.set_af m.cpu ((0x0d lsl 8) lor 0x01) (* write-protect *)
+  | _ -> ()
+
+let disk_entry_pc = function
+  | 0x4013 | 0x4016 | 0x4019 | 0x401c | 0x401f -> true
+  | _ -> false
+
+let load_disk m image =
+  m.disk <- Some (Dsk.parse image);
+  Z80.set_entry_trap m.cpu
+    (Some (fun pc -> if disk_entry_pc pc then begin serve_disk_entry m pc; true end else false))
+
+let boot_disk m =
+  match m.disk with
+  | None -> Error "no disk loaded"
+  | Some d -> (
+      match Dsk.read_sector d 0 with
+      | None -> Error "boot sector unreadable"
+      | Some b ->
+          String.iteri (fun i c -> mem_write m (0xC000 + i) (Char.code c)) b;
+          Z80.set_pc m.cpu 0xC000;
+          Ok ())
 
 let set_key t k ~pressed =
   match key_target k with

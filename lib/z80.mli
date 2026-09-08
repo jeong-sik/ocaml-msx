@@ -16,9 +16,15 @@ val create :
   port_out:(int -> int -> unit) ->
   t
 
-val step : t -> int
 (** 한 명령을 실행하고 그 명령이 쓴 T-state 를 반환. HALT 상태면 아무
     것도 하지 않고 4 를 반환한다. *)
+val step : t -> int
+
+val set_entry_trap : t -> (int -> bool) option -> unit
+(** An optional hook consulted before each instruction fetch: when it answers
+    true for the current PC the call was already served by the hook and the
+    step returns to the caller instead of executing -- the RET a BIOS entry
+    would have run. Set [None] to disable. *)
 
 val set_pc : t -> int -> unit
 (** 하네스가 TPA 시작(0x100)을 강제하는 자리. 이미지 헤더의 JP 를 믿지

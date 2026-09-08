@@ -8,6 +8,7 @@ let out_prefix = ref "/tmp/msxboot"
 let vlog = ref false
 let watch_mem = ref ""
 let cart = ref ""
+let disk_path = ref ""
 let cart_mapper = ref ""
 let tap_space : int list ref = ref []
 let assert_boot = ref false
@@ -38,10 +39,13 @@ let read_file p =
   s
 
 let () =
+  Printf.eprintf "BOOT-START
+%!";
   Arg.parse
     [ ("--vlog", Arg.Set vlog, "  VDP 포트 쓰기 로그");
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
+      ("--disk", Arg.Set_string disk_path, "PATH  .dsk 플로피 — 부트 섹터로 IPL");
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
         "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
@@ -60,10 +64,22 @@ let () =
       (fun f -> read_file (Filename.concat !rom_dir f))
       [ "cbios_main_msx2.rom"; "cbios_logo_msx2.rom"; "cbios_sub.rom" ]
   in
+  Printf.eprintf "ROMS-OK
+%!";
   let t =
     Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms }
   in
-  if !cart <> "" then
+  Printf.eprintf "CREATE-OK
+%!";
+  (if !disk_path <> "" then begin
+     Msx.load_disk t (read_file !disk_path);
+     match Msx.boot_disk t with
+     | Ok () -> ()
+     | Error m -> Printf.ksprintf failwith "disk boot: %s" m
+   end);
+  (* [begin/end] 는 필수: 없으면 let ... in 뒤의 세미콜론 체인 전체가
+     then 몸통에 묶여, 카트리지 없는 부트가 run_frame 없이 조용히 끝난다. *)
+  if !cart <> "" then begin
     let mapper = match !cart_mapper with
       | "plain" -> Some Msx.Flat
       | "ascii8" -> Some Msx.Ascii8
@@ -73,9 +89,14 @@ let () =
       | "" -> None
       | other -> Printf.ksprintf failwith "unknown --cart-mapper %s" other
     in
-    Msx.load_cartridge ?mapper t (read_file !cart);
+    Msx.load_cartridge ?mapper t (read_file !cart)
+  end;
+  Printf.eprintf "M1
+%!";
   Msx.set_ldirvm_log true;
   Msx.set_pc_hist true;
+  Printf.eprintf "M2
+%!";
   if !watch_mem <> "" then
     Msx.set_watch_mem
       (List.map (fun s -> int_of_string ("0x" ^ s)) (String.split_on_char ',' !watch_mem));
@@ -97,6 +118,8 @@ let () =
    let c = String.index v (char_of_int 58) in let n = int_of_string (String.sub v (c + 1) (String.length v - c - 1)) in
    Msx.set_trace_from (int_of_string ("0x" ^ String.sub v 0 4)) n
  with Not_found -> ());
+  Printf.eprintf "M3
+%!";
   let () = ignore (Msx.ldirvm_log_calls ()) in
   (* 마지막 30개 고유 PC 구간을 남긴다 — 루프 구조 확인용. *)
   let ring = Array.make 64 0 in
@@ -165,7 +188,11 @@ let () =
     Printf.printf "assert boot ok: logo=%d final=%d\n" nb_logo nb_final;
     exit 0
   end;
+  Printf.eprintf "PRE-RUN
+%!";
   run_frame !frames;
+  Printf.eprintf "POST-RUN
+%!";
   Printf.printf "last pcs:";
   for i = !ridx - 16 to !ridx - 1 do
     Printf.printf " %04x" ring.(i land 63)
