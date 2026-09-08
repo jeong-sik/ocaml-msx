@@ -19,6 +19,7 @@ type key =
   | Return
   | Function of int
   | Char of char
+  | Backspace
 
 type machine = {
   ram_kb : int;  (** 64 / 128 / 256 / 512 *)

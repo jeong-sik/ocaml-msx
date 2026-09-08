@@ -70,6 +70,7 @@ let key_of_string s : Msx.key option =
   | "space" -> Some Msx.Space
   | "esc" | "escape" -> Some Msx.Esc
   | "return" | "enter" -> Some Msx.Return
+  | "backspace" -> Some Msx.Backspace
   | "trigger_a" -> Some Msx.Trigger_a
   | "trigger_b" -> Some Msx.Trigger_b
   | "f1" -> Some (Msx.Function 1)

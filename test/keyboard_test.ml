@@ -88,6 +88,15 @@ let () =
   ignore (Msx.set_key t Esc ~pressed:false);
   ignore (Msx.set_key t Return ~pressed:false);
   all_rows_idle t "end of keyboard";
+  check "Backspace maps" (Msx.set_key t Backspace ~pressed:true);
+  check "Backspace = row 7 bit 5" (row_read t 7 = 0xdf);
+  check "Backspace leaves cursor row alone" (row_read t 8 = 0xff);
+  ignore (Msx.set_key t Return ~pressed:true);
+  check "Backspace and Return independent" (row_read t 7 = 0x5f);
+  ignore (Msx.set_key t Backspace ~pressed:false);
+  check "Backspace release leaves Return" (row_read t 7 = 0x7f);
+  ignore (Msx.set_key t Return ~pressed:false);
+  all_rows_idle t "after editing keys";
 
   (* 자리 없는 키는 false 이고 매트릭스를 건드리지 않는다. *)
   check "'!' unmapped" (not (Msx.set_key t (Char '!') ~pressed:true));

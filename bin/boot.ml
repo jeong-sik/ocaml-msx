@@ -17,6 +17,7 @@ let tap_keys : (int * Msx.key) list ref = ref []
 let key_of_name = function
   | "space" -> Msx.Space
   | "return" | "enter" -> Msx.Return
+  | "backspace" -> Msx.Backspace
   | "up" -> Msx.Up
   | "down" -> Msx.Down
   | "left" -> Msx.Left
