@@ -32,3 +32,8 @@
  (name palette_test)
  (modules palette_test)
  (libraries msx))
+
+(test
+ (name disk_test)
+ (modules disk_test)
+ (libraries msx))

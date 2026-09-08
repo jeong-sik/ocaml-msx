@@ -83,6 +83,9 @@ type t = {
   mutable disk : Bytes.t;
       (** the floppy image, 512 bytes a sector (empty = no drive). The disk
           interface ROM itself rides in [cart]; see [load_disk]. *)
+  mutable disk_dma : int;  (** BDOS transfer address, set by function 0x1A *)
+  mutable disk_open : Bytes.t option;
+      (** bytes of the file the last BDOS Open (0x0F) found, for Read Block. *)
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
@@ -332,6 +335,8 @@ let create ~machine =
       cart_mapper = Flat;
       cart_banks = [| 0; 1; 2; 3 |];
       disk = Bytes.make 0 '\000';
+      disk_dma = 0x0080;
+      disk_open = None;
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
       ppi_a = 0x00;
@@ -376,7 +381,8 @@ let load_cartridge ?mapper t rom =
 
 let disk_sector_bytes = 512
 let disk_init_entry = 0x4100 (* the "AB" INIT vector; C-BIOS CALLSLTs here *)
-let disk_dskio_entry = 0x4110 (* DSKIO; the standard disk BIOS offset lands here *)
+let disk_dskio_entry = 0x4010 (* DSKIO; the standard disk BIOS jumptable offset *)
+let disk_bdos_entry = 0xf37d (* MSX DISK-BASIC system-call entry; C = function *)
 let disk_boot_addr = 0xc000 (* boot sector lands here; entry at +0x1e *)
 
 (* Observation: every disk BIOS entry the boot code hits, so an offline run can
@@ -414,8 +420,99 @@ let disk_transfer t ~write ~sector ~count ~addr =
     done
   done
 
+(* --- FAT12 read-only file system on the .dsk image -----------------------
+   Enough of FAT12 to find a file in the root directory and read its bytes, so
+   the BDOS trap can load MSXDOS.SYS (and whatever the boot opens). The BPB is in
+   the boot sector; only fields the reader needs are decoded. *)
+
+let dsk_u8 t off = if off < Bytes.length t.disk then Char.code (Bytes.get t.disk off) else 0
+let dsk_u16 t off = dsk_u8 t off lor (dsk_u8 t (off + 1) lsl 8)
+
+type fat12 = {
+  bytes_per_sec : int;
+  sec_per_clus : int;
+  root_start_sec : int;
+  root_entries : int;
+  data_start_sec : int;
+  fat_start_sec : int;
+}
+
+let fat12_of t =
+  let bytes_per_sec = dsk_u16 t 0x0b in
+  let sec_per_clus = dsk_u8 t 0x0d in
+  let reserved = dsk_u16 t 0x0e in
+  let num_fats = dsk_u8 t 0x10 in
+  let root_entries = dsk_u16 t 0x11 in
+  let sec_per_fat = dsk_u16 t 0x16 in
+  let root_start_sec = reserved + (num_fats * sec_per_fat) in
+  let root_sectors = ((root_entries * 32) + bytes_per_sec - 1) / bytes_per_sec in
+  { bytes_per_sec; sec_per_clus; root_start_sec; root_entries;
+    data_start_sec = root_start_sec + root_sectors; fat_start_sec = reserved }
+
+(* Next cluster in the FAT12 chain (12 bits packed, low/high nibble by parity). *)
+let fat12_next t fs cluster =
+  let base = fs.fat_start_sec * fs.bytes_per_sec in
+  let off = base + (cluster * 3 / 2) in
+  let v = dsk_u8 t off lor (dsk_u8 t (off + 1) lsl 8) in
+  if cluster land 1 = 0 then v land 0xfff else (v lsr 4) land 0xfff
+
+(* The 11-byte directory name (8+3, space padded) of the root entry, uppercased
+   the way a stored FAT name already is. *)
+let fat12_find t fs name11 =
+  let entry_at i = (fs.root_start_sec * fs.bytes_per_sec) + (i * 32) in
+  let rec scan i =
+    if i >= fs.root_entries then None
+    else
+      let e = entry_at i in
+      let first = dsk_u8 t e in
+      if first = 0x00 then None (* no more entries *)
+      else if first = 0xe5 then scan (i + 1) (* deleted *)
+      else
+        let matches = ref true in
+        for k = 0 to 10 do
+          if dsk_u8 t (e + k) <> Char.code name11.[k] then matches := false
+        done;
+        if !matches then Some e else scan (i + 1)
+  in
+  scan 0
+
+(* The whole file's bytes, walking its cluster chain up to the directory size. *)
+let fat12_read t fs dir_entry =
+  let start = dsk_u16 t (dir_entry + 0x1a) in
+  let size =
+    dsk_u8 t (dir_entry + 0x1c)
+    lor (dsk_u8 t (dir_entry + 0x1d) lsl 8)
+    lor (dsk_u8 t (dir_entry + 0x1e) lsl 16)
+    lor (dsk_u8 t (dir_entry + 0x1f) lsl 24)
+  in
+  let out = Buffer.create size in
+  let clus_bytes = fs.sec_per_clus * fs.bytes_per_sec in
+  let rec walk cluster =
+    if cluster < 2 || cluster >= 0xff8 || Buffer.length out >= size then ()
+    else begin
+      let sec = fs.data_start_sec + ((cluster - 2) * fs.sec_per_clus) in
+      let off = sec * fs.bytes_per_sec in
+      for i = 0 to clus_bytes - 1 do
+        if Buffer.length out < size then Buffer.add_char out (Bytes.get t.disk (off + i))
+      done;
+      walk (fat12_next t fs cluster)
+    end
+  in
+  walk start;
+  Buffer.to_bytes out
+
+let fat12_open t name11 =
+  if Bytes.length t.disk = 0 then None
+  else
+    let fs = fat12_of t in
+    match fat12_find t fs name11 with
+    | None -> None
+    | Some e -> Some (fat12_read t fs e)
+
 let load_disk t dsk =
   t.disk <- Bytes.of_string dsk;
+  t.disk_open <- None;
+  t.disk_dma <- 0x0080;
   (* The interface ROM occupies the cartridge slot; loading it the cart way puts
      it in slot 2 page 1 with page 1 selected, so C-BIOS finds the "AB" header
      and calls INIT -- the proven path a game cart takes. *)
@@ -433,6 +530,13 @@ let disk_trap t pc =
        clear -- the boot code's first byte is RET NC, a check that the read
        succeeded. *)
     disk_transfer t ~write:false ~sector:0 ~count:1 ~addr:disk_boot_addr;
+    (* A real disk ROM's boot procedure enables RAM in page 0 before it loads
+       the DOS kernel to 0x0100. Do the same: page 0 to slot 3 (the RAM mapper),
+       with its sub-slot on the RAM bank. Page 1 stays the disk ROM (the kernel
+       calls DSKIO there); page 2/3 are left as they are. Without RAM in page 0
+       the load to 0x0100 lands on the BIOS ROM and is dropped. *)
+    t.ppi_a <- (t.ppi_a land 0xfc) lor 0x03;
+    t.slot3_sel <- (t.slot3_sel land 0xfc) lor 0x02;
     (* Enter the boot sector at +0x1e with carry SET: its first byte is RET NC,
        which the disk ROM uses to bail when the sector is not bootable. Carry
        set means "boot this", so the code runs instead of returning. *)
@@ -454,6 +558,68 @@ let disk_trap t pc =
     disk_transfer t ~write ~sector ~count ~addr;
     Z80.set_af t.cpu ((a lsl 8) lor (f land 0xfe)) (* carry clear = success *);
     Z80.set_bc t.cpu (Z80.dump_bc t.cpu land 0x00ff) (* B=0 remaining *);
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in
+    Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+    Z80.set_pc t.cpu ret;
+    true
+  end
+  else if pc = disk_bdos_entry then begin
+    (* MSX DISK-BASIC system call (C = function). Only the file-load path the
+       boot uses is served, against the FAT12 image: Open File (0x0F), Set DMA
+       (0x1A), Random block read (0x27). A=0 success, A=0xFF failure -- the boot
+       does INC A / JR Z, so 0 continues and 0xFF branches to its error path. *)
+    let c = Z80.dump_bc t.cpu land 0xff in
+    let de = Z80.dump_de t.cpu in
+    let fcb i = mem_read t ((de + i) land 0xffff) in
+    if !disk_call_log then
+      disk_calls := (pc, c, Z80.dump_bc t.cpu, de, Z80.dump_hl t.cpu, Z80.dump_f t.cpu)
+                    :: !disk_calls;
+    let a =
+      match c with
+      | 0x0f -> (
+        let name = String.init 11 (fun i -> Char.chr (fcb (1 + i))) in
+        match fat12_open t name with
+        | Some data ->
+          if !disk_call_log then
+            Printf.eprintf "BDOS open '%s' -> %d bytes\n%!" name (Bytes.length data);
+          t.disk_open <- Some data;
+          let sz = Bytes.length data in
+          mem_write t ((de + 0x10) land 0xffff) (sz land 0xff);
+          mem_write t ((de + 0x11) land 0xffff) ((sz lsr 8) land 0xff);
+          mem_write t ((de + 0x12) land 0xffff) ((sz lsr 16) land 0xff);
+          mem_write t ((de + 0x13) land 0xffff) ((sz lsr 24) land 0xff);
+          0x00
+        | None ->
+          if !disk_call_log then Printf.eprintf "BDOS open '%s' -> NOT FOUND\n%!" name;
+          0xff)
+      | 0x1a ->
+        t.disk_dma <- de;
+        0x00
+      | 0x27 -> (
+        match t.disk_open with
+        | None -> 0xff
+        | Some data ->
+          let rec_size =
+            let r = fcb 0x0e lor (fcb 0x0f lsl 8) in
+            if r = 0 then 128 else r
+          in
+          let rand_rec =
+            fcb 0x21 lor (fcb 0x22 lsl 8) lor (fcb 0x23 lsl 16) lor (fcb 0x24 lsl 24)
+          in
+          let count = Z80.dump_hl t.cpu in
+          let start = rand_rec * rec_size in
+          let want = count * rec_size in
+          let avail = max 0 (Bytes.length data - start) in
+          let n = min want avail in
+          for i = 0 to n - 1 do
+            mem_write t ((t.disk_dma + i) land 0xffff) (Char.code (Bytes.get data (start + i)))
+          done;
+          Z80.set_hl t.cpu (n / rec_size);
+          if n < want then 0x01 else 0x00)
+      | _ -> 0xff
+    in
+    Z80.set_af t.cpu ((a lsl 8) lor (Z80.dump_f t.cpu land 0xff));
     let sp = Z80.dump_sp t.cpu in
     let ret = mem_read t sp lor (mem_read t (sp + 1) lsl 8) in
     Z80.set_sp t.cpu ((sp + 2) land 0xffff);
