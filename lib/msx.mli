@@ -70,6 +70,10 @@ val load_disk : ?interface_rom:bool -> t -> string -> unit
     services against the image. [~interface_rom:false] leaves the slot empty
     for the warm-up replay ({!boot_disk}). *)
 
+val disk_image : t -> string option
+(** Copy of the current floppy bytes, including guest writes, for multi-disk
+    session retention. None when no disk is mounted. *)
+
 val change_disk : t -> string -> (unit, string) result
 (** Replace the mounted floppy without rebooting or changing CPU, RAM, VDP,
     keyboard, frame count or DMA address. Invalid images preserve the machine.

@@ -597,6 +597,9 @@ let load_disk ?(interface_rom = true) t dsk =
      (observed), so the replay path wants a plain BIOS boot first. *)
   if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ())
 
+let disk_image t =
+  if Bytes.length t.disk = 0 then None else Some (Bytes.to_string t.disk)
+
 let change_disk t image =
   let size = String.length image in
   if Bytes.length t.disk = 0 then Error "no disk drive is loaded"

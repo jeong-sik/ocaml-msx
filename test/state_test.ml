@@ -165,6 +165,7 @@ let () =
   let pc = Msx.dump_pc disk and frame = Msx.frame_number disk and rgb = Msx.frame_rgb disk in
   check "valid swap accepted" (Msx.change_disk disk (String.make 512 '\x5a') = Ok ());
   check "disk swap preserves CPU and display" (Msx.dump_pc disk = pc && Msx.frame_number disk = frame && Msx.frame_rgb disk = rgb);
+  check "current media can be retained independently" (Msx.disk_image disk = Some (String.make 512 '\x5a'));
   check "disk swap preserves RAM" (Msx.mem_read disk 0xc200 = 0x11);
   (* The old FCB cannot silently return cached bytes from the removed disk. *)
   List.iteri (fun i byte -> Msx.mem_write disk (0xc080 + i) byte) [0xc3;0x90;0xc0];
