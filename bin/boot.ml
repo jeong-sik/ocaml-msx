@@ -12,6 +12,30 @@ let disk = ref ""
 let disk_warm = ref false
 let cart_mapper = ref ""
 let tap_space : int list ref = ref []
+let tap_keys : (int * Msx.key) list ref = ref []
+
+let key_of_name = function
+  | "space" -> Msx.Space
+  | "return" | "enter" -> Msx.Return
+  | "up" -> Msx.Up
+  | "down" -> Msx.Down
+  | "left" -> Msx.Left
+  | "right" -> Msx.Right
+  | "esc" -> Msx.Esc
+  | "trigger_a" -> Msx.Trigger_a
+  | "trigger_b" -> Msx.Trigger_b
+  | s when String.length s = 2 && s.[0] = 'f' ->
+    Msx.Function (Char.code s.[1] - Char.code '0')
+  | s when String.length s = 1 -> Msx.Char s.[0]
+  | other -> Printf.ksprintf failwith "unknown --tap-key name %s" other
+
+let parse_tap_keys spec =
+  List.map
+    (fun pair ->
+      match String.split_on_char ':' pair with
+      | [ f; name ] -> (int_of_string f, key_of_name name)
+      | _ -> Printf.ksprintf failwith "bad --tap-key entry %s (want FRAME:KEY)" pair)
+    (String.split_on_char ',' spec)
 let assert_boot = ref false
 
 let contains_sub hay needle =
@@ -55,6 +79,9 @@ let () =
         Arg.String
           (fun s -> tap_space := List.map int_of_string (String.split_on_char ',' s)),
         "N[,N..]  해당 프레임마다 스페이스 탭 (down 5프레임)" );
+      ( "--tap-key",
+        Arg.String (fun s -> tap_keys := parse_tap_keys s),
+        "F:KEY[,F:KEY..]  프레임 F 에 KEY 탭 (down 5프레임). KEY=space|return|up|down|left|right|esc|trigger_a|trigger_b|fN|<char>" );
       ("--watch-mem", Arg.Set_string watch_mem, "A,B,C  RAM 쓰기 감시 (hex, 콤마 구분)");
       ("--frames", Arg.Int (fun n -> frames := n), "N  실행할 프레임");
       ("--roms", Arg.String (fun s -> rom_dir := s), "DIR  C-BIOS roms 디렉터리");
@@ -133,6 +160,11 @@ let () =
       if List.mem !ridx !tap_space then assert (Msx.set_key t Space ~pressed:true);
       if List.exists (fun f -> f + 5 = !ridx) !tap_space then
         assert (Msx.set_key t Space ~pressed:false);
+      List.iter
+        (fun (f, k) ->
+          if !ridx = f then ignore (Msx.set_key t k ~pressed:true);
+          if !ridx = f + 5 then ignore (Msx.set_key t k ~pressed:false))
+        !tap_keys;
       ring.(!ridx land 63) <- Msx.dump_pc t;
       incr ridx;
       let dlo, dhi =

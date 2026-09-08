@@ -49,8 +49,10 @@ let boot_code =
        0xC3; 0x00; 0x01 (* JP 0x0100 *) |]
 
 (* 페이로드 = 가짜 MSXDOS.SYS. page0 이 RAM 이 된 뒤라 BIOS 직접 call 은
-   무효 — VDP 포트(0x99 주소, 0x98 데이터)로 name table 0x1800 에 직접 쓴다. *)
-let payload =
+   무효 — VDP 포트(0x99 주소, 0x98 데이터)로 name table 0x1800 에 직접 쓴다.
+   [payload_code] 뒤에 8자 마커가 붙는다 — 디스크 교체 테스트가 같은 파일
+   이름에 다른 마커를 심어 "읽은 내용"을 구별한다. *)
+let payload_code =
   sbytes
     [| 0x3E; 0x00; (* LD A,0x00 — 주소 하위 *)
        0xD3; 0x99;
@@ -63,10 +65,10 @@ let payload =
        0x23; (* INC HL *)
        0x10; 0xFA; (* DJNZ *)
        0x18; 0xFE (* JR $ *) |]
-  ^ "FAT12 OK"
+;;
 
-(* 720KB 2DD 지오메트리 FAT12 디스크 한 장. *)
-let dsk () =
+(* 720KB 2DD 지오메트리 FAT12 디스크 한 장 — [msg] 는 페이로드 마커. *)
+let dsk_with_marker msg =
   let d = Bytes.make (1440 * 512) '\000' in
   Bytes.set d 0 '\xEB'; (* jmp $ — 부트 가능 마커 *)
   Bytes.set d 1 '\xFE';
@@ -100,9 +102,12 @@ let dsk () =
   Bytes.set d (r + 11) '\x20';
   u16 d (r + 26) 2;
   u16 d (r + 28) 128;
-  (* 데이터 클러스터 2 @ 섹터 14. *)
-  Bytes.blit_string payload 0 d (14 * 512) (String.length payload);
+  (* 데이터 클러스터 2 @ 섹터 14 — 코드 + 마커. *)
+  let pl = payload_code ^ msg in
+  Bytes.blit_string pl 0 d (14 * 512) (String.length pl);
   Bytes.to_string d
+
+let dsk () = dsk_with_marker "FAT12 OK"
 
 let rom_names =
   [ "cbios_main_msx2.rom"; "cbios_logo_msx2.rom"; "cbios_sub.rom" ]
@@ -130,4 +135,25 @@ let () =
     let got = String.init 8 (fun i -> Char.chr (Msx.vram_read t (0x1800 + i))) in
     check (Printf.sprintf "disk boot renders payload at 0x1800 (got %S)" got)
       (got = "FAT12 OK");
+    (* change_disk: 머신을 재부팅하지 않고 디스크만 갈아끼운다 — 같은 파일
+       이름(MSXDOS.SYS)에 다른 마커를 심은 두 번째 디스크로 2차 호출을
+       재실행하면 로더가 새 이미지를 읽는다. no-disk 머신의 거부도 함께. *)
+    (match Msx.change_disk t (dsk_with_marker "DISK2 OK") with
+     | Error m ->
+       incr failures;
+       Printf.eprintf "FAIL change_disk on a loaded machine succeeds: %s\n%!" m
+     | Ok () -> (
+       match Msx.boot_disk t with
+       | Error m ->
+         incr failures;
+         Printf.eprintf "FAIL boot_disk replays onto the swapped disk: %s\n%!" m
+       | Ok () ->
+         Msx.step t ~frames:400;
+         let got2 = String.init 8 (fun i -> Char.chr (Msx.vram_read t (0x1800 + i))) in
+         check (Printf.sprintf "the swapped disk renders its own marker (got %S)" got2)
+           (got2 = "DISK2 OK")));
+    let bare = Msx.create ~machine:{ ram_kb = 64; vram_kb = 128; roms = [ ""; ""; "" ] } in
+    (match Msx.change_disk bare "x" with
+     | Ok () -> check "change_disk without a disk loaded is refused" false
+     | Error _ -> ());
     if !failures > 0 then exit 1
