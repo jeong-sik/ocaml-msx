@@ -1321,7 +1321,21 @@ let disk_trap t pc =
               t.disk_dma n;
           for i = 0 to n - 1 do
             mem_write t i (mem_read t ((t.disk_dma + i) land 0xffff))
-          done
+          done;
+          (* This kernel hardcodes CALL 0x0014 (Rune Master's load loop at
+             c641 reads sectors through the 0x000C/0x0014 primitive pair),
+             but the 3-byte table's entries land on 0x0015 boundaries, so at
+             0x0014 the copied bytes read c3 c3 8c = JP 0x8CC3 -- empty RAM.
+             A real boot's page 0 also carries the 8-byte-spaced vector set
+             (0x000C/0x0014/0x001C/0x0024, the MSX-DOS layout) alongside
+             this table, and the entry 0x0014 must reach is the table's
+             0x0015 one (Rune Master: JP 0xC38C, its DSKRST + SETDTA(0xC728)
+             wrapper -- itself real code already loaded at 0xC38C). Plant it
+             one byte early. Rune Master II's boot never calls 0x0014, so
+             this is inert there. *)
+          mem_write t 0x0014 (mem_read t ((t.disk_dma + 0x15) land 0xffff));
+          mem_write t 0x0015 (mem_read t ((t.disk_dma + 0x16) land 0xffff));
+          mem_write t 0x0016 (mem_read t ((t.disk_dma + 0x17) land 0xffff))
         end;
         0x00
       | 0x27 -> (
