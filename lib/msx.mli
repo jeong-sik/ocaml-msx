@@ -15,6 +15,9 @@ type key =
   | Space
   | Trigger_a
   | Trigger_b
+  | Shift
+  | Ctrl
+  | Graph
   | Esc
   | Return
   | Function of int
