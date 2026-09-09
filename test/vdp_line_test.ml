@@ -48,6 +48,13 @@ let () =
   check "IE1 clear resets latched FH" (read_status t 1 land 1 = 0);
   Msx.step t ~frames:1;
   check "IE1 off after reset: FH not latched" (read_status t 1 land 1 = 0);
+  (* 인터럽트 발생 시 상태 레지스터 선택(R#15)은 0 으로 돌아간다 — V9938
+     계약. 게임이 S#1 선택을 남긴 채 VBlank 가 걸리면 BIOS KEYINT 의
+     `in a,(0x99)` 가 S#1 을 읽고 스캔 없이 종료한다(룬마스터 1 관측). *)
+  set_reg t 15 1;
+  Msx.step t ~frames:200;
+  check "interrupt resets S# select to 0"
+    ((Msx.vdp_regs t).(15) land 0x0f = 0);
   (if !failures = 0 then Printf.printf "vdp_line_test: all passed\n"
    else begin
      Printf.printf "vdp_line_test: %d failure(s)\n" !failures;
