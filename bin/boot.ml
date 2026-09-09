@@ -10,38 +10,8 @@ let watch_mem = ref ""
 let cart = ref ""
 let disk = ref ""
 let disk_warm = ref false
-let disk_real = ref false
 let cart_mapper = ref ""
 let tap_space : int list ref = ref []
-let tap_keys : (int * Msx.key) list ref = ref []
-
-let key_of_name = function
-  | "space" -> Msx.Space
-  | "return" | "enter" -> Msx.Return
-  | "backspace" -> Msx.Backspace
-  | "select" -> Msx.Select
-  | "up" -> Msx.Up
-  | "down" -> Msx.Down
-  | "left" -> Msx.Left
-  | "right" -> Msx.Right
-  | "esc" -> Msx.Esc
-  | "trigger_a" -> Msx.Trigger_a
-  | "trigger_b" -> Msx.Trigger_b
-  | "shift" -> Msx.Shift
-  | "ctrl" -> Msx.Ctrl
-  | "graph" -> Msx.Graph
-  | s when String.length s = 2 && s.[0] = 'f' ->
-    Msx.Function (Char.code s.[1] - Char.code '0')
-  | s when String.length s = 1 -> Msx.Char s.[0]
-  | other -> Printf.ksprintf failwith "unknown --tap-key name %s" other
-
-let parse_tap_keys spec =
-  List.map
-    (fun pair ->
-      match String.split_on_char ':' pair with
-      | [ f; name ] -> (int_of_string f, key_of_name name)
-      | _ -> Printf.ksprintf failwith "bad --tap-key entry %s (want FRAME:KEY)" pair)
-    (String.split_on_char ',' spec)
 let assert_boot = ref false
 
 let contains_sub hay needle =
@@ -75,9 +45,6 @@ let () =
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
       ("--disk", Arg.Set_string disk, "PATH  플로피 이미지(.dsk) — 드라이브 A.");
-      ( "--disk-real",
-        Arg.Set disk_real,
-        "  cbios_disk.rom 실ROM 을 카트에 올리고 HLE 트랩을 끈다" );
       ( "--disk-warm",
         Arg.Set disk_warm,
         "  720프레임 워밍업 뒤 Disk ROM 2차 호출 재생 (게임 화면 경로)" );
@@ -88,9 +55,6 @@ let () =
         Arg.String
           (fun s -> tap_space := List.map int_of_string (String.split_on_char ',' s)),
         "N[,N..]  해당 프레임마다 스페이스 탭 (down 5프레임)" );
-      ( "--tap-key",
-        Arg.String (fun s -> tap_keys := parse_tap_keys s),
-        "F:KEY[,F:KEY..]  프레임 F 에 KEY 탭 (down 5프레임). KEY=space|return|up|down|left|right|esc|trigger_a|trigger_b|fN|<char>" );
       ("--watch-mem", Arg.Set_string watch_mem, "A,B,C  RAM 쓰기 감시 (hex, 콤마 구분)");
       ("--frames", Arg.Int (fun n -> frames := n), "N  실행할 프레임");
       ("--roms", Arg.String (fun s -> rom_dir := s), "DIR  C-BIOS roms 디렉터리");
@@ -122,7 +86,7 @@ let () =
     Msx.load_cartridge ?mapper t (read_file !cart)
   end;
   if !disk <> "" then begin
-    Msx.load_disk ~interface_rom:(not !disk_warm) ~real_rom:!disk_real t (read_file !disk);
+    Msx.load_disk ~interface_rom:(not !disk_warm) t (read_file !disk);
     Msx.set_disk_call_log true
   end;
   Msx.set_ldirvm_log true;
@@ -169,11 +133,6 @@ let () =
       if List.mem !ridx !tap_space then assert (Msx.set_key t Space ~pressed:true);
       if List.exists (fun f -> f + 5 = !ridx) !tap_space then
         assert (Msx.set_key t Space ~pressed:false);
-      List.iter
-        (fun (f, k) ->
-          if !ridx = f then ignore (Msx.set_key t k ~pressed:true);
-          if !ridx = f + 5 then ignore (Msx.set_key t k ~pressed:false))
-        !tap_keys;
       ring.(!ridx land 63) <- Msx.dump_pc t;
       incr ridx;
       let dlo, dhi =
@@ -262,10 +221,6 @@ let () =
       (Msx.bdos_counts ())
   end;
   Msx.debug_dump t;
-  (* SCREEN7 logical bytes alternate between the two physical 64K banks. *)
-  let g6_read a =
-    Msx.vram_read t (((a land 1) lsl 16) lor ((a land 0x1ffff) lsr 1))
-  in
   (* SCREEN7 판정 보조: 64K 페이지별로 256바이트 줄(한 표시 줄)의 non-zero
      바이트 수. 한 줄 걸러 비면 인터레이스, 반대 페이지에 있으면 베이스
      오산정, 골고루 차 있으면 렌더 버그. *)
@@ -277,7 +232,7 @@ let () =
        for y = 0 to 211 do
          let c = ref 0 in
          for x = 0 to 255 do
-           if g6_read (base + (y * 256) + x) <> 0 then incr c
+           if Msx.vram_read t (base + (y * 256) + x) <> 0 then incr c
          done;
          Printf.eprintf "%d " !c;
          if y mod 32 = 31 then Printf.eprintf "\n%!"
@@ -296,7 +251,7 @@ let () =
        let img = Bytes.make (512 * 212 * 3) '\000' in
        for y = 0 to 211 do
          for x = 0 to 511 do
-           let b = g6_read (base + (y * 256) + (x lsr 1)) in
+           let b = Msx.vram_read t (base + (y * 256) + (x lsr 1)) in
            let nib = if x land 1 = 0 then b lsr 4 else b land 15 in
            let r, g, bl = pal.(nib) in
            let i = (y * 512 + x) * 3 in
@@ -361,14 +316,6 @@ let () =
        (List.filter (fun (p, _, _) -> p = 0x99 || p = 0x98 || p = 0x9B)
           (Msx.vdp_write_log t)));
   let oc = open_out_bin (!out_prefix ^ ".ppm") in
-  let w, h = Msx.frame_dims t in
-  Printf.fprintf oc "P6\n%d %d\n255\n%s" w h rgb;
+  Printf.fprintf oc "P6\n256 192\n255\n%s" rgb;
   close_out oc;
-  (* 8d349c6 의 fdc 관측 출력 — disk_trap_counts 는 현 main 서명에 없다. *)
-  let calls = Msx.fdc_recent_calls () in
-  Printf.printf "fdc touches: %d\n" (Array.length calls);
-  Array.iter
-    (fun (k, port, v) ->
-      Printf.printf "fdc %s %02x <- %02x\n" (if k = 0 then "R" else "W") port v)
-    (Array.sub calls (max 0 (Array.length calls - 24)) (min 24 (Array.length calls)));
   Printf.printf "wrote %s.ppm\n" !out_prefix
