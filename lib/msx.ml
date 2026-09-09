@@ -1393,11 +1393,15 @@ let disk_trap t pc =
         let count = (Z80.dump_hl t.cpu lsr 8) land 0xff in
         disk_transfer t ~write:false ~sector ~count ~addr:t.disk_dma;
         (* The kernel's byte reader drains the DTA buffer through the c70A
-           offset (see the 0x000C serving); each fresh transfer restarts
-           it. *)
+           offset (see the 0x000C serving). The real kernel never resets
+           c70A on a sector transfer -- it is the stream pointer of the
+           open(c25E)/skip(c245)/vector(c1f5) trio -- so zeroing it here
+           (an artifact of the refill design) pinned the slot-probe walk's
+           reads at offset 0-0x12 of page 0 forever; without the reset the
+           walk's reads advance and reach page 0's untouched tail (the
+           power-on 00 FF pattern), which is exactly the complement-pair
+           fingerprint the c611 scan accepts. Keep the refill seed only. *)
         disk_last_sector := sector;
-        mem_write t 0xc70a 0x00;
-        mem_write t 0xc70b 0x00;
         (* A 2nd-stage loader that is a customised MSX-DOS kernel (Rune Master's
            sector 3) rides a jp table at its head -- entries 3 bytes apart --
            that belongs in page 0: the DOS kernel's primitive vectors
