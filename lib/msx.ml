@@ -841,6 +841,14 @@ let boot_disk t =
       mem_write t (0xf340 + i) 0x83
     done;
     t.rst30_pending <- [];
+    (* KEYBUF 에 스페이스 하나를 미리 넣어둔다 — 룬마스터 1 의 커널은
+       워밍업 재생 구간(720 프레임) 안에서 CONIN 을 부르고(실측 ≈409) 빈
+       링을 받으면 재시도 없이 다른 경로로 간다. 재생은 녹화된 입력의
+       재생이라 --tap-key 가 이 창에 닿을 수 없으므로, "로딩 중 미리
+       눌린 키"를 심는다(실기의 'Insert disk and hit a key' 대응). *)
+    mem_write t 0xfbf0 0x20;
+    mem_write t 0xf3f8 0xf1;
+    mem_write t 0xf3fa 0xf0;
     (* SCNCNT(0xF3F6) 를 성숙 주기(3) 로 시드한다. KEYINT 의 키 스캔은 이 카운터가
        0 까로 내려올 때만 도는데, 재생 시점의 RAM 이 부팅 직후(0) 라면 첫 스캔이
        256 인터럽트 뒤에야 온다. 실기는 디스크 로딩 동안 카운터가 이미 성숙해
