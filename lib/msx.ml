@@ -850,6 +850,14 @@ let boot_disk t =
     mem_write t 0xfbf0 0x20;
     mem_write t 0xf3f8 0xf1;
     mem_write t 0xf3fa 0xf0;
+    (* 확장 훅들에 RET 을 심는다 — 실기는 C-BIOS INIT 이 부팅하며 모든
+       훅을 RET(기본 무동작)으로 초기화한다. 워밍업 재생은 그 INIT 을
+       건너뛰므로 훅이 빈 RAM(0=NOP)으로 남고, KEYINT 의 H_STKE(0xFEDA)
+       호출이 NOP 미끄럼으로 빠져 흐름이 엉뚱한 곳에 갇힌다(룬마스터 1
+       하이브리드 실측: 1b19 call feda 스핀). H_KEYI(0xFD9A) 는 게임이
+       스왑하므로 건드리지 않는다. *)
+    List.iter (fun a -> mem_write t a 0xc9)
+      [ 0xfed0; 0xfed5; 0xfeda; 0xfedf ];
     (* SCNCNT(0xF3F6) 를 성숙 주기(3) 로 시드한다. KEYINT 의 키 스캔은 이 카운터가
        0 까로 내려올 때만 도는데, 재생 시점의 RAM 이 부팅 직후(0) 라면 첫 스캔이
        256 인터럽트 뒤에야 온다. 실기는 디스크 로딩 동안 카운터가 이미 성숙해
