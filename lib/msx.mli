@@ -23,6 +23,7 @@ type key =
   | Function of int
   | Char of char
   | Backspace
+  | Select
 
 type machine = {
   ram_kb : int;  (** 64 / 128 / 256 / 512 *)

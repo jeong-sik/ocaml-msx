@@ -12,10 +12,11 @@ let mapper_writes : int array = Array.make 4 0
 type key =
   | Up | Down | Left | Right | Space | Trigger_a | Trigger_b
   | Shift | Ctrl | Graph
-  | Esc | Return | Function of int | Char of char | Backspace
+  | Esc | Return | Function of int | Char of char | Backspace | Select
 
 (* 논리 키가 닿는 자리. 키보드 매트릭스 (행 0-10, 비트 0-7) 의 정본은
    openMSX share/unicodemaps/unicodemap.int (국제 배열, <ROW><COL>).
+   행 7: ESC(2)·TAB(3)·BS(5)·SELECT(6)·RETURN(7).
    글자는 대소문자를 같은 키로 본다 — SHIFT 는 매트릭스의 다른 키(행 6 비트 0)라
    별도 키로 두고, SHIFT+글자 는 둘을 동시에 눌러 만든다. Shift/Ctrl/Graph 는
    행 6 의 모디파이어(비트 0/1/2). 조이스틱 1 은 PSG R#14 의 비트로 읽힌다:
@@ -43,6 +44,7 @@ let key_target = function
   | Shift -> Matrix (6, 0)
   | Ctrl -> Matrix (6, 1)
   | Graph -> Matrix (6, 2)
+  | Select -> Matrix (7, 6)
   | Function 1 -> Matrix (6, 5)
   | Function 2 -> Matrix (6, 6)
   | Function 3 -> Matrix (6, 7)

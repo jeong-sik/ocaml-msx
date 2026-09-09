@@ -19,6 +19,7 @@ let key_of_name = function
   | "space" -> Msx.Space
   | "return" | "enter" -> Msx.Return
   | "backspace" -> Msx.Backspace
+  | "select" -> Msx.Select
   | "up" -> Msx.Up
   | "down" -> Msx.Down
   | "left" -> Msx.Left
