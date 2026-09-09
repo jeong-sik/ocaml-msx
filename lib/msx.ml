@@ -295,17 +295,18 @@ let mem_read m addr =
       if Bytes.length rom = 0 then 0xff
       else Char.code (Bytes.get rom (min roff (Bytes.length rom - 1)))
     | _ ->
-      (* 슬롯3: 2차 선택 (0xFFFF 하위 2비트×4, 여기선 전 페이지 단일값). *)
-      if m.slot3_sel land 3 = 0 && page <> 3 then
+      (* 슬롯3: 2차 선택 (0xFFFF 하위 2비트×4, 여기선 전 페이지 단일값).
+         서브 배치는 NMS8250 실기를 따른다 — 3-0 = RAM 매퍼, 3-1 = sub ROM,
+         3-2 = 디스크 인터페이스 ROM. 커널류 로더가 EXPTBL 을 훑어 0xFFFF 를
+         2 로 쓰고 0x4000 을 읽으면 "AB" 를 발견하게 된다(룬마스터 II 실측:
+         3-1 에 두면 드라이브 슬롯 순회가 끝나지 않는다). *)
+      if m.slot3_sel land 3 = 1 && page <> 3 then
         (* sub ROM 은 페이지0·1 자리. *)
         Char.code (Bytes.get m.sub_rom off)
       else if
-        m.slot3_sel land 3 = 1 && page <> 3
+        m.slot3_sel land 3 = 2 && page <> 3
         && Bytes.length m.disk > 0 && Bytes.length m.cart >= 0x4000
       then
-        (* 서브슬롯 3-1: 디스크 인터페이스 ROM 이 여기에도 뜬다. 실기에서
-           내장 FDC 는 통상 슬롯3 확장에 살고, 슬롯3 를 훑어 인터페이스를
-           찾는 로더(룬마스터 II 의 2nd stage)가 "AB" 헤더를 발견하게 한다. *)
         Char.code (Bytes.get m.cart (min off (Bytes.length m.cart - 1)))
       else begin
         let seg = m.mapper.(page) in
@@ -342,7 +343,7 @@ let mem_write m addr v =
       (* Otherwise a write into the cart window is a bank select, not a store. *)
       cart_bank_write m a (v land 0xff)
   end
-  else if slot = 3 && (m.slot3_sel land 3 = 2 || page = 3) then begin
+  else if slot = 3 && (m.slot3_sel land 3 = 0 || page = 3) then begin
     let seg = m.mapper.(page) in
     let base = ((seg * 0x4000) + (a land 0x3fff)) mod (Bytes.length m.ram) in
     Bytes.set m.ram base (Char.chr (v land 0xff))
@@ -825,7 +826,18 @@ let boot_disk t =
   else begin
     disk_transfer t ~write:false ~sector:0 ~count:1 ~addr:0xc000;
     t.ppi_a <- 0xfb;
-    t.slot3_sel <- t.slot3_sel lor 0x02;
+    (* page0-3 전부 슬롯3 인 ppi 에서 서브슬롯0 = RAM 매퍼(NMS8250 배치).
+       실기의 디스크 ROM 부트는 EXPTBL(슬롯 확장·식별자)과 RAMAD0-3(RAM 이
+       사는 슬롯)도 채워 두는데 C-BIOS 워밍업은 우리 배치를 거기에 기록하지
+       않는다 — EXPTBL 을 훑는 2nd stage 커널(룬마스터 II)이 드라이브를
+       못 찾아 슬롯 순회가 끝나지 않았다(실측). 서브는 단순(0x00), RAM 는
+       slot3-0 = 식별자 0x80|(0<<2)|3. *)
+    t.slot3_sel <- t.slot3_sel land 0xfc;
+    mem_write t 0xfcc4 0x83;
+    for i = 0 to 3 do
+      mem_write t (0xfcc5 + i) 0x00;
+      mem_write t (0xf340 + i) 0x83
+    done;
     t.rst30_pending <- [];
     (* SCNCNT(0xF3F6) 를 성숙 주기(3) 로 시드한다. KEYINT 의 키 스캔은 이 카운터가
        0 까로 내려올 때만 도는데, 재생 시점의 RAM 이 부팅 직후(0) 라면 첫 스캔이
@@ -955,13 +967,12 @@ let disk_trap t pc =
     disk_transfer t ~write:false ~sector:0 ~count:1 ~addr:disk_boot_addr;
     (* A real disk ROM's boot procedure enables RAM in the low pages before it
        loads the DOS kernel. Do the same: pages 0 and 2 to slot 3 (the RAM
-       mapper), with the sub-slot on the RAM bank. Page 0 holds the kernel at
-       0x0100; page 2 holds its stack (the kernel sets SP=0x9000). Page 1 stays
-       the disk ROM -- the kernel calls INIENV/DSKIO there -- and page 3 keeps
-       the boot sector + system area. Without RAM in page 2 the stack lands on
-       the logo ROM and CALL/RET reads back garbage. *)
+       mapper, sub 0 in the NMS8250 layout -- the pre-NMS code selected sub 2
+       because that was RAM then). Page 0 holds the kernel at 0x0100; page 2
+       holds its stack (the kernel sets SP=0x9000). Without RAM in page 2 the
+       stack lands on the logo ROM and CALL/RET reads back garbage. *)
     t.ppi_a <- (t.ppi_a land 0xcc) lor 0x33;
-    t.slot3_sel <- (t.slot3_sel land 0xfc) lor 0x02;
+    t.slot3_sel <- t.slot3_sel land 0xfc;
     (* Enter the boot sector at +0x1e with carry SET: its first byte is RET NC,
        which the disk ROM uses to bail when the sector is not bootable. Carry
        set means "boot this", so the code runs instead of returning. *)
@@ -1184,22 +1195,28 @@ let disk_trap t pc =
         let count = (Z80.dump_hl t.cpu lsr 8) land 0xff in
         disk_transfer t ~write:false ~sector ~count ~addr:t.disk_dma;
         (* A 2nd-stage loader that is a customised MSX-DOS kernel (Rune Master's
-           sector 3) rides a jp table at its head: 20 entries, 3 bytes apart,
-           that belong in page 0 -- the DOS kernel's primitive vectors
+           sector 3) rides a jp table at its head -- entries 3 bytes apart --
+           that belongs in page 0: the DOS kernel's primitive vectors
            (0x000C = its sector-read entry, 0x001C = CALSLT trampoline,
-           0x0024 = slot-id arithmetic). A real boot leaves those installed in
-           page 0 RAM; our replay never installs them, so the loader's first
-           CALL 0x000C slides into empty RAM and dies. When the bytes just
-           transferred ARE such a table, plant it at 0x0000. *)
+           0x0024 = slot-id arithmetic). The table length varies by game (20
+           entries in Rune Master, 24 in Rune Master II), so plant as many
+           consecutive entries as the data actually has. A real boot leaves
+           those installed in page 0 RAM; our replay never installs them, so
+           the loader's first CALL 0x000C slides into empty RAM and dies. *)
         let jp_table = ref true in
         for k = 0 to 19 do
           if mem_read t ((t.disk_dma + (3 * k)) land 0xffff) <> 0xc3 then
             jp_table := false
         done;
-        if !jp_table then begin
+        let len = ref 0 in
+        while !len < 0xc0 && mem_read t ((t.disk_dma + !len) land 0xffff) = 0xc3 do
+          len := !len + 3
+        done;
+        if !jp_table && !len >= 0x3c then begin
           if !disk_call_log then
-            Printf.eprintf "BDOS 2F: planting page0 vectors from %04x\n%!" t.disk_dma;
-          for i = 0 to 0x3d do
+            Printf.eprintf "BDOS 2F: planting page0 vectors from %04x (%d entries)\n%!"
+              t.disk_dma (!len / 3);
+          for i = 0 to !len - 1 do
             mem_write t i (mem_read t ((t.disk_dma + i) land 0xffff))
           done
         end;
