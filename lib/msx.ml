@@ -852,7 +852,14 @@ let boot_disk t =
     let nseg = Bytes.length t.ram / 0x4000 in
     for s = 0 to nseg - 1 do
       t.mapper.(3) <- s;
-      mem_write t 0xf3f6 3
+      mem_write t 0xf3f6 3;
+      (* The boot sector reloads SP from 0xF674 ("ld sp,(0f674h)"); a real
+         disk ROM leaves the system stack pointer there. Unseeded it reads
+         garbage inside the 0xC000s, so the growing call stack chews through
+         the kernel's own code at 0xC5xx and every later "mystery jump" is
+         corrupted code, not logic. Park it just under the one we set. *)
+      mem_write t 0xf674 0x1f;
+      mem_write t 0xf675 0xf5
     done;
     t.mapper.(3) <- saved_p3;
     Z80.set_sp t.cpu 0xf51f;
@@ -941,6 +948,30 @@ let serve_rst30 t =
     (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
   addr
 
+(* CALSLT (BIOS 0x001C) served in OCaml for the warm-up replay, where page 0
+   is RAM and the real BIOS entry is not visible. Contract per the C-BIOS
+   source: IY high byte = target slot in RDSLT's A format (0x80 | sub<<2 |
+   primary; 0 = slot 0), IX = address to call. We repoint the target's page
+   at that slot, register the restore like an RST 30h return, and jump. *)
+let serve_calslt t =
+  let cpu = t.cpu in
+  let slot = (Z80.dump_iy cpu lsr 8) land 0xff in
+  let target = Z80.dump_ix cpu in
+  let page = target lsr 14 in
+  let shift = page * 2 in
+  let sp = Z80.dump_sp cpu in
+  let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+  Z80.set_sp cpu ((sp + 2) land 0xffff);
+  t.rst30_pending <- (ret, t.ppi_a) :: t.rst30_pending;
+  t.ppi_a <-
+    (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
+  (* An expanded slot 3 target also selects its sub-slot for the target's
+     page. The replay's CALSLT callers so far only target slot 0 (RSLREG),
+     which leaves [slot3_sel] alone. *)
+  if slot land 0x80 <> 0 && (slot land 3) = 3 && page <> 3 then
+    t.slot3_sel <- (t.slot3_sel land 0xfc) lor ((slot lsr 2) land 3);
+  target
+
 (* Serviced in the step loop before the opcode at [pc] runs. Returns true when
    [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
 let disk_trap t pc =
@@ -953,6 +984,12 @@ let disk_trap t pc =
   if Bytes.length t.disk = 0 || not t.hle_disk then false
   else if pc = disk_rst30_entry && t.ppi_a land 3 = 3 then begin
     Z80.set_pc t.cpu (serve_rst30 t);
+    true
+  end
+  else if pc = 0x001c && t.ppi_a land 3 = 3 then begin
+    (* CALSLT: only reachable through empty page-0 RAM (the warm-up replay),
+       never from real BIOS -- there page 0 is ROM and 0x001C runs natively. *)
+    Z80.set_pc t.cpu (serve_calslt t);
     true
   end
   else if pc >= 0x4000 && pc < 0x8000
@@ -1204,7 +1241,7 @@ let disk_trap t pc =
            those installed in page 0 RAM; our replay never installs them, so
            the loader's first CALL 0x000C slides into empty RAM and dies. *)
         let jp_table = ref true in
-        for k = 0 to 19 do
+        for k = 0 to 2 do
           if mem_read t ((t.disk_dma + (3 * k)) land 0xffff) <> 0xc3 then
             jp_table := false
         done;
@@ -1212,11 +1249,18 @@ let disk_trap t pc =
         while !len < 0xc0 && mem_read t ((t.disk_dma + !len) land 0xffff) = 0xc3 do
           len := !len + 3
         done;
-        if !jp_table && !len >= 0x3c then begin
+        (* Rune Master 1's header mixes data entries into the table (0x09
+           jumps into game code at 0x5EC3, 0x0C is JP NZ -- falling through
+           to the 0x0F entry when Z), so "every byte is a jp" rejects it and
+           page 0 stays empty. The first three entries being jp is enough
+           evidence; copy the whole 0x3F header so the data entries sit in
+           page 0 exactly where a real boot leaves them. *)
+        if !jp_table && !len >= 9 then begin
+          let n = max !len 0x3f in
           if !disk_call_log then
-            Printf.eprintf "BDOS 2F: planting page0 vectors from %04x (%d entries)\n%!"
-              t.disk_dma (!len / 3);
-          for i = 0 to !len - 1 do
+            Printf.eprintf "BDOS 2F: planting page0 vectors from %04x (%d bytes)\n%!"
+              t.disk_dma n;
+          for i = 0 to n - 1 do
             mem_write t i (mem_read t ((t.disk_dma + i) land 0xffff))
           done
         end;
