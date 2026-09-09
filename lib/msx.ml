@@ -778,12 +778,15 @@ let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
   (* The interface ROM occupies the cartridge slot; loading it the cart way puts
      it in slot 2 page 1 with page 1 selected, so C-BIOS finds the "AB" header
      and calls INIT -- the proven path a game cart takes. [~interface_rom:false]
-     keeps page 1 off slot 2 for the warm-up replay ({!boot_disk}): a C-BIOS
-     boot that finds the interface ROM re-enters the sector boot every boot
-     cycle (observed), so the replay path wants a plain BIOS boot first. The
-     ROM still rides in [cart] though: a 2nd-stage loader that walks EXPTBL
-     looking for a disk interface (Rune Master's kernel) reads it through the
-     slot 3-1 view and needs its "AB" header to be findable. *)
+     is the warm-up replay path ({!boot_disk}): the ROM is NOT mounted at all
+     during the warm-up. A C-BIOS boot that finds the interface ROM -- through
+     slot 2 page 1 or the slot 3-2 sub view -- re-enters the sector boot every
+     boot cycle (observed), so a long warm-up then leaked game code: Sangokushi
+     II's loader was already polling at f~240 of a 720-frame warm-up, and the
+     replay landed on that polluted state (pc=e1dc stall, 9/9 in the lane).
+     {!boot_disk} mounts the ROM at replay time, when a 2nd-stage loader that
+     walks EXPTBL looking for a disk interface (Rune Master's kernel) needs its
+     "AB" header findable. *)
   (match (if real_rom then disk_rom_real () else None) with
    | Some real ->
      (* 실ROM 을 cart 에 올리되 HLE 트랩은 유지한다 — 하이브리드. cbios_disk.rom
@@ -794,17 +797,7 @@ let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
          BIOS 엔트리는 여전히 HLE 트랩이 서빙한다. *)
      load_cartridge ~mapper:Flat t (Bytes.to_string real)
    | None ->
-     if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ())
-     else begin
-       (* 워밍업 재생 경로: ppi 는 건드리지 않고 cart 만 채운다 — 위 슬롯3-1
-          뷰가 이 ROM 을 보이게. *)
-       t.cart <- Bytes.of_string (disk_rom_bytes ());
-       t.cart_mapper <- Flat;
-       t.cart_banks.(0) <- 0;
-       t.cart_banks.(1) <- 1;
-       t.cart_banks.(2) <- 2;
-       t.cart_banks.(3) <- 3
-     end)
+     if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ()))
 
 let disk_image t =
   if Bytes.length t.disk = 0 then None else Some (Bytes.to_string t.disk)
@@ -834,6 +827,17 @@ let boot_disk t =
   if Bytes.length t.disk = 0 then Error "no disk loaded"
   else if Bytes.length t.disk < 512 then Error "boot sector unreadable"
   else begin
+    (* 워밍업 동안 슬롯 뷰에 없던 인터페이스 ROM 을 재생 시점에 장착한다.
+       3-2 뷰의 문턱(>= 0x4000)과 같은 조건으로, 이미 올라온 ROM(interface_rom
+       경로, 실ROM 하이브리드)은 그대로 둔다. *)
+    if Bytes.length t.cart < 0x4000 then begin
+      t.cart <- Bytes.of_string (disk_rom_bytes ());
+      t.cart_mapper <- Flat;
+      t.cart_banks.(0) <- 0;
+      t.cart_banks.(1) <- 1;
+      t.cart_banks.(2) <- 2;
+      t.cart_banks.(3) <- 3
+    end;
     disk_transfer t ~write:false ~sector:0 ~count:1 ~addr:0xc000;
     t.ppi_a <- 0xfb;
     (* page0-3 전부 슬롯3 인 ppi 에서 서브슬롯0 = RAM 매퍼(NMS8250 배치).
