@@ -551,7 +551,15 @@ let create ~machine =
       rst30_pending = [];
       hle_disk = true;
       fdc = fdc_create ();
-      ram = Bytes.make (ram_kb * 1024) '\000';
+      (* 전원 인가 시 RAM 의 실측 패턴(openMSX Philips_NMS_8250 initialContent):
+         (00 FF)*128 (FF 00)*128 의 512 바이트 블록이 전체를 덮는다. 룬마스터
+         1 의 커널 슬롯 프로브는 이 패턴의 보수쌍(byte2 = ~byte1)을 "이 슬롯에
+         신선한 RAM 이 있나" 의 지문으로 쓴다(c611 스캔) — 0 으로 초기화하면
+         (00,00) 쌍만 나와 프로브 16 회 전부 실패, ~270 프레임 재부팅 루프. *)
+      ram = Bytes.init (ram_kb * 1024) (fun i ->
+          let phase = i land 0x1ff in
+          let even = phase land 1 = 0 in
+          if phase < 0x100 = even then '\000' else '\255');
       mapper = Array.make 4 3;
       ppi_a = 0x00;
       ppi_c = 0x00;
@@ -616,6 +624,9 @@ let disk_boot_addr = 0xc000 (* boot sector lands here; entry at +0x1e *)
 (* Observation: every disk BIOS entry the boot code hits, so an offline run can
    show what convention the .dsk expects (which addresses, which registers). *)
 let disk_calls : (int * int * int * int * int * int) list ref = ref []
+(* The sector whose bytes the 0x000C reader is draining at the DMA buffer;
+   when the c70A offset passes a sector the reader refills with the next. *)
+let disk_last_sector = ref 0
 let disk_call_log = ref false
 let set_disk_call_log b = disk_call_log := b
 let disk_call_entries () = List.rev !disk_calls
@@ -1032,14 +1043,101 @@ let disk_trap t pc =
        관점에서 실기와 같다. 룬마스터 II 의 c1f5 사슬은 이 벡터를
        스스로 완주하므로 page0 에 jp 가 심겨 있지 않으면(=call 0000c 가
        NOP 미끄럼으로만 여기 올 수 있으면) 발동하지 않는다. *)
-    let hl = Z80.dump_hl t.cpu in
-    Z80.set_af t.cpu (((dsk_u8 t hl) lsl 8) lor Z80.dump_f t.cpu);
-    Z80.set_hl t.cpu ((hl + 1) land 0xffff);
+    (* The real vector (the kernel's c1f5) reads through the c70A work
+       offset against the DTA buffer c728 (LD DE,0xC728 / LD HL,(0xC70A) /
+       CALL c345) and never touches the caller's HL. The loader's marker
+       scan sits ~600 bytes into the transferred sectors, past one sector,
+       so when the offset drains the DTA refill it with the next sector --
+       the c340 wrapper re-issues 0x2F the same way on real hardware.
+       The vector's own tail advances the offset: LD BC,(0xC709) / ADD
+       HL,BC / LD (0xC70A),HL -- and C709 is (re)computed per call from
+       the caller's C (LD A,1 / CP C / JR C,+1 / LD A,C / LD (0xC709),A):
+       1 when C>1, else C). Without the advance every call returns the
+       same byte, and the loader's slot probe -- a scan for four
+       consecutive complement pairs (byte2 = ~byte1, at c611) read through
+       raw CALL 0x000C -- can never match, so all 16 probes fail and the
+       kernel reboots in a ~270-frame loop (Rune Master 1 observed). *)
+    let off = mem_read t 0xc70a lor (mem_read t 0xc70b lsl 8) in
+    let slot_probe = Z80.dump_a t.cpu in
+    if slot_probe >= 1 && (slot_probe land 0x80 <> 0 || slot_probe land 3 <> 0) then begin
+      (* The slot-probe face of the vector: the scanner (c611) calls with
+         A = the candidate slot id (c5f1's 0x80|sub<<2|primary) and HL = the
+         page base, and reads (base + offset) through THAT slot's view --
+         the real c1f5 saves A to C714 (c1bc) and its deep path reads the
+         probed slot, not the DTA. The pairs must be consecutive (the c70A
+         advance) so the complement scan can see fresh RAM's 00 FF
+         pattern. Reading a foreign view: point the page's PPI bits at the
+         primary slot (and slot3's sub-selector) for one read, then
+         restore. *)
+      let hl = Z80.dump_hl t.cpu in
+      let page = (hl lsr 14) land 3 in
+      let shift = page * 2 in
+      let primary = slot_probe land 3 in
+      let sub = (slot_probe lsr 2) land 3 in
+      let saved_ppi = t.ppi_a and saved_sl3 = t.slot3_sel in
+      let v =
+        if primary = 3 && sub = 2 && Bytes.length t.disk > 0 then
+          (* Reading through the disk interface's own slot: the real
+             vector's deep path (c38f/c3e5/c535 after the c1bc context
+             save) reaches the FDC's data path, not this slot's ROM bytes.
+             The loader's stream position -- the DTA buffer at the c70A
+             offset -- is the closest observable equivalent. The remaining
+             divergence (the c611 complement-pair scan reads kernel
+             scratch here, so all 16 probes fail and the kernel reboots
+             in a ~270-frame loop) is the FDC byte-pump protocol of the
+             real NMS8250 disk ROM: unobservable without that ROM, and
+             C-BIOS's own disk ROM cannot boot this game at all (openMSX
+             21 + cbios_disk.rom falls back to the BASIC screen -- no
+             reference run exists). Diagnostic note: forcing a complement
+             pair here (00/ff by offset parity) unlocks the game past the
+             probe -- it then runs its bytecode VM at 0x74xx with a blank
+             screen, waiting on data conditions -- so this serving is the
+             only blocker, not a structural one. *)
+          mem_read t ((t.disk_dma + off) land 0xffff)
+        else begin
+          t.ppi_a <-
+            (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor (primary lsl shift);
+          if primary = 3 then t.slot3_sel <- (t.slot3_sel land 0xfc) lor sub;
+          let b = mem_read t ((hl + off) land 0xffff) in
+          t.ppi_a <- saved_ppi;
+          t.slot3_sel <- saved_sl3;
+          b
+        end
+      in
+      mem_write t 0xc70a ((off + 1) land 0xff);
+      mem_write t 0xc70b (((off + 1) lsr 8) land 0xff);
+      Z80.set_af t.cpu ((v lsl 8) lor Z80.dump_f t.cpu);
+      let sp = Z80.dump_sp t.cpu in
+      let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+      Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+      Z80.set_pc t.cpu ret;
+      true
+    end
+    else begin
+    let buf = t.disk_dma in
+    let v, off' =
+      if off >= 512 && Bytes.length t.disk > 0 then begin
+        (* refill: the next sector after the one last seeded at the DMA *)
+        let cur = !disk_last_sector in
+        disk_last_sector := cur + 1;
+        disk_transfer t ~write:false ~sector:(cur + 1) ~count:1 ~addr:buf;
+        mem_read t buf, off - 512
+      end
+      else (mem_read t ((buf + off) land 0xffff), off)
+    in
+    let caller_c = Z80.dump_bc t.cpu land 0xff in
+    let incr = if caller_c > 1 then 1 else caller_c in
+    mem_write t 0xc709 incr;
+    let advanced = off' + incr in
+    mem_write t 0xc70a (advanced land 0xff);
+    mem_write t 0xc70b ((advanced lsr 8) land 0xff);
+    Z80.set_af t.cpu ((v lsl 8) lor Z80.dump_f t.cpu);
     let sp = Z80.dump_sp t.cpu in
     let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
     Z80.set_sp t.cpu ((sp + 2) land 0xffff);
     Z80.set_pc t.cpu ret;
     true
+    end
   end
   else if pc >= 0x4000 && pc < 0x8000
           && (let slot = (t.ppi_a lsr 2) land 3 in slot = 0 || slot = 3) then false
@@ -1294,6 +1392,12 @@ let disk_trap t pc =
         let sector = Z80.dump_de t.cpu in
         let count = (Z80.dump_hl t.cpu lsr 8) land 0xff in
         disk_transfer t ~write:false ~sector ~count ~addr:t.disk_dma;
+        (* The kernel's byte reader drains the DTA buffer through the c70A
+           offset (see the 0x000C serving); each fresh transfer restarts
+           it. *)
+        disk_last_sector := sector;
+        mem_write t 0xc70a 0x00;
+        mem_write t 0xc70b 0x00;
         (* A 2nd-stage loader that is a customised MSX-DOS kernel (Rune Master's
            sector 3) rides a jp table at its head -- entries 3 bytes apart --
            that belongs in page 0: the DOS kernel's primitive vectors
@@ -1532,6 +1636,7 @@ let vdp_status0 t = Vdp.status0 t.vdp
 let vdp_line t = Vdp.line_now t.vdp
 let vdp_irq_active t = Vdp.int_active t.vdp
 let cpu_halted t = Z80.halted t.cpu
+let cpu_iff1 t = Z80.dump_iff1 t.cpu
 let vdp_regs t = Vdp.regs t.vdp
 let ppi_a t = t.ppi_a
 let slot3_sel t = t.slot3_sel

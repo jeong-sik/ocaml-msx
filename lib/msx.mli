@@ -177,6 +177,7 @@ val vdp_irq_active : t -> bool
 (** VDP 인터럽트 라인 상태 — 부트 디버깅용. *)
 
 val cpu_halted : t -> bool
+val cpu_iff1 : t -> bool
 (** Z80 HALT 상태 — 부트 디버깅용. *)
 
 val vdp_regs : t -> int array

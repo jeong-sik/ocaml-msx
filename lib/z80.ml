@@ -69,6 +69,7 @@ let set_de z v = z.d <- (v lsr 8) land 0xff; z.e <- v land 0xff
 let set_hl z v = z.h <- (v lsr 8) land 0xff; z.l <- v land 0xff
 let set_sp z v = z.sp <- v land 0xffff
 let dump_f z = z.f
+let dump_iff1 z = z.iff1
 let dump_bc z = (z.b lsl 8) lor z.c
 let dump_de z = (z.d lsl 8) lor z.e
 let dump_hl z = (z.h lsl 8) lor z.l
