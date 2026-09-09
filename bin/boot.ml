@@ -217,7 +217,31 @@ let () =
      INIT 경로가 KOEI.SYS 진입 후 재부트하는 동안 (실측 f≈330), 게임 화면
      까지 가는 쪽이다. *)
   (if !disk_warm && !disk <> "" then begin
-     run_frame (min !frames 720);
+     (* WARM: 워밍업 프레임을 --frames 에서 분리 — 재생 후 길이를 고정한 채
+        워밍업 길이만 바꾸는 차분 실험용. *)
+     let warm =
+       try int_of_string (Sys.getenv "WARM") with Not_found -> min !frames 720 in
+     run_frame warm;
+     (* PRE_DUMP: 재생 직전 상태 — Z80 이 보는 64K 전체와 ppi/slot/VDP 헤더. *)
+     (try
+        let path = Sys.getenv "PRE_DUMP" in
+        let oc = open_out_bin path in
+        Printf.fprintf oc "# pc=%04x ppi=%02x sl3=%02x mode=%s regs="
+          (Msx.dump_pc t) (Msx.ppi_a t) (Msx.slot3_sel t)
+          (Msx.display_mode_to_string (Msx.display_mode t));
+        Array.iteri
+          (fun i v -> Printf.fprintf oc "%s%02x" (if i = 0 then "" else ",") v)
+          (Msx.vdp_regs t);
+        Printf.fprintf oc "\n";
+        for row = 0 to 4095 do
+          Printf.fprintf oc "%04x" (row * 16);
+          for j = 0 to 15 do
+            Printf.fprintf oc " %02x" (Msx.mem_read t ((row * 16) + j))
+          done;
+          Printf.fprintf oc "\n"
+        done;
+        close_out oc
+      with Not_found -> ());
      match Msx.boot_disk t with
      | Ok () -> ()
      | Error m -> Printf.ksprintf failwith "disk boot: %s" m

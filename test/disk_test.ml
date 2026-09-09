@@ -123,6 +123,29 @@ let () =
   | None -> Printf.eprintf "SKIP disk_test: C-BIOS ROM 없음 (roms/ 는 gitignore)\n%!"
   | Some dir ->
     let roms = List.map (fun f -> read_file (Filename.concat dir f)) rom_names in
+    (* 워밍업 재생 경로의 ROM 노출 계약 (삼국지2 부트 회귀, 09-09):
+       load_disk ~interface_rom:false 는 인터페이스 ROM 을 장착하지 않는다 —
+       C-BIOS 가 이를 발견하면 섹터 부트를 재진입해 게임 로더가 워밍업 중에
+       새어 나갔다(실측: 720 프레임 워밍업의 f~240 부터 KOEI 로더 폴링, 재생
+       후 e1dc 스톨). 순수 워밍업은 부트 섹터를 읽지 않는다. *)
+    let warm = Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms } in
+    Msx.set_disk_call_log true;
+    let before = List.length (Msx.disk_call_entries ()) in
+    Msx.load_disk ~interface_rom:false warm (dsk ());
+    Msx.step warm ~frames:720;
+    let leaked = List.length (Msx.disk_call_entries ()) - before in
+    check (Printf.sprintf "warm-up alone reads no boot sector (%d disk traps)" leaked)
+      (leaked = 0);
+    (* boot_disk 는 재생 시점에 인터페이스 ROM 을 장착한다 — ppi_a=0xfb 의
+       page1(slot2) 0x4000 에서 "AB" 가 보여야 로더의 0x4013 호출이 산다. *)
+    (match Msx.boot_disk warm with
+     | Error m ->
+       incr failures;
+       Printf.eprintf "FAIL boot_disk after a clean warm-up: %s\n%!" m
+     | Ok () ->
+       check "boot_disk mounts the interface ROM (AB at 0x4000)"
+         (Msx.mem_read warm 0x4000 = Char.code 'A'
+         && Msx.mem_read warm 0x4001 = Char.code 'B'));
     let t = Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms } in
     Msx.set_disk_call_log true;
     Msx.load_disk t (dsk ());
