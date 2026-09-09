@@ -57,3 +57,8 @@
  (name vdp_line_test)
  (modules vdp_line_test)
  (libraries msx))
+
+(test
+ (name im2_test)
+ (modules im2_test)
+ (libraries z80core))

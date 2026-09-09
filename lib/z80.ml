@@ -446,9 +446,9 @@ and ed_exec z op =
     (* RETN/RETI — 인터럽트 없는 코어에선 둘 다 RET. *)
     z.pc <- pop z;
     add_t 14
-  | 0x46 -> z.im <- 0; add_t 8
-  | 0x4E | 0x66 | 0x6E -> z.im <- 2; add_t 8
+  | 0x46 | 0x4E | 0x66 | 0x6E -> z.im <- 0; add_t 8
   | 0x56 | 0x76 | 0x7E -> z.im <- 1; add_t 8
+  | 0x5E -> z.im <- 2; add_t 8
   | 0x47 -> z.i <- z.a; add_t 9
   | 0x4F -> z.r <- z.a; add_t 9
   | 0x57 ->
@@ -831,9 +831,16 @@ let interrupt z =
        push z z.pc;
        z.pc <- 0x38
      | _ ->
-       (* IM2: I<<8 | 데이터 버스 0xFF — C-BIOS 는 IM1 만 쓴다. *)
+       (* IM2: 벡터 테이블에서 핸들러 주소를 읽는다 — I<<8 | 데이터 버스
+          (아무것도 올리지 않으면 0xFF). 실기 Z80 은 그 주소의 word 를
+          읽어 그곳으로 call 한다. I<<8|0xFF 로 곧장 점프하면 게임이
+          c7xx 워크에이어에 심는 벡터 테이블(룬마스터 1 의 디스크
+          인터럽트)을 읽지 않는다 — 인터럽트 사슬이 죽는다. *)
+       let vec = ((z.i lsl 8) lor 0xff) land 0xffff in
+       let lo = z.rb vec in
+       let hi = z.rb (m16 (vec + 1)) in
        push z z.pc;
-       z.pc <- ((z.i lsl 8) lor 0xff) land 0xffff);
+       z.pc <- (hi lsl 8) lor lo);
     z.iff1 <- false;
     z.iff2 <- false;
     true
