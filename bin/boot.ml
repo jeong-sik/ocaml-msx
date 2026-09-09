@@ -10,6 +10,7 @@ let watch_mem = ref ""
 let cart = ref ""
 let disk = ref ""
 let disk_warm = ref false
+let disk_real = ref false
 let cart_mapper = ref ""
 let tap_space : int list ref = ref []
 let tap_keys : (int * Msx.key) list ref = ref []
@@ -73,6 +74,9 @@ let () =
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
       ("--disk", Arg.Set_string disk, "PATH  플로피 이미지(.dsk) — 드라이브 A.");
+      ( "--disk-real",
+        Arg.Set disk_real,
+        "  cbios_disk.rom 실ROM 을 카트에 올리고 HLE 트랩을 끈다" );
       ( "--disk-warm",
         Arg.Set disk_warm,
         "  720프레임 워밍업 뒤 Disk ROM 2차 호출 재생 (게임 화면 경로)" );
@@ -117,7 +121,7 @@ let () =
     Msx.load_cartridge ?mapper t (read_file !cart)
   end;
   if !disk <> "" then begin
-    Msx.load_disk ~interface_rom:(not !disk_warm) t (read_file !disk);
+    Msx.load_disk ~interface_rom:(not !disk_warm) ~real_rom:!disk_real t (read_file !disk);
     Msx.set_disk_call_log true
   end;
   Msx.set_ldirvm_log true;

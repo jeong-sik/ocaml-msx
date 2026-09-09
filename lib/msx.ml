@@ -136,6 +136,10 @@ type t = {
       (** RST 30h 인터슬롯의 복귀 대기: (복귀 PC, 저장한 ppi_a) 최근 것 먼저.
           워밍업 재생 경로(page0 = RAM)에서 디스크 로더가 쓰는 벡터를
           트램페린이 대신 서기 위한 상태. *)
+  mutable hle_disk : bool;
+      (** 인터페이스 ROM 이 HLE(RET 채움)이면 true — disk_trap 이 BIOS 엔트리를
+          OCaml 로 서빙한다. 실ROM(cbios_disk.rom)을 심으면 false: ROM 코드가
+          직접 돌고 트랩은 물러난다. *)
   mutable fdc : fdc_state;
       (** WD279x 컨트롤러 근사: 명령/상태, 트랙·섹터 레지스터, 섹터 버퍼.
           포트 0xD0-0xD4 로 로더가 직접 말을 건다. *)
@@ -535,6 +539,7 @@ let create ~machine =
       rtc_reg = 0;
       con_esc = 0;
       rst30_pending = [];
+      hle_disk = true;
       fdc = fdc_create ();
       ram = Bytes.make (ram_kb * 1024) '\000';
       mapper = Array.make 4 3;
@@ -608,6 +613,33 @@ let disk_call_entries () = List.rev !disk_calls
 (* Per-function BDOS call counts, for boot diagnosis: which functions a
    loader actually exercises (_RDBLK 27 calls in Sangokushi II's loader). *)
 let bdos_call_counts : int array = Array.make 256 0
+
+(* 실제 디스크 ROM(cbios_disk.rom) — 있으면 이식 대상. 헤더 0x4000-0x400F 가
+   비어 카트로 못 띄우므로 AB + INIT 벡터만 얹는다. C-BIOS 가 INIT 로 부르는
+   0x4030(INIENV) 을 진입점으로 준다 — 하드웨어 초기화·page0 프리미티브 설치
+   까지 실ROM 코드에 맡긴다(HLE 트랩은 끈다). *)
+let disk_rom_real () =
+  let read p =
+    try
+      let ic = open_in_bin p in
+      let s = really_input_string ic (in_channel_length ic) in
+      close_in ic;
+      Some (Bytes.of_string s)
+    with Sys_error _ -> None
+  in
+  let candidates =
+    [ "roms/cbios/cbios_disk.rom"; "../roms/cbios/cbios_disk.rom";
+      "../../roms/cbios/cbios_disk.rom"; "../../../roms/cbios/cbios_disk.rom" ]
+  in
+  match List.find_map read candidates with
+  | Some rom when Bytes.length rom >= 0x4000 ->
+      let b = Bytes.sub rom 0 0x4000 in
+      Bytes.set b 0 'A';
+      Bytes.set b 1 'B';
+      Bytes.set b 2 (Char.chr (disk_inienv_entry land 0xff));
+      Bytes.set b 3 (Char.chr ((disk_inienv_entry lsr 8) land 0xff));
+      Some b
+  | _ -> None
 
 let disk_rom_bytes () =
   let rom = Bytes.make 0x4000 '\xc9' (* every unentered byte is a RET *) in
@@ -729,7 +761,7 @@ let fat12_open t name11 =
     | None -> None
     | Some e -> Some (fat12_read t fs e)
 
-let load_disk ?(interface_rom = true) t dsk =
+let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
   t.disk <- Bytes.of_string dsk;
   Hashtbl.reset t.bdos_files;
   t.disk_dma <- 0x0080;
@@ -739,7 +771,15 @@ let load_disk ?(interface_rom = true) t dsk =
      leaves the slot empty for the warm-up replay ({!boot_disk}): a C-BIOS boot
      that finds the interface ROM re-enters the sector boot every boot cycle
      (observed), so the replay path wants a plain BIOS boot first. *)
-  if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ())
+  (match (if real_rom then disk_rom_real () else None) with
+   | Some real ->
+     (* 실ROM 이 있으면 이걸 올리고 HLE 트랩을 끈다 — ROM 의 INIENV/DSKIO 가
+         page0 프리미티브 설치와 물리 I/O 를 맡는다(룬마스터 계열 로더의
+         전제). 없으면 기존 RET 채움 + 트랩 경로. *)
+     load_cartridge ~mapper:Flat t (Bytes.to_string real);
+     t.hle_disk <- false
+   | None ->
+     if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ()))
 
 let disk_image t =
   if Bytes.length t.disk = 0 then None else Some (Bytes.to_string t.disk)
@@ -884,7 +924,7 @@ let disk_trap t pc =
      t.rst30_pending <- rest;
      t.ppi_a <- saved
    | _ -> ());
-  if Bytes.length t.disk = 0 then false
+  if Bytes.length t.disk = 0 || not t.hle_disk then false
   else if pc = disk_rst30_entry && t.ppi_a land 3 = 3 then begin
     Z80.set_pc t.cpu (serve_rst30 t);
     true
