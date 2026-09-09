@@ -768,18 +768,32 @@ let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
   (* The interface ROM occupies the cartridge slot; loading it the cart way puts
      it in slot 2 page 1 with page 1 selected, so C-BIOS finds the "AB" header
      and calls INIT -- the proven path a game cart takes. [~interface_rom:false]
-     leaves the slot empty for the warm-up replay ({!boot_disk}): a C-BIOS boot
-     that finds the interface ROM re-enters the sector boot every boot cycle
-     (observed), so the replay path wants a plain BIOS boot first. *)
+     keeps page 1 off slot 2 for the warm-up replay ({!boot_disk}): a C-BIOS
+     boot that finds the interface ROM re-enters the sector boot every boot
+     cycle (observed), so the replay path wants a plain BIOS boot first. The
+     ROM still rides in [cart] though: a 2nd-stage loader that walks EXPTBL
+     looking for a disk interface (Rune Master's kernel) reads it through the
+     slot 3-1 view and needs its "AB" header to be findable. *)
   (match (if real_rom then disk_rom_real () else None) with
    | Some real ->
      (* 실ROM 이 있으면 이걸 올리고 HLE 트랩을 끈다 — ROM 의 INIENV/DSKIO 가
          page0 프리미티브 설치와 물리 I/O 를 맡는다(룬마스터 계열 로더의
-         전제). 없으면 기존 RET 채움 + 트랩 경로. *)
+         전제). 없으면 기존 RET 채움 + 트랩 경로. 실ROM 은 물리 I/O 코드가
+         없음이 밝혀져 실험 인프라로만 남는다(cbios_disk.rom dskio_done 참조). *)
      load_cartridge ~mapper:Flat t (Bytes.to_string real);
      t.hle_disk <- false
    | None ->
-     if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ()))
+     if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ())
+     else begin
+       (* 워밍업 재생 경로: ppi 는 건드리지 않고 cart 만 채운다 — 위 슬롯3-1
+          뷰가 이 ROM 을 보이게. *)
+       t.cart <- Bytes.of_string (disk_rom_bytes ());
+       t.cart_mapper <- Flat;
+       t.cart_banks.(0) <- 0;
+       t.cart_banks.(1) <- 1;
+       t.cart_banks.(2) <- 2;
+       t.cart_banks.(3) <- 3
+     end)
 
 let disk_image t =
   if Bytes.length t.disk = 0 then None else Some (Bytes.to_string t.disk)
@@ -1169,6 +1183,26 @@ let disk_trap t pc =
         let sector = Z80.dump_de t.cpu in
         let count = (Z80.dump_hl t.cpu lsr 8) land 0xff in
         disk_transfer t ~write:false ~sector ~count ~addr:t.disk_dma;
+        (* A 2nd-stage loader that is a customised MSX-DOS kernel (Rune Master's
+           sector 3) rides a jp table at its head: 20 entries, 3 bytes apart,
+           that belong in page 0 -- the DOS kernel's primitive vectors
+           (0x000C = its sector-read entry, 0x001C = CALSLT trampoline,
+           0x0024 = slot-id arithmetic). A real boot leaves those installed in
+           page 0 RAM; our replay never installs them, so the loader's first
+           CALL 0x000C slides into empty RAM and dies. When the bytes just
+           transferred ARE such a table, plant it at 0x0000. *)
+        let jp_table = ref true in
+        for k = 0 to 19 do
+          if mem_read t ((t.disk_dma + (3 * k)) land 0xffff) <> 0xc3 then
+            jp_table := false
+        done;
+        if !jp_table then begin
+          if !disk_call_log then
+            Printf.eprintf "BDOS 2F: planting page0 vectors from %04x\n%!" t.disk_dma;
+          for i = 0 to 0x3d do
+            mem_write t i (mem_read t ((t.disk_dma + i) land 0xffff))
+          done
+        end;
         0x00
       | 0x27 -> (
         match Hashtbl.find_opt t.bdos_files de with
