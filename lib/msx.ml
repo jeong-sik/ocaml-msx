@@ -779,12 +779,13 @@ let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
      slot 3-1 view and needs its "AB" header to be findable. *)
   (match (if real_rom then disk_rom_real () else None) with
    | Some real ->
-     (* 실ROM 이 있으면 이걸 올리고 HLE 트랩을 끈다 — ROM 의 INIENV/DSKIO 가
-         page0 프리미티브 설치와 물리 I/O 를 맡는다(룬마스터 계열 로더의
-         전제). 없으면 기존 RET 채움 + 트랩 경로. 실ROM 은 물리 I/O 코드가
-         없음이 밝혀져 실험 인프라로만 남는다(cbios_disk.rom dskio_done 참조). *)
-     load_cartridge ~mapper:Flat t (Bytes.to_string real);
-     t.hle_disk <- false
+     (* 실ROM 을 cart 에 올리되 HLE 트랩은 유지한다 — 하이브리드. cbios_disk.rom
+         은 물리 I/O 가 없어(dskio_done = nop/ret, 09-09 실측) 단독 부트는
+         불가능하지만, 게임 커널이 page0 을 디스크 ROM 슬롯으로 스왑하고 부르는
+         루틴들(0x30xx+)은 이 코드에 산다 — 룬마스터 1 의 커널이 RET 채움 cart
+         에서 루틴을 못 찾아 빈 RAM 으로 미끄러지던 경로(실측). 부트 섹터 로드와
+         BIOS 엔트리는 여전히 HLE 트랩이 서빙한다. *)
+     load_cartridge ~mapper:Flat t (Bytes.to_string real)
    | None ->
      if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ())
      else begin
