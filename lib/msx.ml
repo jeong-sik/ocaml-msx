@@ -310,6 +310,13 @@ let mem_read m addr =
         && Bytes.length m.disk > 0 && Bytes.length m.cart >= 0x4000
       then
         Char.code (Bytes.get m.cart (min off (Bytes.length m.cart - 1)))
+      else if m.slot3_sel land 3 = 3 && page = 0 then
+        (* NMS8250 의 서브 3 은 미장착 — page 0 자리에서 읽으면 빈 버스
+           (0xFF). 빈 RAM(0x00=NOP)을 보이면 빈 슬롯을 기대한 코드가 NOP
+           미끄럼으로 64K 를 돌아 리셋까지 흐른다. 룬마스터 1: 커널이
+           slot3_sel=7 을 쓰고 page 0 을 그 서브로 스왑 — 0xFF 를 받아야
+           갈림길에서 살아남는다(16콜 재부팅 루프 → 14000+콜 로더 진행). *)
+        0xff
       else begin
         let seg = m.mapper.(page) in
         let base = ((seg * 0x4000) + off) mod (Bytes.length m.ram) in
