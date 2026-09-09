@@ -329,6 +329,12 @@ let set_reg t r v =
        흘러들면 다음 색의 채널이 한 칸 어긋난다. *)
     t.pal_first <- None
   end
+  else if r = 0 && v land 0x10 = 0 then
+    (* IE1 을 끄면 라인 인터럽트 플래그(S#1 bit0)도 지운다 — openMSX 가
+       R#0 쓰기에서 irqHorizontal.reset() 하는 것과 같은 계약. 이 게이트가
+       없으면 IE1=0 인 게임이 매 프레임 FH=1 을 읽는다 (룬마스터 II 의
+       갤러리 핸들러가 5109 증가 경로를 영원히 건너뛰어 프리즈). *)
+    t.status1 <- t.status1 land 0xfe
 
 let palette_rgb t i =
   if i land 0x10 = 0 then grb_to_rgb t.palette.(i land 15)
@@ -441,8 +447,14 @@ let advance t ~cycles =
       t.int_pending <- true;
       hit := true
     end;
-    (* 라인 인터럽트: 표시 라인이 R#19 와 같아질 때 S#1 bit0. *)
-    if t.line < visible_lines t && t.line = t.regs.(19) then begin
+    (* 라인 인터럽트: 표시 라인이 R#19 와 같아질 때 S#1 bit0. FH 플래그는
+       IE1(R#0 bit4) 이 켜져 있을 때만 래치된다 — V9938 정본(openMSX
+       execHScan: "if (controlRegs[0] & 0x10)"). IE1 없이도 세우면 IE1=0 으로
+       라인 인터럽트를 쓰지 않는 게임이 매 프레임 S#1 읽기에서 1 을 본다. *)
+    if
+      t.regs.(0) land 0x10 <> 0
+      && t.line < visible_lines t && t.line = t.regs.(19)
+    then begin
       t.status1 <- t.status1 lor 1;
       t.int_pending <- true;
       hit := true

@@ -23,6 +23,7 @@ type key =
   | Function of int
   | Char of char
   | Backspace
+  | Select
 
 type machine = {
   ram_kb : int;  (** 64 / 128 / 256 / 512 *)
@@ -42,6 +43,12 @@ type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
 val create : machine:machine -> t
 
 val name : t -> string
+
+
+val fdc_recent_calls : unit -> (int * int * int) array
+(** Recent FDC port touches (kind, port, value), newest last, ring of 256.
+    kind 0 = read, 1 = write. Boot diagnosis for loaders that program the
+    WD279x directly instead of calling the disk BIOS entries. *)
 
 val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
@@ -67,7 +74,7 @@ val mem_write : t -> int -> int -> unit
 (** Write a byte at a 16-bit address as the Z80 would — into RAM, or as a bank
     select in a MegaROM's cart window. For tests and debugging. *)
 
-val load_disk : ?interface_rom:bool -> t -> string -> unit
+val load_disk : ?interface_rom:bool -> ?real_rom:bool -> t -> string -> unit
 (** Plug a floppy image (raw .dsk, 512 bytes a sector) into drive A. By
     default a disk interface ROM rides in the cartridge slot: C-BIOS finds its
     "AB" header and calls INIT, whose BIOS entries are HLE traps the step loop

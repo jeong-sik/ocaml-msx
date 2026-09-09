@@ -52,3 +52,8 @@
  (name fat12_write_test)
  (modules fat12_write_test)
  (libraries msx))
+
+(test
+ (name vdp_line_test)
+ (modules vdp_line_test)
+ (libraries msx))
