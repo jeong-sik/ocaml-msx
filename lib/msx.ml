@@ -275,6 +275,14 @@ let mem_read m addr =
       if m.slot3_sel land 3 = 0 && page <> 3 then
         (* sub ROM 은 페이지0·1 자리. *)
         Char.code (Bytes.get m.sub_rom off)
+      else if
+        m.slot3_sel land 3 = 1 && page <> 3
+        && Bytes.length m.disk > 0 && Bytes.length m.cart >= 0x4000
+      then
+        (* 서브슬롯 3-1: 디스크 인터페이스 ROM 이 여기에도 뜬다. 실기에서
+           내장 FDC 는 통상 슬롯3 확장에 살고, 슬롯3 를 훑어 인터페이스를
+           찾는 로더(룬마스터 II 의 2nd stage)가 "AB" 헤더를 발견하게 한다. *)
+        Char.code (Bytes.get m.cart (min off (Bytes.length m.cart - 1)))
       else begin
         let seg = m.mapper.(page) in
         let base = ((seg * 0x4000) + off) mod (Bytes.length m.ram) in
@@ -642,6 +650,22 @@ let boot_disk t =
     t.ppi_a <- 0xfb;
     t.slot3_sel <- t.slot3_sel lor 0x02;
     t.rst30_pending <- [];
+    (* SCNCNT(0xF3F6) 를 성숙 주기(3) 로 시드한다. KEYINT 의 키 스캔은 이 카운터가
+       0 까로 내려올 때만 도는데, 재생 시점의 RAM 이 부팅 직후(0) 라면 첫 스캔이
+       256 인터럽트 뒤에야 온다. 실기는 디스크 로딩 동안 카운터가 이미 성숙해
+       게임 첫 프레임부터 스캔이 돈다. "PRESS SPACE KEY" 타이틀이 스페이스를
+       못 받고 타임아웃 리셋을 거는 것(룬마스터 1)이 이 창 때문이었다.
+       게임이 로드되며 매퍼를 다시 배선하면(룬마스터 1 은 page3 을 seg0 으로
+       돌린다) 시드한 물리 세그먼트가 보이지 않게 되므로, page3 이 가리킬 수
+       있는 세그먼트 전부에 심는다 — 0xF3F6 매핑이 어느 물리로 갈려도 성숙해
+       있어야 실기의 "로딩 끝난 상태"와 같다. *)
+    let saved_p3 = t.mapper.(3) in
+    let nseg = Bytes.length t.ram / 0x4000 in
+    for s = 0 to nseg - 1 do
+      t.mapper.(3) <- s;
+      mem_write t 0xf3f6 3
+    done;
+    t.mapper.(3) <- saved_p3;
     Z80.set_sp t.cpu 0xf51f;
     Z80.set_af t.cpu ((0x00 lsl 8) lor 0x01);
     Z80.set_pc t.cpu 0xc01e;
@@ -818,6 +842,14 @@ let disk_trap t pc =
         (* _DIRIO: console in/out. No console -- an input poll (E=0xFF) gets
            "no character ready" (A=0), output is consumed. *)
         0x00
+      | 0x07 ->
+        (* _DIRIN: direct console input. Served non-blockingly from the
+           keyboard matrix: the space bar (row 8, bit 0) reports its ASCII
+           code while held, nothing held reads A=0. What a "press any key"
+           loader needs -- without it every poll fails (0xFF) and the loader
+           restarts its boot loop forever (Rune Master II does exactly
+           this). *)
+        (if t.keys.((8 * 8) + 0) then 0x20 else 0x00)
       | 0x09 ->
         (* _STROUT: print a '$'-terminated string -- consumed, no console. *)
         0x00
