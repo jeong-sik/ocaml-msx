@@ -994,6 +994,25 @@ let disk_trap t pc =
     Z80.set_pc t.cpu (serve_calslt t);
     true
   end
+  else if pc = 0x000c && t.ppi_a land 3 = 3 then begin
+    (* sec3 커널(룬마스터)의 1바이트 읽기 벡터. 실기는 디스크 인터럽트
+       핸들러가 A'(ex af,af') 로 읽은 바이트를 싣고 c1d4 의 얕은 복귀가
+       그것을 넘긴다 — c713 을 세우는 그 인터럽트가 없는 HLE 에선 재귀가
+       폭발한다(룬마스터 1 실측: 스택 오염 → ld (de),a 가 자기 코드에
+       0xC7=RST0 을 심어 부트가 재시작). 등가: HL 이 가리키는 디스크
+       바이트를 A 에 곧바로 실어 복귀시킨다 — 즉시-완료라 c44c 폴링
+       관점에서 실기와 같다. 룬마스터 II 의 c1f5 사슬은 이 벡터를
+       스스로 완주하므로 page0 에 jp 가 심겨 있지 않으면(=call 0000c 가
+       NOP 미끄럼으로만 여기 올 수 있으면) 발동하지 않는다. *)
+    let hl = Z80.dump_hl t.cpu in
+    Z80.set_af t.cpu (((dsk_u8 t hl) lsl 8) lor Z80.dump_f t.cpu);
+    Z80.set_hl t.cpu ((hl + 1) land 0xffff);
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+    Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+    Z80.set_pc t.cpu ret;
+    true
+  end
   else if pc >= 0x4000 && pc < 0x8000
           && (let slot = (t.ppi_a lsr 2) land 3 in slot = 0 || slot = 3) then false
   else if pc = disk_init_entry then begin
@@ -1181,6 +1200,20 @@ let disk_trap t pc =
       | 0x1a ->
         t.disk_dma <- de;
         0x00
+      | 0x01 -> (
+        (* _CONIN: KEYBUF 링(0xFBF0 40바이트)에서 한 문자 pop — C-BIOS
+           KEYINT 가 키 스캔으로 push 한 것. PUTPNT 0xF3F8 / GETPNT
+           0xF3FA 값은 버퍼의 페이지 내 오프셋(0xF0+인덱스, 실측) —
+           비었으면 0xFF(커널의 재시도 코드). *)
+        let putp = mem_read t 0xf3f8 and getp = mem_read t 0xf3fa in
+        if getp = putp then 0xff
+        else begin
+          let idx = getp - 0xf0 in
+          let c = mem_read t (0xfbf0 + idx) in
+          let next = 0xf0 + ((idx + 1) mod 40) in
+          mem_write t 0xf3fa next;
+          c
+        end)
       | 0x0d ->
         (* Disk reset: default drive A, DMA back to 0x0080. *)
         t.disk_dma <- 0x0080;
