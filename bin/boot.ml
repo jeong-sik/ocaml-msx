@@ -12,6 +12,29 @@ let disk = ref ""
 let disk_warm = ref false
 let cart_mapper = ref ""
 let tap_space : int list ref = ref []
+let tap_keys : (int * Msx.key) list ref = ref []
+let tap_key_spec = ref ""
+
+let key_of_name = function
+  | "up" -> Msx.Up | "down" -> Msx.Down
+  | "left" -> Msx.Left | "right" -> Msx.Right
+  | "space" -> Msx.Space | "esc" -> Msx.Esc
+  | "return" -> Msx.Return | "backspace" -> Msx.Backspace
+  | "select" -> Msx.Select
+  | "shift" -> Msx.Shift | "ctrl" -> Msx.Ctrl | "graph" -> Msx.Graph
+  | "trigger_a" -> Msx.Trigger_a | "trigger_b" -> Msx.Trigger_b
+  | "f1" -> Msx.Function 1 | "f2" -> Msx.Function 2
+  | "f3" -> Msx.Function 3 | "f4" -> Msx.Function 4
+  | "f5" -> Msx.Function 5
+  | other -> Printf.ksprintf failwith "unknown --tap-key name %s" other
+
+let parse_tap_keys spec =
+  List.map
+    (fun pair ->
+      match String.split_on_char ':' pair with
+      | [ f; name ] -> (int_of_string f, key_of_name name)
+      | _ -> Printf.ksprintf failwith "bad --tap-key entry %s" pair)
+    (String.split_on_char ',' spec)
 let assert_boot = ref false
 
 let contains_sub hay needle =
@@ -51,6 +74,9 @@ let () =
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
         "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
+      ( "--tap-key",
+        Arg.String (fun spec -> tap_key_spec := spec),
+        "F:KEY[,F:KEY..]  해당 프레임에 키 탭 (space/return/up/.../shift/a)" );
       ( "--tap-space",
         Arg.String
           (fun s -> tap_space := List.map int_of_string (String.split_on_char ',' s)),
@@ -87,7 +113,8 @@ let () =
   end;
   if !disk <> "" then begin
     Msx.load_disk ~interface_rom:(not !disk_warm) t (read_file !disk);
-    Msx.set_disk_call_log true
+    if !tap_key_spec <> "" then tap_keys := parse_tap_keys !tap_key_spec;
+  Msx.set_disk_call_log true
   end;
   Msx.set_ldirvm_log true;
   Msx.set_pc_hist true;
@@ -133,6 +160,11 @@ let () =
       if List.mem !ridx !tap_space then assert (Msx.set_key t Space ~pressed:true);
       if List.exists (fun f -> f + 5 = !ridx) !tap_space then
         assert (Msx.set_key t Space ~pressed:false);
+      List.iter
+        (fun (f, k) ->
+          if !ridx = f then ignore (Msx.set_key t k ~pressed:true);
+          if !ridx = f + 5 then ignore (Msx.set_key t k ~pressed:false))
+        !tap_keys;
       ring.(!ridx land 63) <- Msx.dump_pc t;
       incr ridx;
       let dlo, dhi =
