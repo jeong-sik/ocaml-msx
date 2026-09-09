@@ -242,9 +242,11 @@ let () =
   if !disk <> "" then begin
     let calls = Msx.disk_call_entries () in
     Printf.printf "disk calls=%d\n" (List.length calls);
+    let n_calls = List.length calls in
     List.iteri
       (fun i (pc, a, bc, de, hl, f) ->
-        if i < 20 then
+        (* 처음 20 개는 부트 관행, 마지막 20 개는 도달한 국면의 관행 *)
+        if i < 20 || i >= n_calls - 20 then
           Printf.printf "  disk @%04x a=%02x bc=%04x de(sec)=%04x hl(addr)=%04x f=%02x\n"
             pc a bc de hl f)
       calls;
