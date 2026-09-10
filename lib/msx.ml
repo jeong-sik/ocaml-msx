@@ -288,9 +288,13 @@ let fdc_status m =
      루프의 관찰된 원인). *)
   let base = if Bytes.length m.disk = 0 then 0x80 else 0x00 in
   let trk0 = if f.track = 0 then 0x04 else 0x00 in
+  (* Type I 명령(RESTORE/SEEK/STEP) 상태의 bit5 = 헤드 적재. 모터가 돌면
+     헤드가 디스크에 닿는다(즉시-완료 근사) — 이 비트가 없으면 실 디스크
+     ROM 의 드라이브 검색이 헤드 적재를 폴링하다 영원히 못 넘어간다. *)
+  let head = if f.motor && Bytes.length m.disk > 0 then 0x20 else 0x00 in
   let drq = if f.drq then 0x02 else 0x00 in
   let busy = if f.busy then 0x01 else 0x00 in
-  base lor trk0 lor drq lor busy
+  base lor trk0 lor head lor drq lor busy
 
 let fdc_load_sector m =
   let f = m.fdc in
@@ -366,6 +370,13 @@ let fdc_recent_calls () =
   Array.init (min !fdc_log_i 256) (fun k -> fdc_log.((!fdc_log_i - min !fdc_log_i 256 + k) land 255))
 
 
+(* 0xFFFF 서브슬롯 레지스터의 페이지별 해석: 8비트가 4페이지 × 2비트로
+   각 페이지가 볼 슬롯3 의 서브를 따로 고른다(bits0-1=page0 … bits6-7=page3).
+   실기 BIOS/C-BIOS 의 RAM 검색(chkram: 0xFFFF 에 0xF0,0xE0,… 를 쓰며 순회)
+   은 이 배치로 서브 조합을 만든다 — 단일 2비트로 읽으면 0x80(=page3 서브2,
+   RAM)이 서브0(sub ROM)로 뭉개져 "MEMORY NOT FOUND" 가 난다(실측). *)
+let slot3_sub m page = (m.slot3_sel lsr (page * 2)) land 3
+
 let mem_read m addr =
   let a = addr land 0xffff in
   let page = a lsr 14 in
@@ -380,29 +391,39 @@ let mem_read m addr =
   else if
     a land 0x3ff8 = 0x3ff8
     && ((slot = 2 && Bytes.length m.cart >= 0x4000)
-        || (slot = 3 && m.slot3_sel land 3 = 2 && Bytes.length m.cart >= 0x4000))
+        || (slot = 3 && slot3_sub m page = 3 && Bytes.length m.cart >= 0x4000))
     && Bytes.length m.disk > 0
   then
     (* NMS8250 의 WD2793 은 I/O 포트가 아니라 메모리 매핑: 인터페이스 슬롯의
        페이지마다 0x3FF8-0x3FFF 창(=0x7FF8-0x7FFF 미러)에 상태/트랙/섹터/데이터
        레지스터가 보인다(openMSX 설정 문서: "FDC registers are visible in all
        4 pages"). 실 디스크 ROM(0x782B 폴링 루프)은 이 창으로만 칩을 다룬다.
-       +0..3 = WD279x 포트 0xD0..0xD3, 0x7FFC = 사이드/모터 시스템 레지스터. *)
+       +0..3 = WD279x 포트 0xD0..0xD3, 0x7FFC = 사이드/모터 시스템 레지스터.
+       인터페이스 슬롯은 서브2(레거시 rm2 배선)와 서브3(정본 NMS8250 배치,
+       hardwareconfig rom_visibility 참조) 양쪽에서 보인다. *)
     (match a land 7 with
      | 0 | 1 | 2 | 3 -> fdc_read m ((a land 7) + 0xd0)
-     | 4 -> m.fdc.side_reg
+     | 4 ->
+       fdc_note 0 0xd4 m.fdc.side_reg;
+       m.fdc.side_reg
      | 5 ->
        (* DSKCHG: bit2 는 디스크가 바뀌지 않았을 때 1 (openMSX PhilipsFDC
           정본: `driveReg & ~4 | (diskChanged ? 0 : 4)` — 항상 안 바뀜). *)
-       m.fdc.drive_reg lor 0x04
+       let v = m.fdc.drive_reg lor 0x04 in
+       fdc_note 0 0xd5 v;
+       v
      | 6 -> 0xff
      | _ ->
        (* DRQ/INTRQ 상태: 풀업 0xFF 기반 active-low — DRQ active 면 bit7
           클리어, INTRQ active 면 bit6 클리어 (openMSX 정본). 실ROM 의
           바이트 펌프(0x760C)가 이 비트들을 기다린다. *)
-       0xff
-       land (if m.fdc.drq then lnot 0x80 else 0xff)
-       land (if m.fdc.intr then lnot 0x40 else 0xff))
+       let v =
+         0xff
+         land (if m.fdc.drq then lnot 0x80 else 0xff)
+         land (if m.fdc.intr then lnot 0x40 else 0xff)
+       in
+       fdc_note 0 0xd7 v;
+       v)
   else if
     a >= 0x4000 && a < 0xc000 && slot = 2 && m.cart_mapper <> Flat
     && Bytes.length m.cart > 0
@@ -462,46 +483,39 @@ let mem_read m addr =
         | 2, 1 ->
           if Bytes.length m.cart >= 0x4000 then (m.cart, cart_off)
           else (m.main_rom, off)
-        | 2, 3 | 1, 3 | 0, 3 -> (m.main_rom, off)
+        | 0, 3 | 1, 3 | 2, 3 ->
+          (* 실기 NMS8250: 슬롯0-2 의 page3(0xC000-) 는 빈 버스(0xFF) 다.
+             main ROM(32KB) 이 page0-1 까지라 page3 에서 그 마지막 바이트를
+             미러로 보이면, BIOS 의 서브슬롯 판정 루틴(0x7B8D-0x7BB2: ppi 를
+             0x00/0x40/0x80/0xC0 로 돌려 page3 를 슬롯0-3 으로 맞추고 0xFFFF
+             를 읽어 CPL 한 값을 fcc5-8 에 기록)이 "슬롯0 page3 unmapped" 판정
+             을 ROM 미러값으로 오염시킨다 — 실측 fcc5=0xE7 = CPL(main ROM
+             0x3FFF=0x18), 실기는 CPL(0xFF)=0x00. 이 테이블을 훑는 카트 스캔
+             순회가 스킵돼 디스크 부트 대신 BASIC 폴백한다. *)
+          (Bytes.make 0 '\000', 0)
         | _ -> (m.logo_rom, off)
       in
       if Bytes.length rom = 0 then 0xff
       else Char.code (Bytes.get rom (min roff (Bytes.length rom - 1)))
     | _ ->
-      (* 슬롯3: 2차 선택 (0xFFFF 하위 2비트×4, 여기선 전 페이지 단일값).
-         서브 배치는 NMS8250 실기를 따른다 — 3-0 = RAM 매퍼, 3-1 = sub ROM,
-         3-2 = 디스크 인터페이스 ROM. 커널류 로더가 EXPTBL 을 훑어 0xFFFF 를
-         2 로 쓰고 0x4000 을 읽으면 "AB" 를 발견하게 된다(룬마스터 II 실측:
-         3-1 에 두면 드라이브 슬롯 순회가 끝나지 않는다). *)
-      if m.slot3_sel land 3 = 1 && page <> 3 then
-        (* sub ROM 은 페이지0·1 자리. *)
-        Char.code (Bytes.get m.sub_rom off)
-      else if
-        m.slot3_sel land 3 = 3 && page = 1
-        && Bytes.length m.disk > 0 && Bytes.length m.cart >= 0x4000
-      then
-        (* openMSX 정본 NMS8250 배치는 서브3 = 디스크 인터페이스(ROM 은
-           page1 0x4000-0x7FFF 에만, rom_visibility). 실 BIOS 의 카트 INIT
-           스캔이 이 자리에서 "AB" 헤더와 INIT 벡터를 찾는다. 기존 3-2 뷰는
-           레거시 경로(룬마스터 II 워밍업 재생)를 위해 그대로 둔다. *)
-        Char.code (Bytes.get m.cart (min off (Bytes.length m.cart - 1)))
-      else if
-        m.slot3_sel land 3 = 2 && page <> 3
-        && Bytes.length m.disk > 0 && Bytes.length m.cart >= 0x4000
-      then
-        Char.code (Bytes.get m.cart (min off (Bytes.length m.cart - 1)))
-      else if m.slot3_sel land 3 = 3 && page = 0 then
-        (* NMS8250 의 서브 3 은 미장착 — page 0 자리에서 읽으면 빈 버스
-           (0xFF). 빈 RAM(0x00=NOP)을 보이면 빈 슬롯을 기대한 코드가 NOP
-           미끄럼으로 64K 를 돌아 리셋까지 흐른다. 룬마스터 1: 커널이
-           slot3_sel=7 을 쓰고 page 0 을 그 서브로 스왑 — 0xFF 를 받아야
-           갈림길에서 살아남는다(16콜 재부팅 루프 → 14000+콜 로더 진행). *)
-        0xff
-      else begin
+      (* 슬롯3 의 2차 배치는 openMSX 정본 Philips_NMS_8250 과 같다:
+         3-0 = sub ROM(16KB 가 슬롯 전 페이지에 미러 — "mirrored all over
+         the slot"), 3-1 = 빈 버스, 3-2 = RAM 매퍼(128KB), 3-3 = WD2793 디스크
+         인터페이스(ROM 은 page1 에만 보이고 FDC 레지스터 창은 전 페이지).
+         이전 배치(3-0=RAM, 3-1=sub, 3-2=cart)는 워밍업 재생을 위해 섞은
+         것이라 실 BIOS 의 RAM 검색(0x7D5D: 0xEF00 쓰고 되읽기)이 서브3 의
+         page2·3 을 RAM 으로 오인, EXPTBL(fcc8) 오염으로 이어졌다(실측). *)
+      match slot3_sub m page with
+      | 0 -> Char.code (Bytes.get m.sub_rom (off land 0x3fff))
+      | 1 -> 0xff
+      | 2 ->
         let seg = m.mapper.(page) in
         let base = ((seg * 0x4000) + off) mod (Bytes.length m.ram) in
         Char.code (Bytes.get m.ram base)
-      end
+      | _ ->
+        if page = 1 && Bytes.length m.disk > 0 && Bytes.length m.cart >= 0x4000
+        then Char.code (Bytes.get m.cart (min off (Bytes.length m.cart - 1)))
+        else 0xff
   end
 
 let mem_write m addr v =
@@ -518,7 +532,7 @@ let mem_write m addr v =
   else if
     a land 0x3ff8 = 0x3ff8
     && ((slot = 2 && Bytes.length m.cart >= 0x4000)
-        || (slot = 3 && m.slot3_sel land 3 = 2 && Bytes.length m.cart >= 0x4000))
+        || (slot = 3 && slot3_sub m page = 3 && Bytes.length m.cart >= 0x4000))
     && Bytes.length m.disk > 0
   then
     (* 메모리 매핑 FDC 창의 쓰기 면(읽기 면의 주석 참조): +0..3 = WD279x
@@ -528,9 +542,11 @@ let mem_write m addr v =
     (match a land 7 with
      | 0 | 1 | 2 | 3 -> fdc_write m ((a land 7) + 0xd0) v
      | 4 ->
+       fdc_note 1 0xd4 v;
        m.fdc.side_reg <- v land 0xff;
        m.fdc.side <- v land 1
      | 5 ->
+       fdc_note 1 0xd5 v;
        m.fdc.drive_reg <- v land 0xff;
        m.fdc.motor <- v land 0x80 <> 0
      | _ -> ())
@@ -551,7 +567,9 @@ let mem_write m addr v =
       (* Otherwise a write into the cart window is a bank select, not a store. *)
       cart_bank_write m a (v land 0xff)
   end
-  else if slot = 3 && (m.slot3_sel land 3 = 0 || page = 3) then begin
+  else if slot = 3 && slot3_sub m page = 2 then begin
+    (* 슬롯3 의 쓰기 면은 정본 배치에서 서브2(RAM 매퍼)뿐 — sub ROM(서브0)
+       과 디스크 인터페이스(서브3)는 ROM/버스라 쓰기가 무시된다. *)
     let seg = m.mapper.(page) in
     let base = ((seg * 0x4000) + (a land 0x3fff)) mod (Bytes.length m.ram) in
     Bytes.set m.ram base (Char.chr (v land 0xff))
@@ -990,19 +1008,24 @@ let boot_disk t =
       t.cart_banks.(2) <- 2;
       t.cart_banks.(3) <- 3
     end;
-    disk_transfer t ~write:false ~sector:0 ~count:1 ~addr:0xc000;
+    (* 배선 시드를 부트섹터 심기보다 먼저: transfer 의 쓰기는 현재 ppi·서브
+       슬롯 뷰를 따라가므로, 호출자가 남긴 배선(예: page3 가 sub ROM 을 보는
+       조합)에서 심으면 부트섹터가 사라진다(fat12_write_test 실측 — 서브0 이
+       RAM 이던 예전 배선에선 우연히 성공). page0·2·3 = 슬롯3-서브2(RAM 매퍼),
+       page1 = 슬롯2(인터페이스 ROM) 의 재생 배선을 먼저 둔다. *)
     t.ppi_a <- 0xfb;
-    (* page0-3 전부 슬롯3 인 ppi 에서 서브슬롯0 = RAM 매퍼(NMS8250 배치).
-       실기의 디스크 ROM 부트는 EXPTBL(슬롯 확장·식별자)과 RAMAD0-3(RAM 이
-       사는 슬롯)도 채워 두는데 C-BIOS 워밍업은 우리 배치를 거기에 기록하지
-       않는다 — EXPTBL 을 훑는 2nd stage 커널(룬마스터 II)이 드라이브를
-       못 찾아 슬롯 순회가 끝나지 않았다(실측). 서브는 단순(0x00), RAM 는
-       slot3-0 = 식별자 0x80|(0<<2)|3. *)
-    t.slot3_sel <- t.slot3_sel land 0xfc;
-    mem_write t 0xfcc4 0x83;
+    (* page0-3 전부 슬롯3 인 ppi 에서 서브2 = RAM 매퍼(정본 NMS8250 배치 —
+       슬롯3 은 3-0=sub ROM, 3-2=RAM, 3-3=FDC). 실기의 디스크 ROM 부트는
+       EXPTBL(슬롯 확장)과 RAMAD0-3(RAM 이 사는 슬롯)을 채워 두는데 C-BIOS
+       워밍업은 그 기록을 남기지 않는다 — EXPTBL 을 훑는 2nd stage 커널(룬
+       마스터 II)이 드라이브를 못 찾아 슬롯 순회가 끝나지 않았다(실측).
+       RAMAD0-3 = RAM 슬롯의 식별자 0x80|(2<<2)|3 = 0x8B. *)
+    t.slot3_sel <- 0xaa;
+    disk_transfer t ~write:false ~sector:0 ~count:1 ~addr:0xc000;
+    mem_write t 0xfcc4 0x80;
     for i = 0 to 3 do
       mem_write t (0xfcc5 + i) 0x00;
-      mem_write t (0xf340 + i) 0x83
+      mem_write t (0xf340 + i) 0x8b
     done;
     t.rst30_pending <- [];
     (* KEYBUF 에 스페이스 하나를 미리 넣어둔다 — 룬마스터 1 의 커널은
@@ -1148,10 +1171,14 @@ let serve_calslt t =
   t.ppi_a <-
     (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
   (* An expanded slot 3 target also selects its sub-slot for the target's
-     page. The replay's CALSLT callers so far only target slot 0 (RSLREG),
-     which leaves [slot3_sel] alone. *)
-  if slot land 0x80 <> 0 && (slot land 3) = 3 && page <> 3 then
-    t.slot3_sel <- (t.slot3_sel land 0xfc) lor ((slot lsr 2) land 3);
+     page — the page's own 2-bit field of the 0xFFFF register (see
+     {!slot3_sub}). The replay's CALSLT callers so far only target slot 0
+     (RSLREG), which leaves [slot3_sel] alone. *)
+  if slot land 0x80 <> 0 && (slot land 3) = 3 && page <> 3 then begin
+    let shift = page * 2 in
+    t.slot3_sel <-
+      (t.slot3_sel land lnot (3 lsl shift)) lor (((slot lsr 2) land 3) lsl shift)
+  end;
   target
 
 (* Serviced in the step loop before the opcode at [pc] runs. Returns true when
@@ -1238,7 +1265,10 @@ let disk_trap t pc =
         else begin
           t.ppi_a <-
             (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor (primary lsl shift);
-          if primary = 3 then t.slot3_sel <- (t.slot3_sel land 0xfc) lor sub;
+          if primary = 3 then
+            t.slot3_sel <-
+              (t.slot3_sel land lnot (3 lsl shift))
+              lor (sub lsl shift);
           let b = mem_read t ((hl + off) land 0xffff) in
           t.ppi_a <- saved_ppi;
           t.slot3_sel <- saved_sl3;
@@ -1297,7 +1327,10 @@ let disk_trap t pc =
        holds its stack (the kernel sets SP=0x9000). Without RAM in page 2 the
        stack lands on the logo ROM and CALL/RET reads back garbage. *)
     t.ppi_a <- (t.ppi_a land 0xcc) lor 0x33;
-    t.slot3_sel <- t.slot3_sel land 0xfc;
+    (* page0·2 를 슬롯3 의 RAM(정본 배치의 서브2) 으로: 0xFFFF 레지스터의
+       해당 페이지 필드만 2 로 둔다(전 페이지를 한 값으로 두던 예전 관례는
+       서브0 이 RAM 이던 배선의 것). *)
+    t.slot3_sel <- (t.slot3_sel land 0xcc) lor 0x22;
     (* Enter the boot sector at +0x1e with carry SET: its first byte is RET NC,
        which the disk ROM uses to bail when the sector is not bootable. Carry
        set means "boot this", so the code runs instead of returning. *)
