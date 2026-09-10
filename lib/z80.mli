@@ -51,6 +51,7 @@ val dump_bc : t -> int
 val dump_de : t -> int
 val dump_hl : t -> int
 val dump_f : t -> int
+val dump_iff1 : t -> bool
 val dump_ix : t -> int
 val dump_iy : t -> int
 val set_ix : t -> int -> unit
