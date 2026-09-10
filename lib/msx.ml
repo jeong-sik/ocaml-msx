@@ -103,6 +103,8 @@ type fdc_state = {
   mutable intr : bool;
   buf : Bytes.t;             (** READ SECTOR 버퍼, 512 *)
   mutable pos : int;
+  mutable side_reg : int;   (** Philips 0x7FFC: bit0 = side *)
+  mutable drive_reg : int;  (** Philips 0x7FFD: bits0-1 drive, bit7 motor *)
 }
 
 type t = {
@@ -259,6 +261,8 @@ let fdc_create () =
     intr = false;
     buf = Bytes.make 512 '\000';
     pos = 0;
+    side_reg = 0;
+    drive_reg = 0;
   }
 
 let fdc_status m =
@@ -324,8 +328,11 @@ let fdc_read m port =
   | 0xD0 ->
       let st = fdc_status m in
       fdc_note 0 0xD0 st;
-      (* 상태 읽기가 seek 완료를 소비한다 — 즉시-완료 모델의 표현. *)
+      (* 상태 읽기가 seek 완료를 소비한다 — 즉시-완료 모델의 표현. 실칩과
+         같이 상태 읽기가 INTRQ 도 내린다: 실 디스크 ROM 은 EX (SP),HL 쌍
+         사이에 park 한 복귀 주소를 INTRQ 인터럽트 핸들러가 소비한다. *)
       f.busy <- false;
+      f.intr <- false;
       st
   | 0xD1 -> f.track
   | 0xD2 -> f.sector
@@ -368,12 +375,19 @@ let mem_read m addr =
        +0..3 = WD279x 포트 0xD0..0xD3, 0x7FFC = 사이드/모터 시스템 레지스터. *)
     (match a land 7 with
      | 0 | 1 | 2 | 3 -> fdc_read m ((a land 7) + 0xd0)
+     | 4 -> m.fdc.side_reg
+     | 5 ->
+       (* DSKCHG: bit2 는 디스크가 바뀌지 않았을 때 1 (openMSX PhilipsFDC
+          정본: `driveReg & ~4 | (diskChanged ? 0 : 4)` — 항상 안 바뀜). *)
+       m.fdc.drive_reg lor 0x04
+     | 6 -> 0xff
      | _ ->
-       (* 시스템 레지스터(0x7FFC-0x7FFF)의 읽기 면: 디스크 변경(DSKCHG)·
-          라이트 프로텍트 검출 비트를 포함한다. 0xFF 를 돌려주면 실ROM 이
-          "디스크가 바뀌었다/없다"로 판정해 READ SECTOR 없이 드라이브를
-          리셋하는 루프에 빠진다(실측). 정상 상태 0x00. *)
-       0x00)
+       (* DRQ/INTRQ 상태: 풀업 0xFF 기반 active-low — DRQ active 면 bit7
+          클리어, INTRQ active 면 bit6 클리어 (openMSX 정본). 실ROM 의
+          바이트 펌프(0x760C)가 이 비트들을 기다린다. *)
+       0xff
+       land (if m.fdc.drq then lnot 0x80 else 0xff)
+       land (if m.fdc.intr then lnot 0x40 else 0xff))
   else if
     a >= 0x4000 && a < 0xc000 && slot = 2 && m.cart_mapper <> Flat
     && Bytes.length m.cart > 0
@@ -474,11 +488,18 @@ let mem_write m addr v =
     && Bytes.length m.disk > 0
   then
     (* 메모리 매핑 FDC 창의 쓰기 면(읽기 면의 주석 참조): +0..3 = WD279x
-       포트 0xD0-0xD3(명령/트랙/섹터/데이터), +4..7 = 사이드/모터 시스템
-       레지스터(포트 0xD4 등가). *)
+       포트 0xD0-0xD3(명령/트랙/섹터/데이터), +4 = 사이드(bit0), +5 =
+       드라이브(bits0-1)·모터(bit7) — 0xD4 포트 계열과는 비트 배치가 다르다
+       (openMSX PhilipsFDC 정본). *)
     (match a land 7 with
      | 0 | 1 | 2 | 3 -> fdc_write m ((a land 7) + 0xd0) v
-     | _ -> fdc_write m 0xd4 v)
+     | 4 ->
+       m.fdc.side_reg <- v land 0xff;
+       m.fdc.side <- v land 1
+     | 5 ->
+       m.fdc.drive_reg <- v land 0xff;
+       m.fdc.motor <- v land 0x80 <> 0
+     | _ -> ())
   else if
     slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
   then begin
@@ -1575,7 +1596,10 @@ let step t ~frames =
   for _ = 1 to frames do
     let budget = ref cycles_per_frame in
     while !budget > 0 do
-      if Vdp.int_active t.vdp then ignore (Z80.interrupt t.cpu);
+      (* VDP 인터럽트와 FDC INTRQ 를 같은 INT 선으로: 실기에서 WD2793 의
+         INTRQ 는 디스크 인터페이스가 MSX 인터럽트 사슬에 끼워 넣는다(실
+         디스크 ROM 의 INIT 가 설치한 핸들러가 0x0038 사슬에서 소비). *)
+      if Vdp.int_active t.vdp || t.fdc.intr then ignore (Z80.interrupt t.cpu);
       let pc0 = Z80.dump_pc t.cpu in
       (match !trace_from with
        | Some (target, n) when pc0 = target && !trace_remaining = 0 ->
