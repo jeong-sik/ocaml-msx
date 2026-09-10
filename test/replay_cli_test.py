@@ -14,7 +14,7 @@ def firmware(directory):
     directory.mkdir()
     # Select RAM in page 3 and keyboard row 8. Increment a RAM counter and
     # continuously sample SPACE, so restored execution has a guest-visible effect.
-    setup = bytes.fromhex("31 00 f0 3e c0 d3 a8 3e 08 d3 aa 21 00 c0")
+    setup = bytes.fromhex("31 00 f0 3e c0 d3 a8 3e 80 32 ff ff 3e 08 d3 aa 21 00 c0")
     loop = bytes.fromhex("34 db a9 32 01 c0 c3") + struct.pack("<H", len(setup))
     (directory / "cbios_main_msx2.rom").write_bytes((setup + loop).ljust(32768, b"\0"))
     for name in ("cbios_logo_msx2.rom", "cbios_sub.rom"):
