@@ -135,6 +135,18 @@ type t = {
           부족하다 (삼국지2 는 _OPEN 을 6번 부른다). *)
   mutable frames : int;
   mutable rtc_reg : int;
+      (** RTC(RP5C01) 의 어드레스 래치(포트 0xB4 로 선택한 레지스터 번호). *)
+  rtc_regs : int array;
+      (** RP5C01 레지스터 파일 52니블 = 4뱅크 × 13레지스터(openMSX RP5C01
+          정본: bank = 모드 레지스터 bit0-1, 0=시계 1=알람/RAM 2·3=SRAM).
+          실 sub ROM 부트는 여기에 초기값을 쓰고 읽어 되돌려 검증한다(실측:
+          nms8250_msx2sub 0x0431/0x0440 — reg0 에 0x0A 를 심고 CP 0x0A 로
+          확인) — 읽기가 상수면 검증이 영원히 실패해 BIOS 초기화가 0x04xx
+          루프에 갇힌다. 시계 진행은 없다(부트 검증은 쓴 값의 되돌림만 보고,
+          실시간 비결정성도 만든다). *)
+  mutable rtc_mode : int;
+      (** 모드 레지스터(reg 13): bit0-1=뱅크, bit2=알람, bit3=타이머. 읽기에
+          그대로 드러난다. 전원 인가값은 타이머 동작 자세(0x8). *)
   mutable con_esc : int;
       (** VT52 escape-sequence state for the BDOS console: 0=plain, 1=after
           ESC, 2=after "ESC Y" (row byte next), 3=column byte next. *)
@@ -433,9 +445,6 @@ let mem_read m addr =
           (m.main_rom, if page = 1 && Bytes.length m.main_rom >= 0x8000
                         then 0x4000 + off else off)
         | 1, 0 | 1, 1 -> (m.main_rom, off)
-        (* calslt 가 init 호출 시 전 페이지를 카트리지 슬롯으로 스왑하므로
-           부트 초반 로고(슬롯0 페이지2)와는 시점이 갈린다. *)
-        | 0, 2 | 1, 2 -> (m.logo_rom, off)
         | 2, 2 ->
           (* 32KB 카트는 뒷 16KB. 16KB 카트는 A15 를 해독하지 않아 페이지2 에
              앞 16KB 가 다시 보인다 (미러). 경계는 >= — 정확히 0x8000 인
@@ -443,7 +452,14 @@ let mem_read m addr =
           if Bytes.length m.cart >= 0x8000 then (m.cart, cart_off)
           else if Bytes.length m.cart >= 0x4000 then (m.cart, off)
           else (m.logo_rom, off)
-        | 2, 0 | 2, 1 ->
+        | 2, 0 ->
+          (* 실기 NMS8250: 카트리지는 page1(0x4000) 부터 보인다 — page0 은
+             빈 버스. 카트 파일 앞 16KB("AB" 헤더)를 page0 에서도 돌려주면
+             실 BIOS 의 슬롯 스캔 판정을 오염시킨다. 카트가 없는 부트의 기존
+             폴백(main ROM 미러)은 유지 — 그 부트가 이 뷰를 읽는다. *)
+          if Bytes.length m.cart >= 0x4000 then (Bytes.make 0 '\000', 0)
+          else (m.main_rom, off)
+        | 2, 1 ->
           if Bytes.length m.cart >= 0x4000 then (m.cart, cart_off)
           else (m.main_rom, off)
         | 2, 3 | 1, 3 | 0, 3 -> (m.main_rom, off)
@@ -460,6 +476,15 @@ let mem_read m addr =
       if m.slot3_sel land 3 = 1 && page <> 3 then
         (* sub ROM 은 페이지0·1 자리. *)
         Char.code (Bytes.get m.sub_rom off)
+      else if
+        m.slot3_sel land 3 = 3 && page = 1
+        && Bytes.length m.disk > 0 && Bytes.length m.cart >= 0x4000
+      then
+        (* openMSX 정본 NMS8250 배치는 서브3 = 디스크 인터페이스(ROM 은
+           page1 0x4000-0x7FFF 에만, rom_visibility). 실 BIOS 의 카트 INIT
+           스캔이 이 자리에서 "AB" 헤더와 INIT 벡터를 찾는다. 기존 3-2 뷰는
+           레거시 경로(룬마스터 II 워밍업 재생)를 위해 그대로 둔다. *)
+        Char.code (Bytes.get m.cart (min off (Bytes.length m.cart - 1)))
       else if
         m.slot3_sel land 3 = 2 && page <> 3
         && Bytes.length m.disk > 0 && Bytes.length m.cart >= 0x4000
@@ -543,8 +568,37 @@ let psg_read m =
   | r when r < 16 -> m.psg.(r)
   | _ -> 0xff
 
+(* RP5C01 접근 면(openMSX RP5C01.cc peekPort/writePort 정본): 뱅크 = 모드
+   bit0-1, reg 13 은 모드를 그대로, reg 14/15(TEST/RESET) 는 쓰기 전용이라
+   읽으면 0x0F. 뱅크별 니블 마스크는 시계 자릿수의 유효 범위(초 10자리 ≤5
+   등)를 낸다 — 초 1자리(레지스터 0)의 마스크는 0xF 라 0x0A 도 그대로
+   저장되고, sub ROM 의 부트 검증(CP 0x0A)은 이 되돌림을 본다. *)
+let rtc_masks =
+  [| [| 0xf; 0x7; 0xf; 0x7; 0xf; 0x3; 0x7; 0xf; 0x3; 0xf; 0x1; 0xf; 0xf |];
+     [| 0x0; 0x0; 0xf; 0x7; 0xf; 0x3; 0x7; 0xf; 0x3; 0x0; 0x1; 0x3; 0x0 |];
+     Array.make 13 0xf;
+     Array.make 13 0xf |]
+
+let rtc_read_reg m =
+  match m.rtc_reg land 0x0f with
+  | 13 -> m.rtc_mode land 0x0f
+  | 14 | 15 -> 0x0f
+  | r ->
+    let bank = m.rtc_mode land 3 in
+    m.rtc_regs.((bank * 13) + r) land rtc_masks.(bank).(r)
+
+let rtc_write_reg m v =
+  match m.rtc_reg land 0x0f with
+  | 13 -> m.rtc_mode <- v land 0x0f
+  | 14 | 15 -> () (* TEST/RESET: 쓰기 효과(타이머 가속·분수 리셋) 없음 *)
+  | r ->
+    let bank = m.rtc_mode land 3 in
+    m.rtc_regs.((bank * 13) + r) <- (v land 0x0f) land rtc_masks.(bank).(r)
+
 let port_read m port =
   match port land 0xff with
+  | 0xB4 -> m.rtc_reg land 0x0f
+  | 0xB5 -> rtc_read_reg m
   | 0xD0 | 0xD1 | 0xD2 | 0xD3 -> fdc_read m port
   | 0x98 -> Vdp.io_read m.vdp ~port:0x98
   | 0x99 -> Vdp.io_read m.vdp ~port:0x99
@@ -582,6 +636,7 @@ let port_write m port v =
     mapper_writes.(port land 3) <- mapper_writes.(port land 3) + 1;
     m.mapper.(port land 3) <- v land 0x3f
   | 0xB4 -> m.rtc_reg <- v land 0xff
+  | 0xB5 -> rtc_write_reg m v
   | _ -> ()
 
 (* 메모리 쓰기 감시 — write 클로저가 참조하므로 create 보다 앞에. *)
@@ -626,6 +681,8 @@ let create ~machine =
       bdos_files = Hashtbl.create 4;
       frames = 0;
       rtc_reg = 0;
+      rtc_regs = Array.make 52 0;
+      rtc_mode = 0x8;
       con_esc = 0;
       rst30_pending = [];
       hle_disk = true;
@@ -1785,6 +1842,8 @@ let serialize t =
   State_codec.put_int w t.cart_sram_bit;
   State_codec.put_int w t.disk_dma;
   State_codec.put_int w t.rtc_reg;
+  State_codec.put_int w t.rtc_mode;
+  State_codec.put_int_array w t.rtc_regs;
   State_codec.put_int w t.con_esc;
   State_codec.put_int w t.ppi_a;
   State_codec.put_int w t.ppi_c;
@@ -1830,6 +1889,8 @@ let restore ~state =
     t.cart_sram_bit <- State_codec.get_int r ~min:0 ~max:max_int;
     t.disk_dma <- State_codec.get_int r ~min:0 ~max:65535;
     t.rtc_reg <- State_codec.get_int r ~min:0 ~max:255;
+    t.rtc_mode <- State_codec.get_int r ~min:0 ~max:15;
+    State_codec.fill_int_array r ~min:0 ~max:15 t.rtc_regs;
     t.con_esc <- State_codec.get_int r ~min:0 ~max:3;
     t.ppi_a <- State_codec.get_int r ~min:0 ~max:255;
     t.ppi_c <- State_codec.get_int r ~min:0 ~max:255;
