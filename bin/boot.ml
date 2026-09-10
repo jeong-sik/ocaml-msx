@@ -10,6 +10,7 @@ let watch_mem = ref ""
 let cart = ref ""
 let disk = ref ""
 let disk_warm = ref false
+let disk_real = ref false
 let cart_mapper = ref ""
 let tap_space : int list ref = ref []
 let tap_keys : (int * Msx.key) list ref = ref []
@@ -71,6 +72,9 @@ let () =
       ( "--disk-warm",
         Arg.Set disk_warm,
         "  720프레임 워밍업 뒤 Disk ROM 2차 호출 재생 (게임 화면 경로)" );
+      ( "--disk-real",
+        Arg.Set disk_real,
+        "  실 디스크 ROM 코드를 cart 에 (DISK_ROM env 로 경로, 기본 cbios_disk)" );
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
         "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
@@ -112,7 +116,7 @@ let () =
     Msx.load_cartridge ?mapper t (read_file !cart)
   end;
   if !disk <> "" then begin
-    Msx.load_disk ~interface_rom:(not !disk_warm) t (read_file !disk);
+    Msx.load_disk ~interface_rom:(not !disk_warm) ~real_rom:!disk_real t (read_file !disk);
     if !tap_key_spec <> "" then tap_keys := parse_tap_keys !tap_key_spec;
   Msx.set_disk_call_log true
   end;
@@ -276,7 +280,27 @@ let () =
       calls;
     Array.iteri
       (fun i n -> if n > 0 then Printf.printf "bdos %02x: %d\n" i n)
-      (Msx.bdos_counts ())
+      (Msx.bdos_counts ());
+    (* 메모리 매핑 FDC 창(0x7FF8+) 교환의 마지막 32개 — 실ROM 드라이버와
+       칩 모델의 상호작용 진단용. kind: 1=쓰기 0=읽기. *)
+    let fdcs = Msx.fdc_recent_calls () in
+    Printf.printf "fdc ops=%d\n" (Array.length fdcs);
+    let writes = ref [] and reads = ref [] in
+    Array.iter
+      (fun (kind, port, v) ->
+        if kind = 1 then writes := (port, v) :: !writes
+        else reads := (port, v) :: !reads)
+      fdcs;
+    List.iteri
+      (fun i (port, v) ->
+        if i < 40 then Printf.printf "  fdc W %04x=%02x\n" port v)
+      (List.rev !writes);
+    Printf.printf "fdc reads=%d (W=%d)\n" (List.length !reads) (List.length !writes);
+    List.iteri
+      (fun i (port, v) ->
+        if i < 16 || i >= List.length !reads - 16 then
+          Printf.printf "  fdc R %04x=%02x\n" port v)
+      !reads
   end;
   Msx.debug_dump t;
   (* SCREEN7 판정 보조: 64K 페이지별로 256바이트 줄(한 표시 줄)의 non-zero

@@ -97,6 +97,7 @@ type fdc_state = {
   mutable data : int;        (** 데이터 레지스터 (seek 목적지 포함) *)
   mutable side : int;        (** 0xD4 bit1 *)
   mutable motor : bool;      (** 0xD4 bit3 *)
+  mutable step_out : bool;   (** STEP(0x20) 의 직전 방향: IN=false OUT=true *)
   mutable busy : bool;
   mutable drq : bool;
   mutable intr : bool;
@@ -231,6 +232,118 @@ let guess_mapper rom =
     else Konami
   end
 
+(* ---------- FDC (WD279x 근사) — 포트 0xD0-0xD4 ----------
+
+   정본은 openMSX src/fdc/WD2793.cc. 즉시-완료 모델: RESTORE/SEEK 은 상태
+   읽기 한 번 안에 끝나고, READ SECTOR 는 명령 받는 순간 버퍼를 채워
+   DRQ 를 올린다 — 로더가 상태 비트를 폴링하는 한 실기와 관측이 같다.
+   논리 섹터 = (track*2 + side)*9 + (sector-1). *)
+
+let fdc_log : (int * int * int) array = Array.make 256 (0, 0, 0)
+let fdc_log_i = ref 0
+let fdc_note kind port v =
+  fdc_log.(!fdc_log_i land 255) <- (kind, port, v);
+  incr fdc_log_i
+
+let fdc_create () =
+  {
+    cmd = 0;
+    track = 0;
+    sector = 1;
+    data = 0;
+    side = 0;
+    motor = false;
+    step_out = false;
+    busy = false;
+    drq = false;
+    intr = false;
+    buf = Bytes.make 512 '\000';
+    pos = 0;
+  }
+
+let fdc_status m =
+  let f = m.fdc in
+  (* READ 계열 진행 중이면 DRQ, 아니면 ready(0). not-ready 는 디스크가
+     없을 때만 — 있으면 언제나 ready. bit2 = TRK00: 헤드가 0번 트랙에
+     있을 때 1 — 실 디스크 ROM 의 초기화는 STEP OUT 연쇄로 이 비트가
+     켜질 때까지 헤드를 되돌린다(16회 시도 후 디스크 에러로 재부팅하는
+     루프의 관찰된 원인). *)
+  let base = if Bytes.length m.disk = 0 then 0x80 else 0x00 in
+  let trk0 = if f.track = 0 then 0x04 else 0x00 in
+  let drq = if f.drq then 0x02 else 0x00 in
+  let busy = if f.busy then 0x01 else 0x00 in
+  base lor trk0 lor drq lor busy
+
+let fdc_load_sector m =
+  let f = m.fdc in
+  if Bytes.length m.disk = 0 then f.drq <- false
+  else begin
+    let logical = ((f.track * 2) + f.side) * 9 + (f.sector - 1) in
+    let off = logical * 512 in
+    if off + 512 > Bytes.length m.disk then f.drq <- false
+    else begin
+      Bytes.blit m.disk off f.buf 0 512;
+      f.pos <- 0;
+      f.drq <- true;
+      f.busy <- true
+    end
+  end
+
+let fdc_write m port v =
+  let f = m.fdc in
+  match port land 0xff with
+  | 0xD0 ->
+      fdc_note 1 0xD0 v;
+      f.cmd <- v land 0xf0;
+      (match v land 0xf0 with
+       | 0x00 -> f.track <- 0; f.intr <- true (* RESTORE *)
+       | 0x10 -> f.track <- f.data; f.intr <- true (* SEEK *)
+       | 0x20 -> f.track <- max 0 (f.track + if f.step_out then -1 else 1);
+         f.intr <- true (* STEP: 직전 방향 *)
+       | 0x40 -> f.track <- f.track + 1; f.step_out <- false;
+         f.intr <- true (* STEP IN — 트랙 증가, TRK00 해제 *)
+       | 0x60 -> f.track <- max 0 (f.track - 1); f.step_out <- true;
+         f.intr <- true (* STEP OUT — 0 에서 멈춘다 *)
+       | 0x80 | 0x90 | 0xA0 | 0xB0 -> fdc_load_sector m (* READ SECTOR *)
+       | 0xC0 -> f.intr <- true (* READ ADDRESS — 최소 *)
+       | 0xD0 -> f.busy <- false; f.intr <- true (* FORCE INTERRUPT *)
+       | _ -> f.intr <- true)
+  | 0xD1 -> f.track <- v land 0xff
+  | 0xD2 -> f.sector <- v land 0xff
+  | 0xD3 -> f.data <- v land 0xff
+  | 0xD4 ->
+      (* 시스템 컨트롤: bit1 side, bit3 motor (배선은 로더 로그로 맞춘다). *)
+      fdc_note 1 0xD4 v;
+      f.side <- (v lsr 1) land 1;
+      f.motor <- v land 0x08 <> 0
+  | _ -> ()
+
+let fdc_read m port =
+  let f = m.fdc in
+  match port land 0xff with
+  | 0xD0 ->
+      let st = fdc_status m in
+      fdc_note 0 0xD0 st;
+      (* 상태 읽기가 seek 완료를 소비한다 — 즉시-완료 모델의 표현. *)
+      f.busy <- false;
+      st
+  | 0xD1 -> f.track
+  | 0xD2 -> f.sector
+  | 0xD3 ->
+      let b = Char.code (Bytes.get f.buf f.pos) in
+      if f.pos < 511 then f.pos <- f.pos + 1
+      else begin
+        f.drq <- false;
+        f.intr <- true
+      end;
+      fdc_note 0 0xD3 b;
+      b
+  | _ -> 0xff
+
+let fdc_recent_calls () =
+  Array.init (min !fdc_log_i 256) (fun k -> fdc_log.((!fdc_log_i - min !fdc_log_i 256 + k) land 255))
+
+
 let mem_read m addr =
   let a = addr land 0xffff in
   let page = a lsr 14 in
@@ -242,6 +355,25 @@ let mem_read m addr =
     | _ -> (m.ppi_a lsr 6) land 3
   in
   if a = 0xffff && slot = 3 then lnot m.slot3_sel land 0xff
+  else if
+    a land 0x3ff8 = 0x3ff8
+    && ((slot = 2 && Bytes.length m.cart >= 0x4000)
+        || (slot = 3 && m.slot3_sel land 3 = 2 && Bytes.length m.cart >= 0x4000))
+    && Bytes.length m.disk > 0
+  then
+    (* NMS8250 의 WD2793 은 I/O 포트가 아니라 메모리 매핑: 인터페이스 슬롯의
+       페이지마다 0x3FF8-0x3FFF 창(=0x7FF8-0x7FFF 미러)에 상태/트랙/섹터/데이터
+       레지스터가 보인다(openMSX 설정 문서: "FDC registers are visible in all
+       4 pages"). 실 디스크 ROM(0x782B 폴링 루프)은 이 창으로만 칩을 다룬다.
+       +0..3 = WD279x 포트 0xD0..0xD3, 0x7FFC = 사이드/모터 시스템 레지스터. *)
+    (match a land 7 with
+     | 0 | 1 | 2 | 3 -> fdc_read m ((a land 7) + 0xd0)
+     | _ ->
+       (* 시스템 레지스터(0x7FFC-0x7FFF)의 읽기 면: 디스크 변경(DSKCHG)·
+          라이트 프로텍트 검출 비트를 포함한다. 0xFF 를 돌려주면 실ROM 이
+          "디스크가 바뀌었다/없다"로 판정해 READ SECTOR 없이 드라이브를
+          리셋하는 루프에 빠진다(실측). 정상 상태 0x00. *)
+       0x00)
   else if
     a >= 0x4000 && a < 0xc000 && slot = 2 && m.cart_mapper <> Flat
     && Bytes.length m.cart > 0
@@ -336,6 +468,18 @@ let mem_write m addr v =
   in
   if a = 0xffff && slot = 3 then m.slot3_sel <- v land 0xff
   else if
+    a land 0x3ff8 = 0x3ff8
+    && ((slot = 2 && Bytes.length m.cart >= 0x4000)
+        || (slot = 3 && m.slot3_sel land 3 = 2 && Bytes.length m.cart >= 0x4000))
+    && Bytes.length m.disk > 0
+  then
+    (* 메모리 매핑 FDC 창의 쓰기 면(읽기 면의 주석 참조): +0..3 = WD279x
+       포트 0xD0-0xD3(명령/트랙/섹터/데이터), +4..7 = 사이드/모터 시스템
+       레지스터(포트 0xD4 등가). *)
+    (match a land 7 with
+     | 0 | 1 | 2 | 3 -> fdc_write m ((a land 7) + 0xd0) v
+     | _ -> fdc_write m 0xd4 v)
+  else if
     slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
   then begin
     let w = (a lsr 13) - 2 in
@@ -368,106 +512,6 @@ let psg_read m =
   | 14 -> if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle
   | r when r < 16 -> m.psg.(r)
   | _ -> 0xff
-
-(* ---------- FDC (WD279x 근사) — 포트 0xD0-0xD4 ----------
-
-   정본은 openMSX src/fdc/WD2793.cc. 즉시-완료 모델: RESTORE/SEEK 은 상태
-   읽기 한 번 안에 끝나고, READ SECTOR 는 명령 받는 순간 버퍼를 채워
-   DRQ 를 올린다 — 로더가 상태 비트를 폴링하는 한 실기와 관측이 같다.
-   논리 섹터 = (track*2 + side)*9 + (sector-1). *)
-
-let fdc_log : (int * int * int) array = Array.make 256 (0, 0, 0)
-let fdc_log_i = ref 0
-let fdc_note kind port v =
-  fdc_log.(!fdc_log_i land 255) <- (kind, port, v);
-  incr fdc_log_i
-
-let fdc_create () =
-  {
-    cmd = 0;
-    track = 0;
-    sector = 1;
-    data = 0;
-    side = 0;
-    motor = false;
-    busy = false;
-    drq = false;
-    intr = false;
-    buf = Bytes.make 512 '\000';
-    pos = 0;
-  }
-
-let fdc_status m =
-  let f = m.fdc in
-  (* READ 계열 진행 중이면 DRQ, 아니면 ready(0). not-ready 는 디스크가
-     없을 때만 — 있으면 언제나 ready. *)
-  let base = if Bytes.length m.disk = 0 then 0x80 else 0x00 in
-  let drq = if f.drq then 0x02 else 0x00 in
-  let busy = if f.busy then 0x01 else 0x00 in
-  base lor drq lor busy
-
-let fdc_load_sector m =
-  let f = m.fdc in
-  if Bytes.length m.disk = 0 then f.drq <- false
-  else begin
-    let logical = ((f.track * 2) + f.side) * 9 + (f.sector - 1) in
-    let off = logical * 512 in
-    if off + 512 > Bytes.length m.disk then f.drq <- false
-    else begin
-      Bytes.blit m.disk off f.buf 0 512;
-      f.pos <- 0;
-      f.drq <- true;
-      f.busy <- true
-    end
-  end
-
-let fdc_write m port v =
-  let f = m.fdc in
-  match port land 0xff with
-  | 0xD0 ->
-      fdc_note 1 0xD0 v;
-      f.cmd <- v land 0xf0;
-      (match v land 0xf0 with
-       | 0x00 -> f.track <- 0; f.intr <- true (* RESTORE *)
-       | 0x10 -> f.track <- f.data; f.intr <- true (* SEEK *)
-       | 0x80 | 0x90 | 0xA0 | 0xB0 -> fdc_load_sector m (* READ SECTOR *)
-       | 0xC0 -> f.intr <- true (* READ ADDRESS — 최소 *)
-       | 0xD0 -> f.busy <- false; f.intr <- true (* FORCE INTERRUPT *)
-       | _ -> f.intr <- true)
-  | 0xD1 -> f.track <- v land 0xff
-  | 0xD2 -> f.sector <- v land 0xff
-  | 0xD3 -> f.data <- v land 0xff
-  | 0xD4 ->
-      (* 시스템 컨트롤: bit1 side, bit3 motor (배선은 로더 로그로 맞춘다). *)
-      fdc_note 1 0xD4 v;
-      f.side <- (v lsr 1) land 1;
-      f.motor <- v land 0x08 <> 0
-  | _ -> ()
-
-let fdc_read m port =
-  let f = m.fdc in
-  match port land 0xff with
-  | 0xD0 ->
-      let st = fdc_status m in
-      fdc_note 0 0xD0 st;
-      (* 상태 읽기가 seek 완료를 소비한다 — 즉시-완료 모델의 표현. *)
-      f.busy <- false;
-      st
-  | 0xD1 -> f.track
-  | 0xD2 -> f.sector
-  | 0xD3 ->
-      let b = Char.code (Bytes.get f.buf f.pos) in
-      if f.pos < 511 then f.pos <- f.pos + 1
-      else begin
-        f.drq <- false;
-        f.intr <- true
-      end;
-      fdc_note 0 0xD3 b;
-      b
-  | _ -> 0xff
-
-let fdc_recent_calls () =
-  Array.init (min !fdc_log_i 256) (fun k -> fdc_log.((!fdc_log_i - min !fdc_log_i 256 + k) land 255))
 
 let port_read m port =
   match port land 0xff with
@@ -635,10 +679,11 @@ let disk_call_entries () = List.rev !disk_calls
    loader actually exercises (_RDBLK 27 calls in Sangokushi II's loader). *)
 let bdos_call_counts : int array = Array.make 256 0
 
-(* 실제 디스크 ROM(cbios_disk.rom) — 있으면 이식 대상. 헤더 0x4000-0x400F 가
-   비어 카트로 못 띄우므로 AB + INIT 벡터만 얹는다. C-BIOS 가 INIT 로 부르는
-   0x4030(INIENV) 을 진입점으로 준다 — 하드웨어 초기화·page0 프리미티브 설치
-   까지 실ROM 코드에 맡긴다(HLE 트랩은 끈다). *)
+(* 실제 디스크 ROM — DISK_ROM 환경변수로 임의의 실ROM(예: NMS8250 덤프)을
+   지정할 수 있다. 기본은 cbios_disk.rom: 헤더 0x4000-0x400F 가 비어 카트로
+   못 띄우므로 AB + INIT 벡터만 얹는다. ROM 이 자기 헤더("AB" + INIT 벡터)를
+   이미 가지면 그대로 쓴다 — C-BIOS 가 ROM 자기 INIT(하드웨어 초기화·page0
+   프리미티브 설치·부트 절차)을 실행하게 한다. *)
 let disk_rom_real () =
   let read p =
     try
@@ -648,17 +693,21 @@ let disk_rom_real () =
       Some (Bytes.of_string s)
     with Sys_error _ -> None
   in
+  let override = try [Sys.getenv "DISK_ROM"] with Not_found -> [] in
   let candidates =
-    [ "roms/cbios/cbios_disk.rom"; "../roms/cbios/cbios_disk.rom";
-      "../../roms/cbios/cbios_disk.rom"; "../../../roms/cbios/cbios_disk.rom" ]
+    override
+    @ [ "roms/cbios/cbios_disk.rom"; "../roms/cbios/cbios_disk.rom";
+        "../../roms/cbios/cbios_disk.rom"; "../../../roms/cbios/cbios_disk.rom" ]
   in
   match List.find_map read candidates with
   | Some rom when Bytes.length rom >= 0x4000 ->
       let b = Bytes.sub rom 0 0x4000 in
-      Bytes.set b 0 'A';
-      Bytes.set b 1 'B';
-      Bytes.set b 2 (Char.chr (disk_inienv_entry land 0xff));
-      Bytes.set b 3 (Char.chr ((disk_inienv_entry lsr 8) land 0xff));
+      if not (Bytes.length b >= 2 && Bytes.get b 0 = 'A' && Bytes.get b 1 = 'B') then begin
+        Bytes.set b 0 'A';
+        Bytes.set b 1 'B';
+        Bytes.set b 2 (Char.chr (disk_inienv_entry land 0xff));
+        Bytes.set b 3 (Char.chr ((disk_inienv_entry lsr 8) land 0xff))
+      end;
       Some b
   | _ -> None
 
