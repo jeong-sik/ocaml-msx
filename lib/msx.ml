@@ -465,7 +465,13 @@ let mem_read m addr =
              보여 부트가 "FILE" 을 실행하며 RST0 루프에 빠진다(실측). *)
           (m.main_rom, if page = 1 && Bytes.length m.main_rom >= 0x8000
                         then 0x4000 + off else off)
-        | 1, 0 | 1, 1 -> (m.main_rom, off)
+        | 1, 0 | 1, 1 | 1, 2 ->
+          (* 실기 NMS8250 의 슬롯1 은 미장착 카트리지 슬롯 — 전 페이지가 빈
+             버스(0xFF) 다. main ROM 미러를 보이면(실측: page0[0]=0xF3) 실
+             BIOS 의 슬롯 스캔(page0 헤더 읽기)이 슬롯1 을 "뭔가 있는 슬롯"으로
+             오인한다. 슬롯2 의 page0 폴백(main ROM) 과는 다르다 — 그쪽은 카트
+             없는 C-BIOS 부트가 쓰는 경로다. *)
+          (Bytes.make 0 '\000', 0)
         | 2, 2 ->
           (* 32KB 카트는 뒷 16KB. 16KB 카트는 A15 를 해독하지 않아 페이지2 에
              앞 16KB 가 다시 보인다 (미러). 경계는 >= — 정확히 0x8000 인
