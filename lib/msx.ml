@@ -105,6 +105,7 @@ type fdc_state = {
   mutable pos : int;
   mutable side_reg : int;   (** Philips 0x7FFC: bit0 = side *)
   mutable drive_reg : int;  (** Philips 0x7FFD: bits0-1 drive, bit7 motor *)
+  mutable intr_fired : bool;  (** 이번 INTRQ 펄스를 이미 CPU 에 전달했나 *)
 }
 
 type t = {
@@ -263,6 +264,7 @@ let fdc_create () =
     pos = 0;
     side_reg = 0;
     drive_reg = 0;
+    intr_fired = false;
   }
 
 let fdc_status m =
@@ -333,6 +335,7 @@ let fdc_read m port =
          사이에 park 한 복귀 주소를 INTRQ 인터럽트 핸들러가 소비한다. *)
       f.busy <- false;
       f.intr <- false;
+      f.intr_fired <- false;
       st
   | 0xD1 -> f.track
   | 0xD2 -> f.sector
@@ -422,7 +425,13 @@ let mem_read m addr =
       let cart_off = if page = 2 then 0x4000 + off else off in
       let rom, roff =
         match slot, page with
-        | 0, 0 | 0, 1 -> (m.main_rom, off)
+        | 0, 0 | 0, 1 ->
+          (* 32KB 메인 ROM: 페이지0 = 앞 16KB, 페이지1 = 뒤 16KB. 페이지
+             상대 오프셋만 쓰면 앞半이 양쪽에 미러로 보인다 — 실기 BIOS 의
+             페이지1 코드(예: 0x7BD2 의 VDP PAL 설정)가 문자열 영역으로
+             보여 부트가 "FILE" 을 실행하며 RST0 루프에 빠진다(실측). *)
+          (m.main_rom, if page = 1 && Bytes.length m.main_rom >= 0x8000
+                        then 0x4000 + off else off)
         | 1, 0 | 1, 1 -> (m.main_rom, off)
         (* calslt 가 init 호출 시 전 페이지를 카트리지 슬롯으로 스왑하므로
            부트 초반 로고(슬롯0 페이지2)와는 시점이 갈린다. *)
@@ -558,6 +567,11 @@ let port_read m port =
 
 let port_write m port v =
   match port land 0xff with
+  | 0x2E | 0x2F ->
+    (* 게임 커널의 디버그 채널(룬마스터 TPA 0x09B8 의 문자열 출력 루틴이
+       0x2F 로 글자를 뱉는다) — 관측용으로 흘린다. *)
+    Printf.eprintf "%c" (Char.chr (v land 0xff));
+    if v = 0x0d then Printf.eprintf "\n%!"
   | 0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xD4 -> fdc_write m port v
   | 0x98 | 0x99 | 0x9A | 0x9B -> Vdp.io_write m.vdp ~port:(port land 0xff) v
   | 0xA8 -> m.ppi_a <- v land 0xff
@@ -1598,7 +1612,11 @@ let step t ~frames =
     while !budget > 0 do
       (* VDP 인터럽트와 FDC INTRQ 를 같은 INT 선으로: 실기에서 WD2793 의
          INTRQ 는 디스크 인터페이스가 MSX 인터럽트 사슬에 끼워 넣는다(실
-         디스크 ROM 의 INIT 가 설치한 핸들러가 0x0038 사슬에서 소비). *)
+         디스크 ROM 의 INIT 가 설치한 핸들러가 0x0038 사슬에서 소비).
+         우리는 즉시-완료 모델이라 INTRQ 가 park(EX (SP),HL 쌍)보다 먼저
+         뜬다 — intr 가 켜져 있는 동안 계속 걸어야 park 직후의 재개가
+         일어난다(펄스 1회화는 재개 누락으로 리캘리브레이션 루프 재발,
+         실측). 상태 읽기(0xD0)가 intr 를 내리므로 무한 재입은 없다. *)
       if Vdp.int_active t.vdp || t.fdc.intr then ignore (Z80.interrupt t.cpu);
       let pc0 = Z80.dump_pc t.cpu in
       (match !trace_from with
