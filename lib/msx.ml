@@ -276,6 +276,8 @@ let fdc_log_i = ref 0
    선언을 앞에 둔다. *)
 let ring = Array.make 64 0
 let ri = ref 0
+(* 직전 0x7FFF 폴 값 — 계측이 값 변화 시점만 찍게. *)
+let last_poll = ref 0xff
 let fdc_note m kind port v =
   fdc_log.(!fdc_log_i land 255) <- (kind, port, v, Z80.dump_pc m.cpu);
   incr fdc_log_i
@@ -302,17 +304,26 @@ let fdc_create () =
 
 let fdc_status m =
   let f = m.fdc in
-  (* READ 계열 진행 중이면 DRQ, 아니면 ready(0). not-ready 는 디스크가
-     없을 때만 — 있으면 언제나 ready. bit2 = TRK00: 헤드가 0번 트랙에
-     있을 때 1 — 실 디스크 ROM 의 초기화는 STEP OUT 연쇄로 이 비트가
-     켜질 때까지 헤드를 되돌린다(16회 시도 후 디스크 에러로 재부팅하는
-     루프의 관찰된 원인). *)
+  (* WD2793 상태 비트는 명령 타입을 따라 다르다 (openMSX WD2793::getStatus
+     의 type1 분기 정본). Type I(RESTORE/SEEK/STEP, cmd<0x80): bit5=헤드
+     적재, bit2=TRK00, bit1=인덱스. Type II+(READ/WRITE SECTOR): bit5=레코드
+     타입(0=정상), bit2=LOST DATA, bit1=DRQ. 한 비트로 두 의미를 실는 칩의
+     설계라, 펌프 완료 검사(실ROM 0x76C5: 상태 AND 0x9C / RET Z)는 Type II
+     상태의 bit2 를 lost data 로 읽는다 — TRK00 을 Type II 에도 얹으면
+     모든 READ SECTOR 가 "lost data 에러"로 판정돼 10회 재시도 뒤 드라이브를
+     포기한다(실측 09-12: readsec logical 0 을 10번 반복 후 BASIC 폴백). *)
   let base = if Bytes.length m.disk = 0 then 0x80 else 0x00 in
-  let trk0 = if f.track = 0 then 0x04 else 0x00 in
-  (* Type I 명령(RESTORE/SEEK/STEP) 상태의 bit5 = 헤드 적재. 모터가 돌면
-     헤드가 디스크에 닿는다(즉시-완료 근사) — 이 비트가 없으면 실 디스크
-     ROM 의 드라이브 검색이 헤드 적재를 폴링하다 영원히 못 넘어간다. *)
-  let head = if f.motor && Bytes.length m.disk > 0 then 0x20 else 0x00 in
+  let type1 = f.cmd < 0x80 in
+  (* TRK00: 헤드가 0번 트랙에 있을 때 1 (Type I 상태에서만). 실 디스크 ROM
+     의 초기화는 STEP OUT 연쇄로 이 비트가 켜질 때까지 헤드를 되돌린다. *)
+  let trk0 = if type1 && f.track = 0 then 0x04 else 0x00 in
+  (* Type I 상태의 bit5 = 헤드 적재. 모터가 돌면 헤드가 디스크에 닿는다
+     (즉시-완료 근사) — 이 비트가 없으면 실 디스크 ROM 의 드라이브 검색이
+     헤드 적재를 폴링하다 영원히 못 넘어간다. Type II 의 bit5(레코드 타입)
+     는 0 = 정상 데이터. *)
+  let head =
+    if type1 && f.motor && Bytes.length m.disk > 0 then 0x20 else 0x00
+  in
   let drq = if f.drq then 0x02 else 0x00 in
   let busy = if f.busy then 0x01 else 0x00 in
   base lor trk0 lor head lor drq lor busy
@@ -323,9 +334,22 @@ let fdc_load_sector m =
   else begin
     let logical = ((f.track * 2) + f.side) * 9 + (f.sector - 1) in
     let off = logical * 512 in
-    if off + 512 > Bytes.length m.disk then f.drq <- false
+    if off + 512 > Bytes.length m.disk then begin
+      (try
+         if Sys.getenv "FDC_TRACE" <> "" then
+           Printf.eprintf "FDC readsec MISS t=%d side=%d sec=%d -> logical %d (off %d, len %d)\n%!"
+             f.track f.side f.sector logical off (Bytes.length m.disk)
+       with Not_found -> ());
+      f.drq <- false
+    end
     else begin
       Bytes.blit m.disk off f.buf 0 512;
+      (try
+         if Sys.getenv "FDC_TRACE" <> "" then
+           Printf.eprintf "FDC readsec t=%d side=%d sec=%d -> logical %d (off %d) buf0=%02x drive=%d motor=%b\n%!"
+             f.track f.side f.sector logical off (Char.code (Bytes.get f.buf 0))
+             (f.drive_reg land 3) f.motor
+       with Not_found -> ());
       f.pos <- 0;
       f.drq <- true;
       f.busy <- true
@@ -382,6 +406,12 @@ let fdc_read m port =
   | 0xD2 -> f.sector
   | 0xD3 ->
       let b = Char.code (Bytes.get f.buf f.pos) in
+      (try
+         if f.pos < 2 && Sys.getenv "FDC_TRACE" <> "" then
+           Printf.eprintf "FDC pump pos=%d buf0=%02x b=%02x cmd=%02x drq=%b hl=%04x ppi=%02x sl3=%02x\n%!"
+             f.pos (Char.code (Bytes.get f.buf 0)) b f.cmd f.drq
+             (Z80.dump_hl m.cpu) m.ppi_a m.slot3_sel
+       with Not_found -> ());
       if f.pos < 511 then f.pos <- f.pos + 1
       else begin
         f.drq <- false;
@@ -458,6 +488,13 @@ let mem_read m addr =
          land (if m.fdc.drq then lnot 0x80 else 0xff)
          land (if m.fdc.intr then lnot 0x40 else 0xff)
        in
+       (try
+         if Sys.getenv "FDC_TRACE" <> "" && v <> !last_poll then begin
+           Printf.eprintf "FDC poll %02x -> %02x @%04x pos=%d cmd=%02x\n%!"
+             !last_poll v (Z80.dump_pc m.cpu) m.fdc.pos m.fdc.cmd;
+           last_poll := v
+         end
+       with Not_found -> ());
        fdc_note m 0 0xd7 v;
        v)
   else if
@@ -595,8 +632,8 @@ let mem_write m addr v =
          Printf.eprintf "fdcwin W %04x=%02x @%04x sp=%04x ppi=%02x sl3=%02x\n  ring:"
            a (v land 0xff) (Z80.dump_pc m.cpu) (Z80.dump_sp m.cpu)
            m.ppi_a m.slot3_sel;
-         (* 직전 명령 40스텝 — ring 은 매 명령 기록이라 정확한 선행 흐름. *)
-         for k = max 0 (!ri - 40) to !ri - 1 do
+         (* 직전 명령 64스텝(링 전체) — KEYINT 주기를 넘어 그 사이 실행까지. *)
+         for k = max 0 (!ri - 64) to !ri - 1 do
            Printf.eprintf " %04x" ring.(k land 63)
          done;
          Printf.eprintf "\n%!"
@@ -1790,14 +1827,16 @@ let step t ~frames =
   for _ = 1 to frames do
     let budget = ref cycles_per_frame in
     while !budget > 0 do
-      (* VDP 인터럽트와 FDC INTRQ 를 같은 INT 선으로: 실기에서 WD2793 의
-         INTRQ 는 디스크 인터페이스가 MSX 인터럽트 사슬에 끼워 넣는다(실
-         디스크 ROM 의 INIT 가 설치한 핸들러가 0x0038 사슬에서 소비).
-         우리는 즉시-완료 모델이라 INTRQ 가 park(EX (SP),HL 쌍)보다 먼저
-         뜬다 — intr 가 켜져 있는 동안 계속 걸어야 park 직후의 재개가
-         일어난다(펄스 1회화는 재개 누락으로 리캘리브레이션 루프 재발,
-         실측). 상태 읽기(0xD0)가 intr 를 내리므로 무한 재입은 없다. *)
-      if Vdp.int_active t.vdp || t.fdc.intr then ignore (Z80.interrupt t.cpu);
+      (* 인터럽트 선은 VDP 만: NMS8250(PhilipsFDC) 의 WD2793 INTRQ/DRQ 는
+         Z80 인터럽트 선에 연결되지 않는다(openMSX PhilipsFDC 정본 주석:
+         "Drive control IRQ and DRQ lines are not connected to Z80
+         interrupt request") — 0x7FFF 상태 비트(!INTRQ/!DRQ) 폴링 전용.
+         INTRQ 를 INT 선에 얹던 옛 배선은 page1=3-3 + 스택이 창(0x7FF8-0x7FFF
+         미러)에 걸친 KEYINT 침입에서 오염 PUSH 가 발행한 RESTORE 가 intr
+         를 올리고 그 intr 가 재진입을 부르는 자기유지 폭풍의 연료가 됐다
+         (실측 09-11: 64명령 안에 KEYINT 2.5바퀴, PUSH12/POP12 가 FDC 창을
+         유린). fdc.intr 는 0x7FFF 폴링 비트용 상태로만 남는다. *)
+      if Vdp.int_active t.vdp then ignore (Z80.interrupt t.cpu);
       let pc0 = Z80.dump_pc t.cpu in
       (match !trace_from with
        | Some (target, n) when pc0 = target && !trace_remaining = 0 ->
