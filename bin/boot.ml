@@ -287,19 +287,19 @@ let () =
     Printf.printf "fdc ops=%d\n" (Array.length fdcs);
     let writes = ref [] and reads = ref [] in
     Array.iter
-      (fun (kind, port, v) ->
-        if kind = 1 then writes := (port, v) :: !writes
-        else reads := (port, v) :: !reads)
+      (fun (kind, port, v, pc) ->
+        if kind = 1 then writes := (port, v, pc) :: !writes
+        else reads := (port, v, pc) :: !reads)
       fdcs;
     List.iteri
-      (fun i (port, v) ->
-        if i < 40 then Printf.printf "  fdc W %04x=%02x\n" port v)
+      (fun i (port, v, pc) ->
+        if i < 40 then Printf.printf "  fdc W %04x=%02x @%04x\n" port v pc)
       (List.rev !writes);
     Printf.printf "fdc reads=%d (W=%d)\n" (List.length !reads) (List.length !writes);
     List.iteri
-      (fun i (port, v) ->
+      (fun i (port, v, pc) ->
         if i < 16 || i >= List.length !reads - 16 then
-          Printf.printf "  fdc R %04x=%02x\n" port v)
+          Printf.printf "  fdc R %04x=%02x @%04x\n" port v pc)
       !reads
   end;
   Msx.debug_dump t;

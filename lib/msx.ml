@@ -105,6 +105,12 @@ type fdc_state = {
   mutable pos : int;
   mutable side_reg : int;   (** Philips 0x7FFC: bit0 = side *)
   mutable drive_reg : int;  (** Philips 0x7FFD: bits0-1 drive, bit7 motor *)
+  mutable disk_changed : bool;
+      (** DSKCHG 래치 — 소비형: 디스크를 넣으면 set, DSKCHG(0x7FFD) 를 읽으면
+          그 한 번만 true 로 나오고 즉시 해제 (openMSX DiskChanger::diskChanged
+          정본: `ret = flag; flag = false;` — 해제 트리거는 step 도 인덱스도
+          아닌 읽기 자체). 전원 인가는 디스크를 새로 넣은 상태라 true 로
+          시작한다. *)
   mutable intr_fired : bool;  (** 이번 INTRQ 펄스를 이미 CPU 에 전달했나 *)
 }
 
@@ -158,6 +164,16 @@ type t = {
       (** 인터페이스 ROM 이 HLE(RET 채움)이면 true — disk_trap 이 BIOS 엔트리를
           OCaml 로 서빙한다. 실ROM(cbios_disk.rom)을 심으면 false: ROM 코드가
           직접 돌고 트랩은 물러난다. *)
+  mutable cart_is_disk_rom : bool;
+      (** [cart] 가 게임 카트리지가 아니라 슬롯3-3 의 디스크 인터페이스 ROM 이다
+          — 실ROM 부트(--disk-real)의 배선. 실기 NMS8250 은 이때 카트리지 슬롯
+          (2) 이 비어 있고(전 페이지 빈 버스), FDC 레지스터 창도 오직 3-3 뷰에만
+          존재한다. 이 플래그가 없으면(레거시 rm2 HLE 경로) 인터페이스 ROM 이
+          카트로 slot 2 에 올라가고 창도 slot 2 뷰에 보인다 — 실ROM 커널이
+          SP=0x7FFF(MSX-DOS TPA 관례)로 돌 때 스택 푸시가 slot 2 뷰의 창에
+          떨어져(푸시 → 모터 레지스터, 팝 → DSKCHG) 인터슬롯 프리미티브가 자기
+          컨텍스트를 부수고 무한 루프한다(실측: 0x02C0-0x02E3 프리미티브가
+          0x7FFD/0x7FFF 를 8만 번 긁음). *)
   mutable fdc : fdc_state;
       (** WD279x 컨트롤러 근사: 명령/상태, 트랙·섹터 레지스터, 섹터 버퍼.
           포트 0xD0-0xD4 로 로더가 직접 말을 건다. *)
@@ -254,10 +270,16 @@ let guess_mapper rom =
    DRQ 를 올린다 — 로더가 상태 비트를 폴링하는 한 실기와 관측이 같다.
    논리 섹터 = (track*2 + side)*9 + (sector-1). *)
 
-let fdc_log : (int * int * int) array = Array.make 256 (0, 0, 0)
+let fdc_log : (int * int * int * int) array = Array.make 256 (0, 0, 0, 0)
 let fdc_log_i = ref 0
-let fdc_note kind port v =
-  fdc_log.(!fdc_log_i land 255) <- (kind, port, v);
+(* 최근 명령 PC 링(step 이 매 명령 채운다) — 계측이 앞쪽 코드에서도 읽게
+   선언을 앞에 둔다. *)
+let ring = Array.make 64 0
+let ri = ref 0
+(* 직전 0x7FFF 폴 값 — 계측이 값 변화 시점만 찍게. *)
+let last_poll = ref 0xff
+let fdc_note m kind port v =
+  fdc_log.(!fdc_log_i land 255) <- (kind, port, v, Z80.dump_pc m.cpu);
   incr fdc_log_i
 
 let fdc_create () =
@@ -276,22 +298,32 @@ let fdc_create () =
     pos = 0;
     side_reg = 0;
     drive_reg = 0;
+    disk_changed = true;
     intr_fired = false;
   }
 
 let fdc_status m =
   let f = m.fdc in
-  (* READ 계열 진행 중이면 DRQ, 아니면 ready(0). not-ready 는 디스크가
-     없을 때만 — 있으면 언제나 ready. bit2 = TRK00: 헤드가 0번 트랙에
-     있을 때 1 — 실 디스크 ROM 의 초기화는 STEP OUT 연쇄로 이 비트가
-     켜질 때까지 헤드를 되돌린다(16회 시도 후 디스크 에러로 재부팅하는
-     루프의 관찰된 원인). *)
+  (* WD2793 상태 비트는 명령 타입을 따라 다르다 (openMSX WD2793::getStatus
+     의 type1 분기 정본). Type I(RESTORE/SEEK/STEP, cmd<0x80): bit5=헤드
+     적재, bit2=TRK00, bit1=인덱스. Type II+(READ/WRITE SECTOR): bit5=레코드
+     타입(0=정상), bit2=LOST DATA, bit1=DRQ. 한 비트로 두 의미를 실는 칩의
+     설계라, 펌프 완료 검사(실ROM 0x76C5: 상태 AND 0x9C / RET Z)는 Type II
+     상태의 bit2 를 lost data 로 읽는다 — TRK00 을 Type II 에도 얹으면
+     모든 READ SECTOR 가 "lost data 에러"로 판정돼 10회 재시도 뒤 드라이브를
+     포기한다(실측 09-12: readsec logical 0 을 10번 반복 후 BASIC 폴백). *)
   let base = if Bytes.length m.disk = 0 then 0x80 else 0x00 in
-  let trk0 = if f.track = 0 then 0x04 else 0x00 in
-  (* Type I 명령(RESTORE/SEEK/STEP) 상태의 bit5 = 헤드 적재. 모터가 돌면
-     헤드가 디스크에 닿는다(즉시-완료 근사) — 이 비트가 없으면 실 디스크
-     ROM 의 드라이브 검색이 헤드 적재를 폴링하다 영원히 못 넘어간다. *)
-  let head = if f.motor && Bytes.length m.disk > 0 then 0x20 else 0x00 in
+  let type1 = f.cmd < 0x80 in
+  (* TRK00: 헤드가 0번 트랙에 있을 때 1 (Type I 상태에서만). 실 디스크 ROM
+     의 초기화는 STEP OUT 연쇄로 이 비트가 켜질 때까지 헤드를 되돌린다. *)
+  let trk0 = if type1 && f.track = 0 then 0x04 else 0x00 in
+  (* Type I 상태의 bit5 = 헤드 적재. 모터가 돌면 헤드가 디스크에 닿는다
+     (즉시-완료 근사) — 이 비트가 없으면 실 디스크 ROM 의 드라이브 검색이
+     헤드 적재를 폴링하다 영원히 못 넘어간다. Type II 의 bit5(레코드 타입)
+     는 0 = 정상 데이터. *)
+  let head =
+    if type1 && f.motor && Bytes.length m.disk > 0 then 0x20 else 0x00
+  in
   let drq = if f.drq then 0x02 else 0x00 in
   let busy = if f.busy then 0x01 else 0x00 in
   base lor trk0 lor head lor drq lor busy
@@ -302,9 +334,22 @@ let fdc_load_sector m =
   else begin
     let logical = ((f.track * 2) + f.side) * 9 + (f.sector - 1) in
     let off = logical * 512 in
-    if off + 512 > Bytes.length m.disk then f.drq <- false
+    if off + 512 > Bytes.length m.disk then begin
+      (try
+         if Sys.getenv "FDC_TRACE" <> "" then
+           Printf.eprintf "FDC readsec MISS t=%d side=%d sec=%d -> logical %d (off %d, len %d)\n%!"
+             f.track f.side f.sector logical off (Bytes.length m.disk)
+       with Not_found -> ());
+      f.drq <- false
+    end
     else begin
       Bytes.blit m.disk off f.buf 0 512;
+      (try
+         if Sys.getenv "FDC_TRACE" <> "" then
+           Printf.eprintf "FDC readsec t=%d side=%d sec=%d -> logical %d (off %d) buf0=%02x drive=%d motor=%b\n%!"
+             f.track f.side f.sector logical off (Char.code (Bytes.get f.buf 0))
+             (f.drive_reg land 3) f.motor
+       with Not_found -> ());
       f.pos <- 0;
       f.drq <- true;
       f.busy <- true
@@ -315,16 +360,20 @@ let fdc_write m port v =
   let f = m.fdc in
   match port land 0xff with
   | 0xD0 ->
-      fdc_note 1 0xD0 v;
+      fdc_note m 1 0xD0 v;
       f.cmd <- v land 0xf0;
       (match v land 0xf0 with
        | 0x00 -> f.track <- 0; f.intr <- true (* RESTORE *)
        | 0x10 -> f.track <- f.data; f.intr <- true (* SEEK *)
-       | 0x20 -> f.track <- max 0 (f.track + if f.step_out then -1 else 1);
-         f.intr <- true (* STEP: 직전 방향 *)
-       | 0x40 -> f.track <- f.track + 1; f.step_out <- false;
-         f.intr <- true (* STEP IN — 트랙 증가, TRK00 해제 *)
-       | 0x60 -> f.track <- max 0 (f.track - 1); f.step_out <- true;
+       | 0x20 | 0x30 ->
+         f.track <- max 0 (f.track + if f.step_out then -1 else 1);
+         f.intr <- true (* STEP: 직전 방향. 0x30 변형은 트랙 레지스터 갱신 —
+                           상위니블 디코딩으로 같은 스텝 (WD2793 정본 T_FLAG). *)
+       | 0x40 | 0x50 ->
+         f.track <- f.track + 1; f.step_out <- false;
+         f.intr <- true (* STEP IN — 트랙 증가, TRK00 해제. 0x50(트랙 갱신
+                           변형)은 실 디스크 ROM 0x783F 의 되돌리기 스텝이 쓴다. *)
+       | 0x60 | 0x70 -> f.track <- max 0 (f.track - 1); f.step_out <- true;
          f.intr <- true (* STEP OUT — 0 에서 멈춘다 *)
        | 0x80 | 0x90 | 0xA0 | 0xB0 -> fdc_load_sector m (* READ SECTOR *)
        | 0xC0 -> f.intr <- true (* READ ADDRESS — 최소 *)
@@ -335,7 +384,7 @@ let fdc_write m port v =
   | 0xD3 -> f.data <- v land 0xff
   | 0xD4 ->
       (* 시스템 컨트롤: bit1 side, bit3 motor (배선은 로더 로그로 맞춘다). *)
-      fdc_note 1 0xD4 v;
+      fdc_note m 1 0xD4 v;
       f.side <- (v lsr 1) land 1;
       f.motor <- v land 0x08 <> 0
   | _ -> ()
@@ -345,7 +394,7 @@ let fdc_read m port =
   match port land 0xff with
   | 0xD0 ->
       let st = fdc_status m in
-      fdc_note 0 0xD0 st;
+      fdc_note m 0 0xD0 st;
       (* 상태 읽기가 seek 완료를 소비한다 — 즉시-완료 모델의 표현. 실칩과
          같이 상태 읽기가 INTRQ 도 내린다: 실 디스크 ROM 은 EX (SP),HL 쌍
          사이에 park 한 복귀 주소를 INTRQ 인터럽트 핸들러가 소비한다. *)
@@ -357,12 +406,18 @@ let fdc_read m port =
   | 0xD2 -> f.sector
   | 0xD3 ->
       let b = Char.code (Bytes.get f.buf f.pos) in
+      (try
+         if f.pos < 2 && Sys.getenv "FDC_TRACE" <> "" then
+           Printf.eprintf "FDC pump pos=%d buf0=%02x b=%02x cmd=%02x drq=%b hl=%04x ppi=%02x sl3=%02x\n%!"
+             f.pos (Char.code (Bytes.get f.buf 0)) b f.cmd f.drq
+             (Z80.dump_hl m.cpu) m.ppi_a m.slot3_sel
+       with Not_found -> ());
       if f.pos < 511 then f.pos <- f.pos + 1
       else begin
         f.drq <- false;
         f.intr <- true
       end;
-      fdc_note 0 0xD3 b;
+      fdc_note m 0 0xD3 b;
       b
   | _ -> 0xff
 
@@ -390,7 +445,7 @@ let mem_read m addr =
   if a = 0xffff && slot = 3 then lnot m.slot3_sel land 0xff
   else if
     a land 0x3ff8 = 0x3ff8
-    && ((slot = 2 && Bytes.length m.cart >= 0x4000)
+    && ((slot = 2 && not m.cart_is_disk_rom && Bytes.length m.cart >= 0x4000)
         || (slot = 3 && slot3_sub m page = 3 && Bytes.length m.cart >= 0x4000))
     && Bytes.length m.disk > 0
   then
@@ -404,13 +459,24 @@ let mem_read m addr =
     (match a land 7 with
      | 0 | 1 | 2 | 3 -> fdc_read m ((a land 7) + 0xd0)
      | 4 ->
-       fdc_note 0 0xd4 m.fdc.side_reg;
+       fdc_note m 0 0xd4 m.fdc.side_reg;
        m.fdc.side_reg
      | 5 ->
-       (* DSKCHG: bit2 는 디스크가 바뀌지 않았을 때 1 (openMSX PhilipsFDC
-          정본: `driveReg & ~4 | (diskChanged ? 0 : 4)` — 항상 안 바뀜). *)
-       let v = m.fdc.drive_reg lor 0x04 in
-       fdc_note 0 0xd5 v;
+       (* DSKCHG: bit2 는 active-low — 디스크가 교체되었으면 0, 아니면 1
+          (openMSX PhilipsFDC 정본: `driveReg & ~4 | (diskChanged ? 0 : 4)`).
+          [disk_changed] 는 소비형 래치: 읽는 이 한 번이 true 로 나오고 즉시
+          해제된다. 전원 인가 시 디스크가 로드되어 있으면 첫 읽기는 0 —
+          "새 디스크" 를 알려 ROM 이 FAT/부트섹터를 다시 읽게 한다. 항상 1
+          (안 바뀜)만 돌려주면 실 ROM 의 드라이브 탐지가 끝까지 "변화 없음"
+          만 보고 부트섹터 읽기를 발행하지 않은 채 조용히 멈춘다(실측 09-11:
+          RESTORE → TRK00 폴 → R d5=04 → R d0=04 후 정지, READ SECTOR
+          미발행). *)
+       let v =
+         (m.fdc.drive_reg land 0xfb)
+         lor (if m.fdc.disk_changed then 0 else 4)
+       in
+       m.fdc.disk_changed <- false;
+       fdc_note m 0 0xd5 v;
        v
      | 6 -> 0xff
      | _ ->
@@ -422,7 +488,14 @@ let mem_read m addr =
          land (if m.fdc.drq then lnot 0x80 else 0xff)
          land (if m.fdc.intr then lnot 0x40 else 0xff)
        in
-       fdc_note 0 0xd7 v;
+       (try
+         if Sys.getenv "FDC_TRACE" <> "" && v <> !last_poll then begin
+           Printf.eprintf "FDC poll %02x -> %02x @%04x pos=%d cmd=%02x\n%!"
+             !last_poll v (Z80.dump_pc m.cpu) m.fdc.pos m.fdc.cmd;
+           last_poll := v
+         end
+       with Not_found -> ());
+       fdc_note m 0 0xd7 v;
        v)
   else if
     a >= 0x4000 && a < 0xc000 && slot = 2 && m.cart_mapper <> Flat
@@ -465,23 +538,35 @@ let mem_read m addr =
              보여 부트가 "FILE" 을 실행하며 RST0 루프에 빠진다(실측). *)
           (m.main_rom, if page = 1 && Bytes.length m.main_rom >= 0x8000
                         then 0x4000 + off else off)
-        | 1, 0 | 1, 1 -> (m.main_rom, off)
+        | 1, 0 | 1, 1 | 1, 2 ->
+          (* 실기 NMS8250 의 슬롯1 은 미장착 카트리지 슬롯 — 전 페이지가 빈
+             버스(0xFF) 다. main ROM 미러를 보이면(실측: page0[0]=0xF3) 실
+             BIOS 의 슬롯 스캔(page0 헤더 읽기)이 슬롯1 을 "뭔가 있는 슬롯"으로
+             오인한다. 슬롯2 의 page0 폴백(main ROM) 과는 다르다 — 그쪽은 카트
+             없는 C-BIOS 부트가 쓰는 경로다. *)
+          (Bytes.make 0 '\000', 0)
         | 2, 2 ->
           (* 32KB 카트는 뒷 16KB. 16KB 카트는 A15 를 해독하지 않아 페이지2 에
              앞 16KB 가 다시 보인다 (미러). 경계는 >= — 정확히 0x8000 인
-             파일이 로고 ROM 으로 새는 게 스펠렁커 halt 사태의 원인이었다. *)
-          if Bytes.length m.cart >= 0x8000 then (m.cart, cart_off)
+             파일이 로고 ROM 으로 새는 게 스펠렁커 halt 사태의 원인이었다.
+             [cart] 가 디스크 인터페이스 ROM(실ROM 부트)이면 카트리지 슬롯은
+             실기처럼 비어 있다 — 전 페이지 빈 버스. *)
+          if m.cart_is_disk_rom then (Bytes.make 0 '\000', 0)
+          else if Bytes.length m.cart >= 0x8000 then (m.cart, cart_off)
           else if Bytes.length m.cart >= 0x4000 then (m.cart, off)
           else (m.logo_rom, off)
         | 2, 0 ->
           (* 실기 NMS8250: 카트리지는 page1(0x4000) 부터 보인다 — page0 은
              빈 버스. 카트 파일 앞 16KB("AB" 헤더)를 page0 에서도 돌려주면
              실 BIOS 의 슬롯 스캔 판정을 오염시킨다. 카트가 없는 부트의 기존
-             폴백(main ROM 미러)은 유지 — 그 부트가 이 뷰를 읽는다. *)
-          if Bytes.length m.cart >= 0x4000 then (Bytes.make 0 '\000', 0)
+             폴백(main ROM 미러)은 유지 — 그 부트가 이 뷰를 읽는다. 실ROM
+             부트의 인터페이스는 3-3 에만 있으므로 여기도 빈 버스다. *)
+          if m.cart_is_disk_rom || Bytes.length m.cart >= 0x4000
+          then (Bytes.make 0 '\000', 0)
           else (m.main_rom, off)
         | 2, 1 ->
-          if Bytes.length m.cart >= 0x4000 then (m.cart, cart_off)
+          if m.cart_is_disk_rom then (Bytes.make 0 '\000', 0)
+          else if Bytes.length m.cart >= 0x4000 then (m.cart, cart_off)
           else (m.main_rom, off)
         | 0, 3 | 1, 3 | 2, 3 ->
           (* 실기 NMS8250: 슬롯0-2 의 page3(0xC000-) 는 빈 버스(0xFF) 다.
@@ -531,7 +616,7 @@ let mem_write m addr v =
   if a = 0xffff && slot = 3 then m.slot3_sel <- v land 0xff
   else if
     a land 0x3ff8 = 0x3ff8
-    && ((slot = 2 && Bytes.length m.cart >= 0x4000)
+    && ((slot = 2 && not m.cart_is_disk_rom && Bytes.length m.cart >= 0x4000)
         || (slot = 3 && slot3_sub m page = 3 && Bytes.length m.cart >= 0x4000))
     && Bytes.length m.disk > 0
   then
@@ -539,17 +624,32 @@ let mem_write m addr v =
        포트 0xD0-0xD3(명령/트랙/섹터/데이터), +4 = 사이드(bit0), +5 =
        드라이브(bits0-1)·모터(bit7) — 0xD4 포트 계열과는 비트 배치가 다르다
        (openMSX PhilipsFDC 정본). *)
-    (match a land 7 with
-     | 0 | 1 | 2 | 3 -> fdc_write m ((a land 7) + 0xd0) v
-     | 4 ->
-       fdc_note 1 0xd4 v;
-       m.fdc.side_reg <- v land 0xff;
-       m.fdc.side <- v land 1
-     | 5 ->
-       fdc_note 1 0xd5 v;
-       m.fdc.drive_reg <- v land 0xff;
-       m.fdc.motor <- v land 0x80 <> 0
-     | _ -> ())
+    begin
+      (let fdc_trace =
+         try Sys.getenv "FDC_TRACE" <> "" with Not_found -> false
+       in
+       if fdc_trace then begin
+         Printf.eprintf "fdcwin W %04x=%02x @%04x sp=%04x ppi=%02x sl3=%02x\n  ring:"
+           a (v land 0xff) (Z80.dump_pc m.cpu) (Z80.dump_sp m.cpu)
+           m.ppi_a m.slot3_sel;
+         (* 직전 명령 64스텝(링 전체) — KEYINT 주기를 넘어 그 사이 실행까지. *)
+         for k = max 0 (!ri - 64) to !ri - 1 do
+           Printf.eprintf " %04x" ring.(k land 63)
+         done;
+         Printf.eprintf "\n%!"
+       end);
+      match a land 7 with
+      | 0 | 1 | 2 | 3 -> fdc_write m ((a land 7) + 0xd0) v
+      | 4 ->
+        fdc_note m 1 0xd4 v;
+        m.fdc.side_reg <- v land 0xff;
+        m.fdc.side <- v land 1
+      | 5 ->
+        fdc_note m 1 0xd5 v;
+        m.fdc.drive_reg <- v land 0xff;
+        m.fdc.motor <- v land 0x80 <> 0
+      | _ -> ()
+    end
   else if
     slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
   then begin
@@ -638,6 +738,17 @@ let port_read m port =
   | _ -> 0xff
 
 let port_write m port v =
+  let ppi_trace =
+    try Sys.getenv "PPI_TRACE" <> "" with Not_found -> false
+  in
+  (if ppi_trace && (port land 0xff) = 0xA8 then
+     Printf.eprintf "a8 %02x @%04x iff=%b hl=%04x ret=%04x sl3=%02x m=%d,%d,%d,%d\n%!"
+       (v land 0xff) (Z80.dump_pc m.cpu) (Z80.dump_iff1 m.cpu) (Z80.dump_hl m.cpu)
+       (mem_read m (Z80.dump_sp m.cpu) lor (mem_read m ((Z80.dump_sp m.cpu) + 1) lsl 8))
+       m.slot3_sel m.mapper.(0) m.mapper.(1) m.mapper.(2) m.mapper.(3));
+  (if ppi_trace && (port land 0xff) >= 0xFC then
+     Printf.eprintf "map p%d=%02x @%04x\n%!" (port land 3) (v land 0x3f)
+       (Z80.dump_pc m.cpu));
   match port land 0xff with
   | 0x2E | 0x2F ->
     (* 게임 커널의 디버그 채널(룬마스터 TPA 0x09B8 의 문자열 출력 루틴이
@@ -704,6 +815,7 @@ let create ~machine =
       con_esc = 0;
       rst30_pending = [];
       hle_disk = true;
+      cart_is_disk_rom = false;
       fdc = fdc_create ();
       (* 전원 인가 시 RAM 의 실측 패턴(openMSX Philips_NMS_8250 initialContent):
          (00 FF)*128 (FF 00)*128 의 512 바이트 블록이 전체를 덮는다. 룬마스터
@@ -959,13 +1071,27 @@ let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
      "AB" header findable. *)
   (match (if real_rom then disk_rom_real () else None) with
    | Some real ->
-     (* 실ROM 을 cart 에 올리되 HLE 트랩은 유지한다 — 하이브리드. cbios_disk.rom
-         은 물리 I/O 가 없어(dskio_done = nop/ret, 09-09 실측) 단독 부트는
-         불가능하지만, 게임 커널이 page0 을 디스크 ROM 슬롯으로 스왑하고 부르는
-         루틴들(0x30xx+)은 이 코드에 산다 — 룬마스터 1 의 커널이 RET 채움 cart
-         에서 루틴을 못 찾아 빈 RAM 으로 미끄러지던 경로(실측). 부트 섹터 로드와
-         BIOS 엔트리는 여전히 HLE 트랩이 서빙한다. *)
-     load_cartridge ~mapper:Flat t (Bytes.to_string real)
+     (* 실ROM 은 슬롯3-3 의 원래 자리에만 둔다 — 실기 NMS8250 배선. [cart] 에
+         바이트를 얹되(3-3 page1 뷰가 여기를 읽는다) load_cartridge 를 부르지
+         않는다: 그 호출은 page1 을 카트 슬롯(2) 로 강제 배선해, BIOS 카트
+         스캔(C=0,1,2,3 순서)이 slot 2 의 그림자 복제본을 먼저 발견하게 만든
+         다. 그림자로 등록된 인터페이스를 통해 커널이 일하면 page1=slot2 뷰의
+         FDC 레지스터 창(레거시 배선)에 스택(0x7FF8-0x7FFF)이 겹쳐 무한 루프
+         한다(실측: 09-11, 0x02C0 프리미티브가 8만 회). HLE 트랩은 유지 — 부트
+         섹터 로드와 BIOS 엔트리는 트랩이, 나머지는 실ROM 코드가 맡는다. *)
+     t.cart <- real;
+     t.cart_mapper <- Flat;
+     t.cart_banks.(0) <- 0;
+     t.cart_banks.(1) <- 1;
+     t.cart_banks.(2) <- 2;
+     t.cart_banks.(3) <- 3;
+     t.cart_is_disk_rom <- true;
+     (* 트랩은 물러난다(hle_disk 필드 계약 그대로). 실ROM 의 MSX-DOS 부트는
+         0xF37D 에 자기 엔트리를 RAM 에 심는데, 트랩이 그 주소를 대신 서빙하면
+         미구현 함수(C=0x91)에게 0xFF 를 돌려준 채 커널이 101 회 재시도하고
+         멈춘다(실측: 09-11). 부트 섹터 로드부터 DSKIO 까지 전부 실ROM 코드 가
+         맡는다 — FDC 모델이 그 프로토콜을 받는다. *)
+     t.hle_disk <- false
    | None ->
      if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ()))
 
@@ -980,6 +1106,9 @@ let change_disk t image =
   else begin
     let disk = Bytes.of_string image in
     t.disk <- disk;
+    (* 교체는 DSKCHG 래치를 다시 어설트 — DiskChanger::changeDisk 정본. 다음
+       DSKCHG 읽기는 0 (changed) 로 나와 ROM 이 FAT 을 다시 읽는다. *)
+    t.fdc.disk_changed <- true;
     Hashtbl.reset t.bdos_files;
     Ok ()
   end
@@ -1691,8 +1820,6 @@ let ldirvm_calls = ref []
 let pc_hist_on = ref false
 let trace_from : (int * int) option ref = ref None
 let trace_remaining = ref 0
-let ring = Array.make 64 0
-let ri = ref 0
 let watch_enter : (int * int) option ref = ref None
 let pc_hist = Array.make 256 0
 
@@ -1700,14 +1827,16 @@ let step t ~frames =
   for _ = 1 to frames do
     let budget = ref cycles_per_frame in
     while !budget > 0 do
-      (* VDP 인터럽트와 FDC INTRQ 를 같은 INT 선으로: 실기에서 WD2793 의
-         INTRQ 는 디스크 인터페이스가 MSX 인터럽트 사슬에 끼워 넣는다(실
-         디스크 ROM 의 INIT 가 설치한 핸들러가 0x0038 사슬에서 소비).
-         우리는 즉시-완료 모델이라 INTRQ 가 park(EX (SP),HL 쌍)보다 먼저
-         뜬다 — intr 가 켜져 있는 동안 계속 걸어야 park 직후의 재개가
-         일어난다(펄스 1회화는 재개 누락으로 리캘리브레이션 루프 재발,
-         실측). 상태 읽기(0xD0)가 intr 를 내리므로 무한 재입은 없다. *)
-      if Vdp.int_active t.vdp || t.fdc.intr then ignore (Z80.interrupt t.cpu);
+      (* 인터럽트 선은 VDP 만: NMS8250(PhilipsFDC) 의 WD2793 INTRQ/DRQ 는
+         Z80 인터럽트 선에 연결되지 않는다(openMSX PhilipsFDC 정본 주석:
+         "Drive control IRQ and DRQ lines are not connected to Z80
+         interrupt request") — 0x7FFF 상태 비트(!INTRQ/!DRQ) 폴링 전용.
+         INTRQ 를 INT 선에 얹던 옛 배선은 page1=3-3 + 스택이 창(0x7FF8-0x7FFF
+         미러)에 걸친 KEYINT 침입에서 오염 PUSH 가 발행한 RESTORE 가 intr
+         를 올리고 그 intr 가 재진입을 부르는 자기유지 폭풍의 연료가 됐다
+         (실측 09-11: 64명령 안에 KEYINT 2.5바퀴, PUSH12/POP12 가 FDC 창을
+         유린). fdc.intr 는 0x7FFF 폴링 비트용 상태로만 남는다. *)
+      if Vdp.int_active t.vdp then ignore (Z80.interrupt t.cpu);
       let pc0 = Z80.dump_pc t.cpu in
       (match !trace_from with
        | Some (target, n) when pc0 = target && !trace_remaining = 0 ->
@@ -1881,6 +2010,8 @@ let serialize t =
   State_codec.put_int w t.ppi_a;
   State_codec.put_int w t.ppi_c;
   State_codec.put_int w t.slot3_sel;
+  State_codec.put_int w (if t.cart_is_disk_rom then 1 else 0);
+  State_codec.put_int w (if t.fdc.disk_changed then 1 else 0);
   State_codec.put_int w t.psg_latch;
   State_codec.put_int w t.joy1;
   State_codec.put_int w (List.length t.rst30_pending);
@@ -1928,6 +2059,8 @@ let restore ~state =
     t.ppi_a <- State_codec.get_int r ~min:0 ~max:255;
     t.ppi_c <- State_codec.get_int r ~min:0 ~max:255;
     t.slot3_sel <- State_codec.get_int r ~min:0 ~max:255;
+    t.cart_is_disk_rom <- State_codec.get_int r ~min:0 ~max:1 <> 0;
+    t.fdc.disk_changed <- State_codec.get_int r ~min:0 ~max:1 <> 0;
     t.psg_latch <- State_codec.get_int r ~min:0 ~max:255;
     t.joy1 <- State_codec.get_int r ~min:0 ~max:255;
     let pending = State_codec.get_int r ~min:0 ~max:(State_codec.remaining r / 16) in
