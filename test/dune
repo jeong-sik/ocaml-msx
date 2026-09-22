@@ -62,3 +62,8 @@
  (name im2_test)
  (modules im2_test)
  (libraries z80core))
+
+(test
+ (name chsns_hle_call_test)
+ (modules chsns_hle_call_test)
+ (libraries msx))

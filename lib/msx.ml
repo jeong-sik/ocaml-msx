@@ -1439,6 +1439,37 @@ let disk_trap t pc =
     true
     end
   end
+  else if t.ppi_a land 3 = 3
+          && (match pc with
+              | 0x009c | 0x009f | 0x00a2 | 0x0156 -> true
+              | _ -> false) then begin
+    (* BIOS fixed-page-0 vectors -- CHSNS 0x009C, CHGET 0x009F, CHPUT 0x00A2,
+       and 0x0156 (task-1564): some disk kernels call them with a plain CALL
+       instead of CALSLT/RST 30h, assuming page 0 still shows BIOS.
+       Sangokushi II's DOS routes all four through one self-patching
+       trampoline: each BDOS handler does `LD IX,<vector>; CALL 0xDB10`, and
+       0xDB10 does `LD (0xDB20),IX` so its template `CALL 0x009C` at 0xDB1F
+       executes with the handler's vector -- while page 0 is RAM. The CALL
+       then executes RAM power-on garbage -- the openMSX (00 FF)* initial
+       pattern, not zeros -- so every key-wait path stalls: CONST never sees
+       a key, CONIN never reads one. The CHSNS-only trap was not enough --
+       the game would hang one step later, inside CONIN's CHGET.
+       Serve any of the four like an implicit CALSLT into slot 0, the only
+       slot main_rom lives in: switch page 0 there and register the restore
+       on the CALL's own return address, already on the stack -- unlike RST
+       30h's inline descriptor, a plain CALL needs no target/slot to parse,
+       so this just flips ppi_a and lets the step loop fetch the real BIOS
+       opcode that is now at [pc] in the same cycle (no set_pc, no synthetic
+       18 T-states). No byte-guard on the RAM content: a power-on pattern
+       byte at the vector is not an installed vector -- it is exactly the
+       broken shape this trap exists for, and with page 0 deliberately
+       mapped to RAM, a plain CALL to a fixed BIOS vector has one meaning. *)
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+    t.rst30_pending <- (ret, t.ppi_a) :: t.rst30_pending;
+    t.ppi_a <- t.ppi_a land 0xfc;
+    false
+  end
   else if pc >= 0x4000 && pc < 0x8000
           && (let slot = (t.ppi_a lsr 2) land 3 in slot = 0 || slot = 3) then false
   else if pc = disk_init_entry then begin
