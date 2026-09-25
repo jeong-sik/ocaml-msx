@@ -67,3 +67,8 @@
  (name chsns_hle_call_test)
  (modules chsns_hle_call_test)
  (libraries msx))
+
+(test
+ (name snsmat_hle_call_test)
+ (modules snsmat_hle_call_test)
+ (libraries msx))
