@@ -18,6 +18,9 @@ let () =
   match Msx.restore ~state:v1_state with
   | Error e -> failwith ("v1 checkpoint must restore: " ^ e)
   | Ok t ->
+    let f0 = Msx.frame_number t in
+    Msx.step t ~frames:3;
+    check "restored v1 machine keeps running" (Msx.frame_number t = f0 + 3);
     let s2 = Msx.serialize t in
     check "re-serialized as current version" (String.sub s2 0 11 = "OCAML-MSX\000\002");
     (match Msx.restore ~state:s2 with
@@ -27,4 +30,10 @@ let () =
     Bytes.set tampered 11 '\xff';
     check "corrupt v1 still rejected"
       (match Msx.restore ~state:(Bytes.to_string tampered) with Error _ -> true | Ok _ -> false);
+    let future = Bytes.of_string s2 in
+    Bytes.set future 10 '\x09';
+    check "unknown format number is named"
+      (match Msx.restore ~state:(Bytes.to_string future) with
+       | Error e -> e = "MSX state saved as format 9; this build reads formats 1-2"
+       | Ok _ -> false);
     print_endline "state v1 compat: ok"

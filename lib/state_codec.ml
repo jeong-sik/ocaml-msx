@@ -24,6 +24,9 @@ let reader input =
   let head = String.sub input 0 (String.length magic) in
   let version =
     if head = magic then 2 else if head = magic_v1 then 1
+    else if String.sub head 0 (String.length magic_prefix) = magic_prefix then
+      fail (Printf.sprintf "MSX state saved as format %d; this build reads formats 1-2"
+              (Char.code head.[String.length magic_prefix]))
     else fail "unsupported or truncated MSX state header" in
   let payload = String.sub input start (String.length input - start) in
   if String.sub input (String.length magic) 16 <> Digest.string payload then
