@@ -1,8 +1,12 @@
 exception Invalid_state of string
 let fail message = raise (Invalid_state message)
 type writer = Buffer.t
-type reader = { input : string; mutable pos : int }
-let magic = "OCAML-MSX\000\001"
+type reader = { input : string; mutable pos : int; version : int }
+(* v1: before ocaml-msx #38 (no rtc_mode/rtc_regs/cart_is_disk_rom/disk_changed).
+   v2: current layout. Readers accept both; writers emit v2. *)
+let magic_prefix = "OCAML-MSX\000"
+let magic = magic_prefix ^ "\002"
+let magic_v1 = magic_prefix ^ "\001"
 let writer () = Buffer.create 1024
 let put_int w n =
   let b = Bytes.create 8 in
@@ -16,12 +20,19 @@ let finish w =
   magic ^ Digest.string payload ^ payload
 let reader input =
   let start = String.length magic + 16 in
-  if String.length input < start || String.sub input 0 (String.length magic) <> magic then
-    fail "unsupported or truncated MSX state header";
+  if String.length input < start then fail "unsupported or truncated MSX state header";
+  let head = String.sub input 0 (String.length magic) in
+  let version =
+    if head = magic then 2 else if head = magic_v1 then 1
+    else if String.sub head 0 (String.length magic_prefix) = magic_prefix then
+      fail (Printf.sprintf "MSX state saved as format %d; this build reads formats 1-2"
+              (Char.code head.[String.length magic_prefix]))
+    else fail "unsupported or truncated MSX state header" in
   let payload = String.sub input start (String.length input - start) in
   if String.sub input (String.length magic) 16 <> Digest.string payload then
     fail "MSX state checksum mismatch";
-  { input; pos = start }
+  { input; pos = start; version }
+let version r = r.version
 let remaining r = String.length r.input - r.pos
 let take r n =
   if n < 0 || n > remaining r then fail "truncated MSX state";

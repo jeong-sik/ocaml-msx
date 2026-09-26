@@ -8,6 +8,8 @@ type reader
 val writer : unit -> writer
 val finish : writer -> string
 val reader : string -> reader
+val version : reader -> int
+(* Layout version of the decoded state: 1 (pre-#38) or 2 (current). *)
 val end_of_input : reader -> unit
 val remaining : reader -> int
 val fail : string -> 'a
