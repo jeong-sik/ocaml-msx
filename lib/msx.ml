@@ -2095,14 +2095,18 @@ let restore ~state =
     t.cart_sram_bit <- State_codec.get_int r ~min:0 ~max:max_int;
     t.disk_dma <- State_codec.get_int r ~min:0 ~max:65535;
     t.rtc_reg <- State_codec.get_int r ~min:0 ~max:255;
-    t.rtc_mode <- State_codec.get_int r ~min:0 ~max:15;
-    State_codec.fill_int_array r ~min:0 ~max:15 t.rtc_regs;
+    if State_codec.version r >= 2 then begin
+      t.rtc_mode <- State_codec.get_int r ~min:0 ~max:15;
+      State_codec.fill_int_array r ~min:0 ~max:15 t.rtc_regs
+    end;
     t.con_esc <- State_codec.get_int r ~min:0 ~max:3;
     t.ppi_a <- State_codec.get_int r ~min:0 ~max:255;
     t.ppi_c <- State_codec.get_int r ~min:0 ~max:255;
     t.slot3_sel <- State_codec.get_int r ~min:0 ~max:255;
-    t.cart_is_disk_rom <- State_codec.get_int r ~min:0 ~max:1 <> 0;
-    t.fdc.disk_changed <- State_codec.get_int r ~min:0 ~max:1 <> 0;
+    if State_codec.version r >= 2 then begin
+      t.cart_is_disk_rom <- State_codec.get_int r ~min:0 ~max:1 <> 0;
+      t.fdc.disk_changed <- State_codec.get_int r ~min:0 ~max:1 <> 0
+    end;
     t.psg_latch <- State_codec.get_int r ~min:0 ~max:255;
     t.joy1 <- State_codec.get_int r ~min:0 ~max:255;
     let pending = State_codec.get_int r ~min:0 ~max:(State_codec.remaining r / 16) in
