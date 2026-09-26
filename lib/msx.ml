@@ -2066,9 +2066,9 @@ let serialize t =
   Vdp.write_state w t.vdp;
   State_codec.finish w
 
-let restore ~state =
+let restore_with_reader reader state =
   try
-    let r = State_codec.reader state in
+    let r = reader state in
     let ram = State_codec.get_bytes r in
     (* Current mapper exposes 6 bank bits, 16K each. *)
     let ram_size = Bytes.length ram in
@@ -2126,6 +2126,28 @@ let restore ~state =
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message
+
+let restore_v1 ~state =
+  let current = restore_with_reader State_codec.reader_with_current_v1_layout state in
+  let legacy = restore_with_reader State_codec.reader state in
+  match current, legacy with
+  | Ok current, Ok legacy ->
+      if serialize current = serialize legacy then Ok current
+      else
+        Error
+          "ambiguous MSX state format 1: both payload layouts decode to different machine states"
+  | Ok current, Error _ -> Ok current
+  | Error _, Ok legacy -> Ok legacy
+  | Error _, Error message -> Error message
+
+let restore ~state =
+  match
+    (try Ok (State_codec.version (State_codec.reader state))
+     with State_codec.Invalid_state message -> Error message)
+  with
+  | Error message -> Error message
+  | Ok 1 -> restore_v1 ~state
+  | Ok _ -> restore_with_reader State_codec.reader state
 
 
 type display_mode = Vdp.display_mode =

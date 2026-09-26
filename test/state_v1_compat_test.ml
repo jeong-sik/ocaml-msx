@@ -13,7 +13,23 @@ let v1_state =
     done) runs;
   Buffer.contents b
 let check name cond = if not cond then failwith name
+let v1_envelope_with_current_layout state =
+  let magic_v2 = "OCAML-MSX\000\002" in
+  let payload_offset = String.length magic_v2 + 16 in
+  let payload = String.sub state payload_offset (String.length state - payload_offset) in
+  "OCAML-MSX\000\001" ^ Digest.string payload ^ payload
 let () =
+  let current = Msx.create ~machine:{ram_kb = 64; vram_kb = 128; roms = [""; ""; ""]} in
+  Msx.load_disk current (String.make 512 '\000');
+  let current_v2 = Msx.serialize current in
+  let current_v1 = v1_envelope_with_current_layout current_v2 in
+  check "post-#38 fixture has a v1 envelope"
+    (String.sub current_v1 0 11 = "OCAML-MSX\000\001");
+  (match Msx.restore ~state:current_v1 with
+   | Error e -> failwith ("post-#38 v1 checkpoint must restore: " ^ e)
+   | Ok restored ->
+       check "post-#38 v1 payload is preserved"
+         (Msx.serialize restored = current_v2));
   check "fixture is a v1 envelope" (String.sub v1_state 0 11 = "OCAML-MSX\000\001");
   match Msx.restore ~state:v1_state with
   | Error e -> failwith ("v1 checkpoint must restore: " ^ e)
