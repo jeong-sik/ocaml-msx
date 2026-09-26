@@ -33,6 +33,9 @@ let reader input =
     fail "MSX state checksum mismatch";
   { input; pos = start; version }
 let version r = r.version
+let reader_with_current_v1_layout input =
+  let r = reader input in
+  if r.version = 1 then { r with version = 2 } else r
 let remaining r = String.length r.input - r.pos
 let take r n =
   if n < 0 || n > remaining r then fail "truncated MSX state";
