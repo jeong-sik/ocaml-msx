@@ -69,11 +69,11 @@
  (libraries msx))
 
 (test
- (name snsmat_hle_call_test)
- (modules snsmat_hle_call_test)
+ (name state_v1_compat_test)
+ (modules state_v1_compat_test)
  (libraries msx))
 
 (test
- (name state_v1_compat_test)
- (modules state_v1_compat_test)
+ (name enaslt_ram_call_test)
+ (modules enaslt_ram_call_test)
  (libraries msx))
