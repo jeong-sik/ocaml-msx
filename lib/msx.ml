@@ -1441,31 +1441,20 @@ let disk_trap t pc =
   end
   else if t.ppi_a land 3 = 3
           && (match pc with
-              | 0x0024 | 0x009c | 0x009f | 0x00a2 | 0x0156 -> true
+              | 0x009c | 0x009f | 0x00a2 | 0x0156 -> true
               | _ -> false) then begin
-    (* BIOS fixed-page-0 vectors -- SNSMAT 0x0024, CHSNS 0x009C, CHGET 0x009F,
-       CHPUT 0x00A2, and 0x0156 (task-1564, task-1762): some disk kernels
-       call them with a plain CALL instead of CALSLT/RST 30h, assuming page 0
-       still shows BIOS.
-       Sangokushi II's DOS routes CHSNS/CHGET/CHPUT/0x0156 through one
-       self-patching trampoline: each BDOS handler does `LD IX,<vector>;
-       CALL 0xDB10`, and 0xDB10 does `LD (0xDB20),IX` so its template
-       `CALL 0x009C` at 0xDB1F executes with the handler's vector -- while
-       page 0 is RAM. Deployment/battle-direction prompts (task-1762) take a
-       fifth path: a joystick-plus-keyboard poll (0xDAE2/0xDAF9, called from
-       0xDB10 right before the CHSNS trampoline) reads the matrix row with a
-       *direct* `LD A,<row>; CALL 0x0024` -- SNSMAT, never routed through
-       the IX trampoline, so it was outside the CHSNS-only and four-vector
-       traps alike. The CALL then executes RAM power-on garbage -- the
-       openMSX (00 FF)* initial pattern, not zeros -- so every key-wait path
-       stalls: CONST never sees a key, CONIN never reads one, and a direct
-       SNSMAT poll never sees the row bit either -- the second unit's
-       placement/battle-direction prompt reads the key into the input
-       buffer (BIOS CHGET still fires once, upstream) but the game's own
-       SNSMAT-based accept check runs on garbage and never latches the
-       press, so the prompt sits forever even though the byte reached
-       0xFC14/0xFC2B/0xFC0A.
-       Serve any of the five like an implicit CALSLT into slot 0, the only
+    (* BIOS fixed-page-0 vectors -- CHSNS 0x009C, CHGET 0x009F, CHPUT 0x00A2,
+       and 0x0156 (task-1564): some disk kernels call them with a plain CALL
+       instead of CALSLT/RST 30h, assuming page 0 still shows BIOS.
+       Sangokushi II's DOS routes all four through one self-patching
+       trampoline: each BDOS handler does `LD IX,<vector>; CALL 0xDB10`, and
+       0xDB10 does `LD (0xDB20),IX` so its template `CALL 0x009C` at 0xDB1F
+       executes with the handler's vector -- while page 0 is RAM. The CALL
+       then executes RAM power-on garbage -- the openMSX (00 FF)* initial
+       pattern, not zeros -- so every key-wait path stalls: CONST never sees
+       a key, CONIN never reads one. The CHSNS-only trap was not enough --
+       the game would hang one step later, inside CONIN's CHGET.
+       Serve any of the four like an implicit CALSLT into slot 0, the only
        slot main_rom lives in: switch page 0 there and register the restore
        on the CALL's own return address, already on the stack -- unlike RST
        30h's inline descriptor, a plain CALL needs no target/slot to parse,
