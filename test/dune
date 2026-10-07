@@ -77,3 +77,8 @@
  (name enaslt_ram_call_test)
  (modules enaslt_ram_call_test)
  (libraries msx))
+
+(test
+ (name core_identity_test)
+ (modules core_identity_test)
+ (libraries core_digest msx_core_identity))
