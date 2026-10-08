@@ -8,4 +8,4 @@
 (executable
  (name gen_core_identity)
  (modules gen_core_identity)
- (libraries core_digest))
+ (libraries core_digest unix))
