@@ -1,0 +1,11 @@
+; The digest algorithm and the program that bakes its value into
+; Msx_core_identity. Neither is installed: only the generated value is.
+
+(library
+ (name core_digest)
+ (modules core_digest))
+
+(executable
+ (name gen_core_identity)
+ (modules gen_core_identity)
+ (libraries core_digest))

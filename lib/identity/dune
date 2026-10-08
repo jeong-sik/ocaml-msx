@@ -1,0 +1,22 @@
+; Which core a client linked. The value is computed at build time from the
+; core's own sources in lib/, so a vendored copy, an opam install and a git
+; checkout of the same sources report the same digest, and a copy that
+; differs in any byte reports a different one. lib/dune is hashed too: its
+; flags and module list change the core as much as a source file does.
+; lib/ must stay flat: a source in a subdirectory would not be hashed.
+
+(library
+ (name msx_core_identity)
+ (public_name ocaml-msx.core-identity)
+ (modules msx_core_identity))
+
+(rule
+ (targets msx_core_identity.ml)
+ (deps
+  ../dune
+  (glob_files ../*.ml)
+  (glob_files ../*.mli))
+ (action
+  (with-stdout-to
+   %{targets}
+   (run %{exe:gen/gen_core_identity.exe} %{deps}))))
