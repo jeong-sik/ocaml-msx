@@ -42,6 +42,7 @@ MSX2+ 를 OCaml 로 에뮬레이트한다. 최종 목표는 두 개다:
 - **재생**: `bin/replay.exe --roms DIR --cart ROM --ledger ledger.jsonl --out-dir DIR` 이 masc 가
   기록한 입력 원장(`frame, who, key, edge`)을 결정론적으로 다시 돌려 프레임을 PPM 으로 덤프한다.
   같은 카트리지 + 같은 원장 = 같은 화면(코어는 시계·난수를 안 읽는다). 사후 관전·GIF 용.
+- **세이브 스테이트**: v3 봉투가 WD2793 드라이브 상태(cmd/track/sector/data/side/motor/step_out/busy/drq/intr/buf/pos/side_reg/drive_reg/intr_fired)를 저장한다(ocaml-msx #46). 복원은 냉시동으로 다시 출발하지 않는다.
 - **라이브 관전**: masc TUI `&` 화면이 서버 프레임을 받아 그린다 (RFC-0439 §3.7, masc PR).
 
 ## 클라이언트
