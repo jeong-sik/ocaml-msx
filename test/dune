@@ -82,3 +82,8 @@
  (name core_identity_test)
  (modules core_identity_test)
  (libraries core_digest msx_core_identity))
+
+(test
+ (name state_fdc_test)
+ (modules state_fdc_test)
+ (libraries msx))

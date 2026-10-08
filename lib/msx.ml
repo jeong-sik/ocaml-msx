@@ -2051,6 +2051,27 @@ let serialize t =
   State_codec.put_int w (List.length files);
   List.iter (fun (fcb, (data, pos)) ->
     State_codec.put_int w fcb; State_codec.put_bytes w data; State_codec.put_int w pos) files;
+  (* v3: the WD2793-visible drive state (ocaml-msx #46). Without it a restored
+     machine redrives cold — motor off, track register 0, and any in-flight
+     READ SECTOR (busy/drq/intr, the sector buffer and its pump position)
+     lost — so two machines differing only in drive state serialize to
+     identical bytes. *)
+  let f = t.fdc in
+  State_codec.put_int w f.cmd;
+  State_codec.put_int w f.track;
+  State_codec.put_int w f.sector;
+  State_codec.put_int w f.data;
+  State_codec.put_int w f.side;
+  State_codec.put_bool w f.motor;
+  State_codec.put_bool w f.step_out;
+  State_codec.put_bool w f.busy;
+  State_codec.put_bool w f.drq;
+  State_codec.put_bool w f.intr;
+  State_codec.put_bytes w f.buf;
+  State_codec.put_int w f.pos;
+  State_codec.put_int w f.side_reg;
+  State_codec.put_int w f.drive_reg;
+  State_codec.put_bool w f.intr_fired;
   Z80.write_state w t.cpu;
   Vdp.write_state w t.vdp;
   State_codec.finish w
@@ -2110,6 +2131,27 @@ let restore_with_reader reader state =
       let pos = State_codec.get_int r ~min:0 ~max:max_int in
       Hashtbl.add t.bdos_files fcb (data, pos)
     done;
+    if State_codec.version r >= 3 then begin
+      let f = t.fdc in
+      f.cmd <- State_codec.get_int r ~min:0 ~max:255;
+      f.track <- State_codec.get_int r ~min:0 ~max:255;
+      f.sector <- State_codec.get_int r ~min:0 ~max:255;
+      f.data <- State_codec.get_int r ~min:0 ~max:255;
+      f.side <- State_codec.get_int r ~min:0 ~max:1;
+      f.motor <- State_codec.get_bool r;
+      f.step_out <- State_codec.get_bool r;
+      f.busy <- State_codec.get_bool r;
+      f.drq <- State_codec.get_bool r;
+      f.intr <- State_codec.get_bool r;
+      let buf = State_codec.get_bytes r in
+      if Bytes.length buf <> Bytes.length f.buf then
+        State_codec.fail "invalid FDC sector buffer size";
+      Bytes.blit buf 0 f.buf 0 (Bytes.length f.buf);
+      f.pos <- State_codec.get_int r ~min:0 ~max:(Bytes.length f.buf);
+      f.side_reg <- State_codec.get_int r ~min:0 ~max:255;
+      f.drive_reg <- State_codec.get_int r ~min:0 ~max:255;
+      f.intr_fired <- State_codec.get_bool r
+    end;
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
     State_codec.end_of_input r;

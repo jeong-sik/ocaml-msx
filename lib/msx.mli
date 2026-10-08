@@ -5,7 +5,8 @@
     RAM 매퍼를 배선한 MSX2 머신이다.
 
     Sound output remains unimplemented. Versioned save states include CPU,
-    VDP, memory, mounted media and device state; file IO belongs to callers. *)
+    VDP, memory, mounted media, the WD2793 drive state (format v3,
+    ocaml-msx #46) and device state; file IO belongs to callers. *)
 
 type key =
   | Up

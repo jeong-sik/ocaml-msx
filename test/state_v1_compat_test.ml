@@ -21,15 +21,16 @@ let v1_envelope_with_current_layout state =
 let () =
   let current = Msx.create ~machine:{ram_kb = 64; vram_kb = 128; roms = [""; ""; ""]} in
   Msx.load_disk current (String.make 512 '\000');
-  let current_v2 = Msx.serialize current in
-  let current_v1 = v1_envelope_with_current_layout current_v2 in
-  check "post-#38 fixture has a v1 envelope"
-    (String.sub current_v1 0 11 = "OCAML-MSX\000\001");
-  (match Msx.restore ~state:current_v1 with
-   | Error e -> failwith ("post-#38 v1 checkpoint must restore: " ^ e)
-   | Ok restored ->
-       check "post-#38 v1 payload is preserved"
-         (Msx.serialize restored = current_v2));
+  let current_v3 = Msx.serialize current in
+  let v3_as_v1 = v1_envelope_with_current_layout current_v3 in
+  check "re-enveloped fixture has a v1 envelope"
+    (String.sub v3_as_v1 0 11 = "OCAML-MSX\000\001");
+  (* Since v3 (ocaml-msx #46) a v1 envelope can legally carry only the frozen
+     v1 layout; a current payload under a v1 envelope is corruption, and both
+     decode branches of restore_v1 must reject it loudly instead of silently
+     decoding a shifted machine. *)
+  check "v1 envelope carrying a current payload is rejected"
+    (match Msx.restore ~state:v3_as_v1 with Error _ -> true | Ok _ -> false);
   check "fixture is a v1 envelope" (String.sub v1_state 0 11 = "OCAML-MSX\000\001");
   match Msx.restore ~state:v1_state with
   | Error e -> failwith ("v1 checkpoint must restore: " ^ e)
@@ -38,7 +39,7 @@ let () =
     Msx.step t ~frames:3;
     check "restored v1 machine keeps running" (Msx.frame_number t = f0 + 3);
     let s2 = Msx.serialize t in
-    check "re-serialized as current version" (String.sub s2 0 11 = "OCAML-MSX\000\002");
+    check "re-serialized as current version" (String.sub s2 0 11 = "OCAML-MSX\000\003");
     (match Msx.restore ~state:s2 with
      | Ok t2 -> check "v2 round trip is stable" (Msx.serialize t2 = s2)
      | Error e -> failwith ("v2 round trip: " ^ e));
@@ -50,6 +51,6 @@ let () =
     Bytes.set future 10 '\x09';
     check "unknown format number is named"
       (match Msx.restore ~state:(Bytes.to_string future) with
-       | Error e -> e = "MSX state saved as format 9; this build reads formats 1-2"
+       | Error e -> e = "MSX state saved as format 9; this build reads formats 1-3"
        | Ok _ -> false);
     print_endline "state v1 compat: ok"
