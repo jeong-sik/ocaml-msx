@@ -27,24 +27,42 @@ let is_full_sha sha =
        sha
 ;;
 
-let source_commit () =
+let realpath path =
+  match Unix.realpath path with
+  | path -> Some path
+  | exception Unix.Unix_error _ -> None
+;;
+
+let source_commit project_path =
+  (* Dune expands project_root relative to the action's working directory,
+     which the rule sets to workspace_root. Both are build-context paths;
+     only DUNE_SOURCEROOT identifies the corresponding source workspace. *)
   match Sys.getenv_opt "DUNE_SOURCEROOT" with
   | None -> None
-  | Some root ->
-    (match read_git root "status --porcelain --untracked-files=all",
-           read_git root "rev-parse --verify HEAD" with
-     | Some "", Some sha when is_full_sha sha -> Some sha
-     | _ -> None)
+  | Some workspace ->
+    let root = Filename.concat workspace project_path in
+    (* A vendored/archive project must not inherit a parent repository's
+       identity. A worktree's .git file, as well as a .git directory, owns
+       a checkout. Canonical paths also handle symlinked workspace roots. *)
+    if not (Sys.file_exists (Filename.concat root ".git")) then None
+    else
+      (match realpath root, read_git root "rev-parse --show-toplevel" with
+       | Some root, Some top when realpath top = Some root ->
+         (match read_git root "status --porcelain --untracked-files=all --ignore-submodules=none",
+                read_git root "rev-parse --verify HEAD" with
+          | Some "", Some sha when is_full_sha sha -> Some sha
+          | _ -> None)
+       | _ -> None)
 ;;
 
 let () =
   match List.tl (Array.to_list Sys.argv) with
-  | [] ->
-    prerr_endline "gen_core_identity: no source files given";
+  | [] | [_] ->
+    prerr_endline "gen_core_identity: expected project path and source files";
     exit 2
-  | paths ->
+  | project_path :: paths ->
     let source_commit =
-      match source_commit () with
+      match source_commit project_path with
       | Some sha -> "Some " ^ Printf.sprintf "%S" sha
       | None -> "None" in
     Printf.printf

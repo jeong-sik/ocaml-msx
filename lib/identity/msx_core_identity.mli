@@ -7,7 +7,8 @@
 
     The source digest identifies the linked library inputs. [source_commit]
     separately reports the full commit that built this identity when Dune sees
-    a clean Git checkout; archive and dirty-tree builds report [None]. *)
+    the core project's own clean Git checkout. Archive, vendored copies
+    without their own checkout, and dirty-tree builds report [None]. *)
 
 val source_digest : string
 (** Lowercase hex MD5 over every [.ml] and [.mli] file in the core's [lib/]
@@ -20,4 +21,6 @@ val source_files : int
 
 val source_commit : string option
 (** The full Git commit of the clean source checkout used for this build.
-    [None] when the build has no Git checkout or the checkout was dirty. *)
+    [None] when the core project does not own a Git checkout, it is dirty,
+    or Git cannot determine its identity. A containing repository's commit
+    and a downstream dependency pin are never substituted. *)
