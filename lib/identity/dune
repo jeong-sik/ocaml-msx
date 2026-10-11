@@ -1,7 +1,8 @@
 ; Which core a client linked. The source digest covers lib/'s top-level
 ; implementation and its dune file. The exact Git commit is recorded only for
-; a clean checkout. The full source tree dependency keeps the commit identity
-; current when any tracked source changes.
+; the project's own clean checkout. Git metadata is outside source_tree:
+; universe reruns this rule for commits with unchanged source bytes and keeps
+; the result out of Dune's shared cache. Source dependencies remain explicit.
 
 (library
  (name msx_core_identity)
@@ -15,8 +16,10 @@
    ../dune
    (glob_files ../*.ml)
    (glob_files ../*.mli))
-  (source_tree ../..))
+  (source_tree ../..)
+  (universe))
  (action
-  (with-stdout-to
-   %{targets}
-   (run %{exe:gen/gen_core_identity.exe} %{digest}))))
+  (chdir %{workspace_root}
+   (with-stdout-to
+    %{targets}
+    (run %{exe:gen/gen_core_identity.exe} %{project_root} %{digest})))))
