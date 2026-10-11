@@ -29,6 +29,45 @@ let lib_sources () =
 
 let is_lower_hex c = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
 
+let git_output root args =
+  let command = Printf.sprintf "git -C %s %s" (Filename.quote root) args in
+  match Unix.open_process_in command with
+  | exception (Unix.Unix_error _ | Sys_error _) -> None
+  | channel ->
+    let output =
+      match In_channel.input_all channel with
+      | text -> Some (String.trim text)
+      | exception Sys_error _ -> None in
+    let status =
+      match Unix.close_process_in channel with
+      | status -> Some status
+      | exception (Unix.Unix_error _ | Sys_error _) -> None in
+    (match status, output with
+     | Some (Unix.WEXITED 0), Some text -> Some text
+     | Some (Unix.WEXITED _ | Unix.WSIGNALED _ | Unix.WSTOPPED _), _
+     | None, _ -> None)
+
+let expected_source_commit () =
+  match Sys.getenv_opt "DUNE_SOURCEROOT" with
+  | None -> None
+  | Some root ->
+    (match git_output root "status --porcelain --untracked-files=all",
+           git_output root "rev-parse --verify HEAD" with
+     | Some "", Some sha when String.length sha = 40 && String.for_all is_lower_hex sha ->
+       Some sha
+     | _ -> None)
+
+let option_to_string = function None -> "None" | Some value -> "Some " ^ value
+
+let test_source_commit_is_this_builds_git_revision () =
+  check_s "baked source commit = clean git source root"
+    (option_to_string Msx_core_identity.source_commit)
+    (option_to_string (expected_source_commit ()));
+  check_true "source commit is full lowercase SHA when present"
+    (match Msx_core_identity.source_commit with
+     | None -> true
+     | Some sha -> String.length sha = 40 && String.for_all is_lower_hex sha)
+
 let test_baked_value_is_this_builds_sources () =
   let paths = lib_sources () in
   check_true "lib/ has sources to digest" (paths <> []);
@@ -56,6 +95,7 @@ let test_digest_moves_with_the_sources () =
 let () =
   test_baked_value_is_this_builds_sources ();
   test_digest_moves_with_the_sources ();
+  test_source_commit_is_this_builds_git_revision ();
   if !failed = 0 then print_endline "core identity: all passed"
   else begin
     Printf.eprintf "core identity: %d failures\n%!" !failed;
