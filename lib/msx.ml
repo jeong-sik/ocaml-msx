@@ -897,6 +897,20 @@ let disk_call_log = ref false
 let set_disk_call_log b = disk_call_log := b
 let disk_call_entries () = List.rev !disk_calls
 
+(* Observation: every fixed-page-0 BIOS vector the trap below serves, with the
+   plain CALL's own return address. A kernel that routes vectors through a
+   self-patching trampoline leaves the handler's frame address here, which is
+   how "the game called SNSMAT/GTSTCK" is told apart from "the core guessed".
+   [(pc, return_address)] in call order. *)
+let bios_vector_calls : (int * int) list ref = ref []
+let bios_vector_log = ref false
+(* Turning the ledger on starts a fresh one, so a live run's entries are only
+   the calls made after the flag went on, not whatever a previous run left. *)
+let set_bios_vector_log b =
+  if b then bios_vector_calls := [];
+  bios_vector_log := b
+let bios_vector_entries () = List.rev !bios_vector_calls
+
 (* Per-function BDOS call counts, for boot diagnosis: which functions a
    loader actually exercises (_RDBLK 27 calls in Sangokushi II's loader). *)
 let bdos_call_counts : int array = Array.make 256 0
@@ -1441,7 +1455,7 @@ let disk_trap t pc =
   end
   else if t.ppi_a land 3 = 3
           && (match pc with
-              | 0x009c | 0x009f | 0x00a2 | 0x0156 -> true
+              | 0x009c | 0x009f | 0x00a2 | 0x0156 | 0x00d5 | 0x0141 -> true
               | _ -> false) then begin
     (* BIOS fixed-page-0 vectors -- CHSNS 0x009C, CHGET 0x009F, CHPUT 0x00A2,
        and 0x0156 (task-1564): some disk kernels call them with a plain CALL
@@ -1463,9 +1477,19 @@ let disk_trap t pc =
        18 T-states). No byte-guard on the RAM content: a power-on pattern
        byte at the vector is not an installed vector -- it is exactly the
        broken shape this trap exists for, and with page 0 deliberately
-       mapped to RAM, a plain CALL to a fixed BIOS vector has one meaning. *)
+       mapped to RAM, a plain CALL to a fixed BIOS vector has one meaning.
+
+       SNSMAT 0x0141 and GTSTCK 0x00D5 (ocaml-msx#51) join the same list:
+       both are fixed page-0 entries, and both are the only BIOS paths that
+       read keyboard matrix row 8 / the joystick bits behind it. A kernel's
+       trampoline reaches them by the identical plain CALL, so serving them
+       has the same single meaning as the four above. Whether a given title
+       actually calls them is an observation, not an assumption -- turn on
+       [set_bios_vector_log] to record (pc, return address) per served
+       vector and read it back with [bios_vector_entries]. *)
     let sp = Z80.dump_sp t.cpu in
     let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+    if !bios_vector_log then bios_vector_calls := (pc, ret) :: !bios_vector_calls;
     t.rst30_pending <- (ret, t.ppi_a) :: t.rst30_pending;
     t.ppi_a <- t.ppi_a land 0xfc;
     false

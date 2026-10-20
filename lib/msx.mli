@@ -107,6 +107,13 @@ val set_disk_call_log : bool -> unit
 val disk_call_entries : unit -> (int * int * int * int * int * int) list
 (** [(pc, a, bc, de, hl, f)] per disk BIOS entry, in order. *)
 
+val set_bios_vector_log : bool -> unit
+(** Record every fixed-page-0 BIOS vector served by the plain-CALL trap, with
+    the CALL's own return address. Off by default. *)
+
+val bios_vector_entries : unit -> (int * int) list
+(** [(pc, return_address)] per served vector, in call order. *)
+
 val bdos_counts : unit -> int array
 (** Per-function BDOS call counts indexed by function number — which
     functions a loader actually exercises. For boot diagnosis. *)
