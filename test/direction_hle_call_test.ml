@@ -70,6 +70,11 @@ let build_main_rom () =
   Bytes.set main 0x53 '\x3e'; Bytes.set main 0x54 '\xff';
   Bytes.set main 0x55 '\x32'; Bytes.set main 0x56 '\x47'; Bytes.set main 0x57 '\xc1';
   Bytes.set main 0x58 '\xc9';
+  (* 0x0321 (ROM-visible at 0x4321): LD A,8 ; CALL 0x0141 ; RET -- a caller that
+     lives inside the BIOS ROM itself, for the origin-split check. *)
+  Bytes.set main 0x321 '\x3e'; Bytes.set main 0x322 '\x08';
+  Bytes.set main 0x323 '\xcd'; Bytes.set main 0x324 '\x41'; Bytes.set main 0x325 '\x01';
+  Bytes.set main 0x326 '\xc9';
   main
 
 (* Fresh machine in the DOS-kernel-replay shape (page 0 = slot 3 RAM, so the
@@ -190,18 +195,52 @@ let () =
   let entries = Msx.bios_vector_entries () in
   check "log: exactly three served vectors recorded"
     (List.length entries = 3);
-  check "log: SNSMAT recorded with a return address inside the caller"
+  check "log: SNSMAT recorded with a return address inside the caller, in RAM"
     (match entries with
-     | (0x0141, ret) :: _ -> ret >= 0x0000 && ret < 0x0100
+     | (0x0141, ret, Msx.From_ram) :: _ -> ret >= 0x0000 && ret < 0x0100
      | _ -> false);
   check "log: GTSTCK recorded after it"
     (match entries with
-     | _ :: (0x00d5, _) :: _ -> true
+     | _ :: (0x00d5, _, Msx.From_ram) :: _ -> true
      | _ -> false);
   check "log: GTTRIG recorded last"
     (match entries with
-     | _ :: _ :: (0x00d8, _) :: _ -> true
+     | _ :: _ :: (0x00d8, _, Msx.From_ram) :: _ -> true
      | _ -> false);
+  (* The origin split itself: with page 1 selected to slot 0 the main ROM holds
+     0x4000-0x7FFF, so a CALL issued from inside the ROM body must be recorded
+     as From_rom while the same vector called from RAM stays From_ram. Without
+     this, one 0x0141 count silently mixes the stub's own call with the game's
+     -- which is the number a "the game really called it" claim would rest on. *)
+  check "origin: address inside the selected main ROM classifies as From_rom"
+    (let m = fresh () in
+     Msx.port_out m 0xa8 0xc3;
+     Msx.bios_vector_origin m 0x4321 = Msx.From_rom);
+  check "origin: address in page-0 RAM classifies as From_ram"
+    (let m = fresh () in
+     Msx.port_out m 0xa8 0xc3;
+     Msx.bios_vector_origin m 0x0100 = Msx.From_ram);
+  (* And through the trap: a CALL issued from the ROM body must land in the
+     From_rom bucket. main_rom carries a tiny caller at ROM offset 0x321
+     (visible at 0x4321 when page 1 selects slot 0): LD A,8 ; CALL 0x0141 ;
+     RET. The RAM stub just CALLs into it, so the logged return address
+     0x4326 sits inside the BIOS ROM while the RAM-issued calls above sit in
+     page-0 RAM. *)
+  let t =
+    run_scenario ~log:true
+      [ 0xcd; 0x21; 0x43 ]   (* CALL 0x4321 -- into the ROM caller *)
+  in
+  let rom_entries =
+    List.filter
+      (fun (pc, _, origin) -> pc = 0x0141 && origin = Msx.From_rom)
+      (Msx.bios_vector_entries ())
+  in
+  check "origin: a CALL issued from the ROM body is logged as From_rom"
+    (match rom_entries with
+     | [ (0x0141, 0x4326, Msx.From_rom) ] -> true
+     | _ -> false);
+  check "origin: the ROM-origin call still returns control to the caller"
+    (Msx.cpu_halted t);
   (* Logging off must not append. Measure the length before and after the run
      instead of asserting a fixed size that only holds for this file order. *)
   check "log: logging off appends nothing to the ledger"

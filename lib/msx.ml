@@ -902,7 +902,16 @@ let disk_call_entries () = List.rev !disk_calls
    self-patching trampoline leaves the handler's frame address here, which is
    how "the game called SNSMAT/GTSTCK" is told apart from "the core guessed".
    [(pc, return_address)] in call order. *)
-let bios_vector_calls : (int * int) list ref = ref []
+(* Which side of the ROM/RAM boundary a served vector's return address sits on.
+   A BIOS ROM body that reaches a fixed page-0 vector returns into the ROM; a
+   disk kernel or game returns into RAM. Counting 0x0141 alone mixes the two --
+   the stub's own call would inflate "the game called SNSMAT" -- so the ledger
+   keeps the origin with every entry. *)
+type bios_vector_origin =
+  | From_rom  (** the main BIOS ROM holds the return address *)
+  | From_ram  (** RAM or a DOS load area holds it: an external caller *)
+
+let bios_vector_calls : (int * int * bios_vector_origin) list ref = ref []
 let bios_vector_log = ref false
 (* Turning the ledger on starts a fresh one, so a live run's entries are only
    the calls made after the flag went on, not whatever a previous run left. *)
@@ -910,6 +919,23 @@ let set_bios_vector_log b =
   if b then bios_vector_calls := [];
   bios_vector_log := b
 let bios_vector_entries () = List.rev !bios_vector_calls
+
+(* Same page/slot resolution [mem_read] uses, cut down to the one question the
+   ledger asks: is this address inside the main BIOS ROM or not? Slot 0 pages 0
+   and 1 hold [main_rom] (see the slot table in [mem_read]); every other slot
+   holding the address is RAM, a DOS load area, or a cartridge. *)
+let bios_vector_origin m addr =
+  let a = addr land 0xffff in
+  let page = a lsr 14 in
+  let slot =
+    match page with
+    | 0 -> m.ppi_a land 3
+    | 1 -> (m.ppi_a lsr 2) land 3
+    | 2 -> (m.ppi_a lsr 4) land 3
+    | _ -> (m.ppi_a lsr 6) land 3
+  in
+  if slot = 0 && page <= 1 && Bytes.length m.main_rom > 0 then From_rom
+  else From_ram
 
 (* Per-function BDOS call counts, for boot diagnosis: which functions a
    loader actually exercises (_RDBLK 27 calls in Sangokushi II's loader). *)
@@ -1496,7 +1522,8 @@ let disk_trap t pc =
        8, and the served answer has to cover that too. *)
     let sp = Z80.dump_sp t.cpu in
     let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
-    if !bios_vector_log then bios_vector_calls := (pc, ret) :: !bios_vector_calls;
+    if !bios_vector_log then
+      bios_vector_calls := (pc, ret, bios_vector_origin t ret) :: !bios_vector_calls;
     t.rst30_pending <- (ret, t.ppi_a) :: t.rst30_pending;
     t.ppi_a <- t.ppi_a land 0xfc;
     false
