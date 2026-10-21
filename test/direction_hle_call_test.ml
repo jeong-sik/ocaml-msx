@@ -214,10 +214,16 @@ let () =
     t
   in
   let t = run_page0_rom ~log:true [ 0x3e; 0x08; 0xcd; 0x41; 0x01 ] in
+  (* Liveness only: without this the empty-ledger check below could pass
+     because the CALL never got there. It is *not* a trap detector -- the trap
+     also returns false and lets the step loop fetch the same ROM opcode, so
+     this value comes home either way. *)
   check "guard: page 0 on slot 0 -- the CALL runs the ROM's own JP body"
     (Msx.cpu_halted t && Msx.mem_read t 0xc140 = 0x08);
-  check "guard: page 0 on slot 0 -- ppi_a is untouched (no trap, no flip)"
-    (Msx.ppi_a t = 0xc0);
+  (* The detector. ppi_a cannot be one: the trap parks the pre-flip wiring on
+     the return address ([rst30_pending]) and restores it on the way back, and
+     [land 0xfc] is a no-op on 0xC0 anyway, so a post-run ppi_a read is blind
+     twice over. Do not re-add that assertion expecting it to catch anything. *)
   check "guard: page 0 on slot 0 -- nothing was logged as served"
     (Msx.bios_vector_entries () = []);
   (* Same machine, GTSTCK: the ROM body answers and the trap stays out. *)
