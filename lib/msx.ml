@@ -1455,7 +1455,7 @@ let disk_trap t pc =
   end
   else if t.ppi_a land 3 = 3
           && (match pc with
-              | 0x009c | 0x009f | 0x00a2 | 0x0156 | 0x00d5 | 0x0141 -> true
+              | 0x009c | 0x009f | 0x00a2 | 0x0156 | 0x00d5 | 0x00d8 | 0x0141 -> true
               | _ -> false) then begin
     (* BIOS fixed-page-0 vectors -- CHSNS 0x009C, CHGET 0x009F, CHPUT 0x00A2,
        and 0x0156 (task-1564): some disk kernels call them with a plain CALL
@@ -1479,14 +1479,21 @@ let disk_trap t pc =
        broken shape this trap exists for, and with page 0 deliberately
        mapped to RAM, a plain CALL to a fixed BIOS vector has one meaning.
 
-       SNSMAT 0x0141 and GTSTCK 0x00D5 (ocaml-msx#51) join the same list:
-       both are fixed page-0 entries, and both are the only BIOS paths that
-       read keyboard matrix row 8 / the joystick bits behind it. A kernel's
-       trampoline reaches them by the identical plain CALL, so serving them
-       has the same single meaning as the four above. Whether a given title
-       actually calls them is an observation, not an assumption -- turn on
-       [set_bios_vector_log] to record (pc, return address) per served
-       vector and read it back with [bios_vector_entries]. *)
+       SNSMAT 0x0141, GTSTCK 0x00D5 and GTTRIG 0x00D8 (ocaml-msx#51) join the
+       same list: all three are fixed page-0 entries, and together they are the
+       only BIOS paths that read keyboard matrix row 8 / the joystick bits
+       behind it. A kernel's trampoline reaches them by the identical plain
+       CALL, so serving them has the same single meaning as the four above.
+       GTPAD 0x00DB and GTPDL 0x00DE are deliberately absent: C-BIOS's own
+       bodies for them are stubs (src/main.asm:2415-2447), so routing there
+       would swap power-on garbage for a stub answer and gain no input path.
+       Whether a given title actually calls these is an observation, not an
+       assumption -- turn on [set_bios_vector_log] to record (pc, return
+       address) per served vector and read it back with [bios_vector_entries].
+       GTTRIG's own body does not treat A=0 as the only keyboard case: 2362
+       `cp 5` / 2363 `jr nc,gttrig_space` sends every A >= 5 down the spacebar
+       path, so a caller that passes a larger number still lands on matrix row
+       8, and the served answer has to cover that too. *)
     let sp = Z80.dump_sp t.cpu in
     let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
     if !bios_vector_log then bios_vector_calls := (pc, ret) :: !bios_vector_calls;

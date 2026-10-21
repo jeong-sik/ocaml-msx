@@ -1,5 +1,18 @@
 (* Regression for ocaml-msx#51: the same plain-CALL trap that serves CHSNS /
-   CHGET / CHPUT / DIRIN must also serve SNSMAT 0x0141 and GTSTCK 0x00D5.
+   CHGET / CHPUT / DIRIN must also serve SNSMAT 0x0141, GTSTCK 0x00D5 and
+   GTTRIG 0x00D8.
+
+   GTTRIG joins them for the same reason and from the same source: C-BIOS
+   0.29a's page-0 table has `jp gttrig` at 0x00D8 (src/main.asm:363-367), and
+   gttrig's body (src/main.asm:2349-2397) reads exactly the two places the
+   other two vectors read -- SNSMAT row 8 bit 0 for the spacebar path (A=0)
+   and PSG R#14 bits 4/5 for the stick path (A=1..4). A disk kernel that
+   reaches 0x00D5 by plain CALL reaches 0x00D8 the same way, so leaving it
+   unserved means the triggers alone stay invisible while directions work.
+   GTPAD 0x00DB and GTPDL 0x00DE stay out on purpose: C-BIOS's own bodies are
+   stubs (src/main.asm:2415-2447), so routing there would return a stub answer
+   from the ROM instead of power-on garbage -- no keyboard or joystick path
+   would be gained.
 
    Why those two: C-BIOS 0.29a's own page-0 table puts a 3-byte JP at both
    addresses -- `c3 27 18` at 0x0141 (SNSMAT, body: row select on PPI C, read
@@ -11,7 +24,7 @@
    power-on garbage instead of reading the row: every direction key and
    joystick bit would be invisible on that path.
 
-   Scenarios 1-3 use a BIOS-shaped page 0 (JP slots into stub bodies in low
+   Scenarios 1-2b use a BIOS-shaped page 0 (JP slots into stub bodies in low
    main_rom) on a fresh machine each, mirroring chsns_hle_call_test, and prove
    the plumbing: a plain CALL reaches the vector body, the caller's argument
    arrives, the result comes home, ppi_a is restored, and the observation
@@ -32,12 +45,13 @@ let check name cond =
     Printf.eprintf "FAIL %s\n%!" name
   end
 
-(* BIOS-shaped page 0: 0x0141 and 0x00D5 are JP stubs into low main_rom, the
-   layout C-BIOS 0.29a itself uses (c3 27 18 / c3 43 18). *)
+(* BIOS-shaped page 0: 0x0141, 0x00D5 and 0x00D8 are JP stubs into low main_rom,
+   the layout C-BIOS 0.29a itself uses (c3 27 18 / c3 43 18 / jp gttrig). *)
 let build_main_rom () =
   let main = Bytes.make 0x4000 '\000' in
   Bytes.set main 0x141 '\xc3'; Bytes.set main 0x142 '\x30'; Bytes.set main 0x143 '\x00';
   Bytes.set main 0x0d5 '\xc3'; Bytes.set main 0x0d6 '\x40'; Bytes.set main 0x0d7 '\x00';
+  Bytes.set main 0x0d8 '\xc3'; Bytes.set main 0x0d9 '\x50'; Bytes.set main 0x0da '\x00';
   (* 0x0030 SNSMAT body: LD (0xC140),A; LD A,0x5a; LD (0xC141),A; RET -- proves
      both that the row number went in and that a result came back through A. *)
   Bytes.set main 0x30 '\x32'; Bytes.set main 0x31 '\x40'; Bytes.set main 0x32 '\xc1';
@@ -50,6 +64,12 @@ let build_main_rom () =
   Bytes.set main 0x43 '\x3e'; Bytes.set main 0x44 '\x07';
   Bytes.set main 0x45 '\x32'; Bytes.set main 0x46 '\x43'; Bytes.set main 0x47 '\xc1';
   Bytes.set main 0x48 '\xc9';
+  (* 0x0050 GTTRIG body: LD (0xC146),A; LD A,0xFF; LD (0xC147),A; RET -- 0xFF is
+     the "trigger pressed" value C-BIOS returns (main.asm:2392-2397). *)
+  Bytes.set main 0x50 '\x32'; Bytes.set main 0x51 '\x46'; Bytes.set main 0x52 '\xc1';
+  Bytes.set main 0x53 '\x3e'; Bytes.set main 0x54 '\xff';
+  Bytes.set main 0x55 '\x32'; Bytes.set main 0x56 '\x47'; Bytes.set main 0x57 '\xc1';
+  Bytes.set main 0x58 '\xc9';
   main
 
 (* Fresh machine in the DOS-kernel-replay shape (page 0 = slot 3 RAM, so the
@@ -127,18 +147,49 @@ let () =
     (Msx.mem_read t 0xc145 = 0x07);
   check "GTSTCK: ppi_a restored after the CALL returned" (Msx.ppi_a t = 0xc3);
 
-  (* -- 3. Observation log: both vectors are visible with their return address,
-     which is the only evidence that separates a real kernel call from a guess.
-     Lengths are measured as deltas from the count taken just before the run,
-     so this check does not depend on which scenario ran first. *)
+  (* -- 2b. GTTRIG 0x00D8: trigger number 1 (port 1, button A) goes in, the
+     pressed value comes back. *)
+  let t =
+    run_scenario ~log:true
+      [ 0x3e; 0x01;             (* LD A,1 -- port 1 button A *)
+        0xcd; 0xd8; 0x00;       (* CALL 0x00D8 -- GTTRIG *)
+        0x32; 0x48; 0xc1 ]      (* LD (0xC148),A *)
+  in
+  check "GTTRIG: reached HALT (control returned)" (Msx.cpu_halted t);
+  check "GTTRIG: stub received the caller's trigger number in A"
+    (Msx.mem_read t 0xc146 = 0x01);
+  check "GTTRIG: stub ran and its A result came home"
+    (Msx.mem_read t 0xc148 = 0xff);
+  check "GTTRIG: ppi_a restored after the CALL returned" (Msx.ppi_a t = 0xc3);
+  (* The two sources GTTRIG's body actually consults (main.asm:2356-2390) are
+     already driven by the core: space clears matrix row 8 bit 0, and the
+     stick path's PSG R#14 bits 4/5 follow Trigger_a/b. *)
+  check "GTTRIG space path: Space clears matrix row 8 bit 0"
+    (let m = fresh () in
+     ignore (Msx.set_key m Msx.Space ~pressed:true);
+     row8 m land 0x01 = 0);
+  check "GTTRIG stick path: Trigger_a clears PSG R#14 bit 4"
+    (let m = fresh () in
+     ignore (Msx.set_key m Msx.Trigger_a ~pressed:true);
+     psg14 m land 0x10 = 0);
+  check "GTTRIG stick path: Trigger_b clears PSG R#14 bit 5"
+    (let m = fresh () in
+     ignore (Msx.set_key m Msx.Trigger_b ~pressed:true);
+     psg14 m land 0x20 = 0);
+
+  (* -- 3. Observation log: all three vectors are visible with their return
+     address, which is the only evidence that separates a real kernel call from
+     a guess. Lengths are measured as deltas from the count taken just before
+     the run, so this check does not depend on which scenario ran first. *)
   let _t =
     run_scenario ~log:true
       [ 0x3e; 0x08; 0xcd; 0x41; 0x01;   (* CALL 0x0141 *)
-        0x3e; 0x00; 0xcd; 0xd5; 0x00 ]   (* CALL 0x00D5 *)
+        0x3e; 0x00; 0xcd; 0xd5; 0x00;   (* CALL 0x00D5 *)
+        0x3e; 0x01; 0xcd; 0xd8; 0x00 ]   (* CALL 0x00D8 *)
   in
   let entries = Msx.bios_vector_entries () in
-  check "log: exactly two served vectors recorded"
-    (List.length entries = 2);
+  check "log: exactly three served vectors recorded"
+    (List.length entries = 3);
   check "log: SNSMAT recorded with a return address inside the caller"
     (match entries with
      | (0x0141, ret) :: _ -> ret >= 0x0000 && ret < 0x0100
@@ -146,6 +197,10 @@ let () =
   check "log: GTSTCK recorded after it"
     (match entries with
      | _ :: (0x00d5, _) :: _ -> true
+     | _ -> false);
+  check "log: GTTRIG recorded last"
+    (match entries with
+     | _ :: _ :: (0x00d8, _) :: _ -> true
      | _ -> false);
   (* Logging off must not append. Measure the length before and after the run
      instead of asserting a fixed size that only holds for this file order. *)
