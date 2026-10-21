@@ -897,6 +897,52 @@ let disk_call_log = ref false
 let set_disk_call_log b = disk_call_log := b
 let disk_call_entries () = List.rev !disk_calls
 
+(* Observation: every fixed-page-0 BIOS vector the trap below serves, with the
+   plain CALL's own return address. A kernel that routes vectors through a
+   self-patching trampoline leaves the handler's frame address here, which is
+   how "the game called SNSMAT/GTSTCK" is told apart from "the core guessed".
+   [(pc, return_address)] in call order. *)
+(* Which side of the ROM/RAM boundary a served vector's return address sits on.
+   A BIOS ROM body that reaches a fixed page-0 vector returns into the ROM; a
+   disk kernel or game returns into RAM.
+
+   This is a defensive record, not a live warning. The trap itself restores
+   page 0 to slot 0 before re-executing the trapped instruction, so a ROM body
+   that calls 0x0141 from ROM is already running with page 0 on ROM and does
+   not trap again -- [From_rom] therefore stays empty on a real run unless the
+   ROM re-selects slot 3 in page 0 and calls back into the vector. It is kept
+   because that case would be silent otherwise, and because a ledger that
+   cannot tell the two apart cannot answer "who called this" at all. *)
+type bios_vector_origin =
+  | From_rom  (** the main BIOS ROM holds the return address *)
+  | From_ram  (** RAM or a DOS load area holds it: an external caller *)
+
+let bios_vector_calls : (int * int * bios_vector_origin) list ref = ref []
+let bios_vector_log = ref false
+(* Turning the ledger on starts a fresh one, so a live run's entries are only
+   the calls made after the flag went on, not whatever a previous run left. *)
+let set_bios_vector_log b =
+  if b then bios_vector_calls := [];
+  bios_vector_log := b
+let bios_vector_entries () = List.rev !bios_vector_calls
+
+(* Same page/slot resolution [mem_read] uses, cut down to the one question the
+   ledger asks: is this address inside the main BIOS ROM or not? Slot 0 pages 0
+   and 1 hold [main_rom] (see the slot table in [mem_read]); every other slot
+   holding the address is RAM, a DOS load area, or a cartridge. *)
+let bios_vector_origin m addr =
+  let a = addr land 0xffff in
+  let page = a lsr 14 in
+  let slot =
+    match page with
+    | 0 -> m.ppi_a land 3
+    | 1 -> (m.ppi_a lsr 2) land 3
+    | 2 -> (m.ppi_a lsr 4) land 3
+    | _ -> (m.ppi_a lsr 6) land 3
+  in
+  if slot = 0 && page <= 1 && Bytes.length m.main_rom > 0 then From_rom
+  else From_ram
+
 (* Per-function BDOS call counts, for boot diagnosis: which functions a
    loader actually exercises (_RDBLK 27 calls in Sangokushi II's loader). *)
 let bdos_call_counts : int array = Array.make 256 0
@@ -1441,7 +1487,7 @@ let disk_trap t pc =
   end
   else if t.ppi_a land 3 = 3
           && (match pc with
-              | 0x009c | 0x009f | 0x00a2 | 0x0156 -> true
+              | 0x009c | 0x009f | 0x00a2 | 0x0156 | 0x00d5 | 0x00d8 | 0x0141 -> true
               | _ -> false) then begin
     (* BIOS fixed-page-0 vectors -- CHSNS 0x009C, CHGET 0x009F, CHPUT 0x00A2,
        and 0x0156 (task-1564): some disk kernels call them with a plain CALL
@@ -1463,9 +1509,27 @@ let disk_trap t pc =
        18 T-states). No byte-guard on the RAM content: a power-on pattern
        byte at the vector is not an installed vector -- it is exactly the
        broken shape this trap exists for, and with page 0 deliberately
-       mapped to RAM, a plain CALL to a fixed BIOS vector has one meaning. *)
+       mapped to RAM, a plain CALL to a fixed BIOS vector has one meaning.
+
+       SNSMAT 0x0141, GTSTCK 0x00D5 and GTTRIG 0x00D8 (ocaml-msx#51) join the
+       same list: all three are fixed page-0 entries, and together they are the
+       only BIOS paths that read keyboard matrix row 8 / the joystick bits
+       behind it. A kernel's trampoline reaches them by the identical plain
+       CALL, so serving them has the same single meaning as the four above.
+       GTPAD 0x00DB and GTPDL 0x00DE are deliberately absent: C-BIOS's own
+       bodies for them are stubs (src/main.asm:2415-2447), so routing there
+       would swap power-on garbage for a stub answer and gain no input path.
+       Whether a given title actually calls these is an observation, not an
+       assumption -- turn on [set_bios_vector_log] to record (pc, return
+       address) per served vector and read it back with [bios_vector_entries].
+       GTTRIG's own body does not treat A=0 as the only keyboard case: 2362
+       `cp 5` / 2363 `jr nc,gttrig_space` sends every A >= 5 down the spacebar
+       path, so a caller that passes a larger number still lands on matrix row
+       8, and the served answer has to cover that too. *)
     let sp = Z80.dump_sp t.cpu in
     let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+    if !bios_vector_log then
+      bios_vector_calls := (pc, ret, bios_vector_origin t ret) :: !bios_vector_calls;
     t.rst30_pending <- (ret, t.ppi_a) :: t.rst30_pending;
     t.ppi_a <- t.ppi_a land 0xfc;
     false
