@@ -3,10 +3,11 @@
    GTTRIG 0x00D8.
 
    GTTRIG joins them for the same reason and from the same source: C-BIOS
-   0.29a's page-0 table has `jp gttrig` at 0x00D8 (src/main.asm:363-367), and
-   gttrig's body (src/main.asm:2349-2397) reads exactly the two places the
-   other two vectors read -- SNSMAT row 8 bit 0 for the spacebar path (A=0)
-   and PSG R#14 bits 4/5 for the stick path (A=1..4). A disk kernel that
+   v0.29 (tag v0.29, src/main.asm sha256 9cd3347622...) has `jp gttrig` at
+   0x00D8 (src/main.asm:363-367), and gttrig's body (src/main.asm:2361-2412)
+   reads exactly the two places the other two vectors read -- SNSMAT row 8
+   bit 0 for the spacebar path, taken when A>=5 (`cp 5` / `jr nc` at
+   2362-2363), and PSG R#14 bits 4/5 for the stick path (A=1..4). A disk kernel that
    reaches 0x00D5 by plain CALL reaches 0x00D8 the same way, so leaving it
    unserved means the triggers alone stay invisible while directions work.
    GTPAD 0x00DB and GTPDL 0x00DE stay out on purpose: C-BIOS's own bodies are
@@ -14,7 +15,7 @@
    from the ROM instead of power-on garbage -- no keyboard or joystick path
    would be gained.
 
-   Why those two: C-BIOS 0.29a's own page-0 table puts a 3-byte JP at both
+   Why those two: C-BIOS v0.29's own page-0 table puts a 3-byte JP at both
    addresses -- `c3 27 18` at 0x0141 (SNSMAT, body: row select on PPI C, read
    PPI A) and `c3 43 18` at 0x00D5 (GTSTCK, body: LD A,8 / CALL 0x1827 /
    nibble shuffle / table) -- and keyboard matrix row 8 is the one row both of
@@ -32,7 +33,7 @@
 
    Scenario 4 stops using a stub for the direction question and reads the
    core's keyboard matrix and joystick latch directly: the eight arrow
-   combinations must produce the two nibble encodings C-BIOS 0.29a's own
+   combinations must produce the two nibble encodings C-BIOS v0.29's own
    GTSTCK body expects, so both of its direction tables land on 1..8. The
    plumbing and the mapping are separate claims and are tested separately;
    the tables themselves are ROM constants and are cited, not re-derived. *)
@@ -46,9 +47,15 @@ let check name cond =
   end
 
 (* BIOS-shaped page 0: 0x0141, 0x00D5 and 0x00D8 are JP stubs into low main_rom,
-   the layout C-BIOS 0.29a itself uses (c3 27 18 / c3 43 18 / jp gttrig). *)
+   the layout C-BIOS v0.29 itself uses (c3 27 18 / c3 43 18 / jp gttrig). *)
 let build_main_rom () =
   let main = Bytes.make 0x4000 '\000' in
+  (* Reset-vector entry (ROM offset 0): JP 0xC000. The machine starts at PC=0,
+     so with page 0 on slot 0 this is the only way to reach a RAM caller -- the
+     guard scenario needs exactly that shape. Scenario code written at RAM 0
+     covers these bytes in every page-0-is-RAM case, so this JP is invisible
+     to them. *)
+  Bytes.set main 0x000 '\xc3'; Bytes.set main 0x001 '\x00'; Bytes.set main 0x002 '\xc0';
   Bytes.set main 0x141 '\xc3'; Bytes.set main 0x142 '\x30'; Bytes.set main 0x143 '\x00';
   Bytes.set main 0x0d5 '\xc3'; Bytes.set main 0x0d6 '\x40'; Bytes.set main 0x0d7 '\x00';
   Bytes.set main 0x0d8 '\xc3'; Bytes.set main 0x0d9 '\x50'; Bytes.set main 0x0da '\x00';
@@ -65,7 +72,9 @@ let build_main_rom () =
   Bytes.set main 0x45 '\x32'; Bytes.set main 0x46 '\x43'; Bytes.set main 0x47 '\xc1';
   Bytes.set main 0x48 '\xc9';
   (* 0x0050 GTTRIG body: LD (0xC146),A; LD A,0xFF; LD (0xC147),A; RET -- 0xFF is
-     the "trigger pressed" value C-BIOS returns (main.asm:2392-2397). *)
+     the "trigger pressed" value C-BIOS returns (00/FF contract in the
+     gttrig header comment at main.asm:2357-2358, produced by `or $FE` /
+     `inc a` at main.asm:2370-2371). *)
   Bytes.set main 0x50 '\x32'; Bytes.set main 0x51 '\x46'; Bytes.set main 0x52 '\xc1';
   Bytes.set main 0x53 '\x3e'; Bytes.set main 0x54 '\xff';
   Bytes.set main 0x55 '\x32'; Bytes.set main 0x56 '\x47'; Bytes.set main 0x57 '\xc1';
@@ -95,7 +104,7 @@ let run_scenario ?(pre = []) ?(log = false) call_bytes =
   Msx.step t ~frames:1;
   t
 
-(* -- direction tables, transcribed from C-BIOS 0.29a src/main.asm ----------
+(* -- direction tables, transcribed from C-BIOS v0.29 src/main.asm ----------
    2341: joypos_kbd_tbl  $00,$07,$01,$08,$05,$06,$00,$07 / $03,$00,$02,$01,$04,$05,$03,$00
          index nibble = 0000RDUL (the GTSTCK keyboard path does RRCA*4 / CPL /
          AND 0x0F on the SNSMAT row-8 byte, main.asm:2264-2290)
@@ -182,6 +191,40 @@ let () =
      ignore (Msx.set_key m Msx.Trigger_b ~pressed:true);
      psg14 m land 0x20 = 0);
 
+  (* -- 2c. The trap's *condition*, not just its body. With page 0 selected to
+     slot 0 the vector address already shows the BIOS ROM, so a plain CALL
+     there is an ordinary ROM call and the trap must stay out of the way: it
+     must not flip ppi_a and must not log. This is the guard the whole
+     "0x0141 can shadow a DOS kernel routine" trade-off rests on, so it gets
+     its own machine with page 0 on ROM and the caller in page-3 RAM
+     (ppi_a = 0xC0: page0 -> slot0, page3 -> slot3). *)
+  let run_page0_rom ?(log = false) call_bytes =
+    Msx.set_bios_vector_log log;
+    let t =
+      Msx.create
+        ~machine:{ Msx.ram_kb = 64; vram_kb = 128;
+                   roms = [ Bytes.to_string (build_main_rom ()) ] }
+    in
+    Msx.load_disk ~interface_rom:false t "\000";
+    Msx.port_out t 0xa8 0xc0;
+    Msx.mem_write t 0xffff 0xaa;
+    List.iteri (fun i b -> Msx.mem_write t (0xc000 + i) b)
+      ([ 0x31; 0xf0; 0xff ] @ call_bytes @ [ 0x76 ]);
+    Msx.step t ~frames:1;
+    t
+  in
+  let t = run_page0_rom ~log:true [ 0x3e; 0x08; 0xcd; 0x41; 0x01 ] in
+  check "guard: page 0 on slot 0 -- the CALL runs the ROM's own JP body"
+    (Msx.cpu_halted t && Msx.mem_read t 0xc140 = 0x08);
+  check "guard: page 0 on slot 0 -- ppi_a is untouched (no trap, no flip)"
+    (Msx.ppi_a t = 0xc0);
+  check "guard: page 0 on slot 0 -- nothing was logged as served"
+    (Msx.bios_vector_entries () = []);
+  (* Same machine, GTSTCK: the ROM body answers and the trap stays out. *)
+  let t = run_page0_rom ~log:true [ 0x3e; 0x00; 0xcd; 0xd5; 0x00 ] in
+  check "guard: page 0 on slot 0 -- 0x00D5 is also left to the ROM"
+    (Msx.cpu_halted t && Msx.ppi_a t = 0xc0 && Msx.bios_vector_entries () = []);
+
   (* -- 3. Observation log: all three vectors are visible with their return
      address, which is the only evidence that separates a real kernel call from
      a guess. Lengths are measured as deltas from the count taken just before
@@ -249,7 +292,7 @@ let () =
      List.length (Msx.bios_vector_entries ()) = n0);
 
   (* -- 4. The eight arrow combinations, read from the core's own matrix and
-     joystick latch, then pushed through C-BIOS 0.29a's two tables.
+     joystick latch, then pushed through C-BIOS v0.29's two tables.
 
      Matrix row 8 (active low when pressed): bit4=L bit5=U bit6=D bit7=R.
      Joystick latch (active low): bit0=U bit1=D bit2=L bit3=R. *)

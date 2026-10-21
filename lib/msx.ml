@@ -904,9 +904,15 @@ let disk_call_entries () = List.rev !disk_calls
    [(pc, return_address)] in call order. *)
 (* Which side of the ROM/RAM boundary a served vector's return address sits on.
    A BIOS ROM body that reaches a fixed page-0 vector returns into the ROM; a
-   disk kernel or game returns into RAM. Counting 0x0141 alone mixes the two --
-   the stub's own call would inflate "the game called SNSMAT" -- so the ledger
-   keeps the origin with every entry. *)
+   disk kernel or game returns into RAM.
+
+   This is a defensive record, not a live warning. The trap itself restores
+   page 0 to slot 0 before re-executing the trapped instruction, so a ROM body
+   that calls 0x0141 from ROM is already running with page 0 on ROM and does
+   not trap again -- [From_rom] therefore stays empty on a real run unless the
+   ROM re-selects slot 3 in page 0 and calls back into the vector. It is kept
+   because that case would be silent otherwise, and because a ledger that
+   cannot tell the two apart cannot answer "who called this" at all. *)
 type bios_vector_origin =
   | From_rom  (** the main BIOS ROM holds the return address *)
   | From_ram  (** RAM or a DOS load area holds it: an external caller *)
