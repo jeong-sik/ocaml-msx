@@ -5,11 +5,13 @@ type reader = { input : string; mutable pos : int; version : int }
 (* v1: before ocaml-msx #38 (no rtc_mode/rtc_regs/cart_is_disk_rom/disk_changed).
    v2: ocaml-msx #38..#45 layout. v3: appends the WD2793 drive block
    (ocaml-msx #46); see Msx.serialize. v4: appends the VDP sprite collision
-   coordinates (S#3-S#6). Readers accept 1-4; writers emit v4. *)
+   coordinates (S#3-S#6). v5: appends the VDP raster and published frame.
+   Readers accept 1-5; writers emit v5. *)
 let magic_prefix = "OCAML-MSX\000"
 let magic = magic_prefix ^ "\002"
 let magic_v3 = magic_prefix ^ "\003"
 let magic_v4 = magic_prefix ^ "\004"
+let magic_v5 = magic_prefix ^ "\005"
 let magic_v1 = magic_prefix ^ "\001"
 let writer () = Buffer.create 1024
 let put_int w n =
@@ -21,17 +23,18 @@ let put_bytes w b = put_int w (Bytes.length b); Buffer.add_bytes w b
 let put_int_array w a = Array.iter (put_int w) a
 let finish w =
   let payload = Buffer.contents w in
-  magic_v4 ^ Digest.string payload ^ payload
+  magic_v5 ^ Digest.string payload ^ payload
 let reader input =
   let start = String.length magic + 16 in
   if String.length input < start then fail "unsupported or truncated MSX state header";
   let head = String.sub input 0 (String.length magic) in
   let version =
-    if head = magic_v4 then 4
+    if head = magic_v5 then 5
+    else if head = magic_v4 then 4
     else if head = magic_v3 then 3
     else if head = magic then 2 else if head = magic_v1 then 1
     else if String.sub head 0 (String.length magic_prefix) = magic_prefix then
-      fail (Printf.sprintf "MSX state saved as format %d; this build reads formats 1-4"
+      fail (Printf.sprintf "MSX state saved as format %d; this build reads formats 1-5"
               (Char.code head.[String.length magic_prefix]))
     else fail "unsupported or truncated MSX state header" in
   let payload = String.sub input start (String.length input - start) in

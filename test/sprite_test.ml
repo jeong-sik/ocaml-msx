@@ -51,7 +51,12 @@ let screen1 t ?(r1 = 0xe0) () =
   (* 나머지 엔트리는 terminator 로 끊는다. *)
   vram_w t sat 0xd0
 
+(* Two frames: the second VBlank publishes lines all scanned after the
+   first, so every line reflects the state written before. *)
+let show t = ignore (Vdp.advance t ~cycles:(2 * 262 * 228))
+
 let px t x y =
+  show t;
   let rgb = Vdp.frame_rgb t in
   let i = (y * 256 + x) * 3 in
   (Char.code rgb.[i], Char.code rgb.[i + 1], Char.code rgb.[i + 2])
@@ -174,6 +179,8 @@ let () =
   sat_w t 5 0xd0 0 0 0;
   check "limit: 4th sprite shows" (is_col t 60 101 12);
   check "limit: 5th sprite hidden" (is_col t 80 101 0);
+  (* Drawing the frames above left F and 5S set; reading S#0 re-arms them. *)
+  ignore (status t 0);
   run_to_line t 100;
   check "limit: no 5S above the sprites" (Vdp.status0 t land 0x40 = 0);
   run_to_line t 1;

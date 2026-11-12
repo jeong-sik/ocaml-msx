@@ -97,3 +97,8 @@
  (name sprite2_test)
  (modules sprite2_test)
  (libraries vdpcore))
+
+(test
+ (name raster_test)
+ (modules raster_test)
+ (libraries vdpcore))

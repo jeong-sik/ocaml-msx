@@ -46,11 +46,24 @@ type t = {
   mutable wlog_i : int;
   (* 최근 명령 발행 이력 — 부트 디버깅용. *)
   mutable cmd_log : (int * int * int * int) list;
+  (* Raster: lines scanned this frame at native width (512 × 212 × 3,
+     [raster_wide] marks the 512-wide ones), and the frame the last VBlank
+     published. *)
+  raster : Bytes.t;
+  raster_wide : Bytes.t;
+  shown : Bytes.t;
+  mutable shown_w : int;
+  mutable shown_h : int;
 }
 
 let lines_per_frame = 262
 let cycles_per_line = 228
 let visible_lines t = if t.regs.(9) land 0x80 = 0 then 192 else 212
+
+(* Raster buffer geometry: the widest native line by the tallest frame. *)
+let max_width = 512
+let max_lines = 212
+let stride = max_width * 3
 
 (* V9938 초기 팔레트 (data book appendix 8) — GGRRBB 3비트 채널. *)
 let default_palette =
@@ -96,6 +109,11 @@ let create () =
     wlog = Array.make 65536 (0, 0, 0);
     wlog_i = 0;
     cmd_log = [];
+    raster = Bytes.make (stride * max_lines) '\000';
+    raster_wide = Bytes.make max_lines '\000';
+    shown = Bytes.make (stride * max_lines) '\000';
+    shown_w = 256;
+    shown_h = 192;
   }
 
 (* V9938 화면 모드표 (application manual 표 "screen mode register bits";
@@ -494,60 +512,7 @@ let check_sprites t ~display_line =
         (* The checked line is one above the shown one. *)
         t.collision_y <- display_line - 1 + 8
 
-let advance t ~cycles =
-  let hit = ref false in
-  t.cycle_in_line <- t.cycle_in_line + cycles;
-  while t.cycle_in_line >= cycles_per_line do
-    t.cycle_in_line <- t.cycle_in_line - cycles_per_line;
-    t.line <- t.line + 1;
-    if t.line = visible_lines t then begin
-      t.status0 <- t.status0 lor 0x80;
-      t.int_pending <- true;
-      hit := true;
-      (* 인터럽트 발생 시 상태 레지스터 선택(R#15)을 0 으로 되돌린다 —
-         V9938 계약. BIOS KEYINT 는 `in a,(0x99)` 후 `jp p,int_end` 로
-         VBlank 플래그(S#0 bit7)를 검사하는데, 게임이 S#1 선택(R#15=1)을
-         남긴 채 인터럽트가 걸리면 이 리셋이 없는 한 KEYINT 는 S#1 을
-         읽고 스캔 없이 종료한다 — 키가 영원히 KEYBUF 에 들어가지 않는다
-         (룬마스터 1 의 CONIN 이 비는 경로). *)
-      t.regs.(15) <- 0
-    end;
-    (* 라인 인터럽트: 표시 라인이 R#19 와 같아질 때 S#1 bit0. FH 플래그는
-       IE1(R#0 bit4) 이 켜져 있을 때만 래치된다 — V9938 정본(openMSX
-       execHScan: "if (controlRegs[0] & 0x10)"). IE1 없이도 세우면 IE1=0 으로
-       라인 인터럽트를 쓰지 않는 게임이 매 프레임 S#1 읽기에서 1 을 본다. *)
-    if
-      t.regs.(0) land 0x10 <> 0
-      && t.line < visible_lines t && t.line = t.regs.(19)
-    then begin
-      t.status1 <- t.status1 lor 1;
-      t.int_pending <- true;
-      hit := true
-    end;
-    if t.line >= lines_per_frame then t.line <- 0;
-    if t.line < visible_lines t then check_sprites t ~display_line:t.line
-  done;
-  !hit
-
-let int_active t =
-  let ie0 = t.regs.(1) land 0x20 <> 0 and ie1 = t.regs.(0) land 0x10 <> 0 in
-  (t.status0 land 0x80 <> 0 && ie0) || (t.status1 land 1 <> 0 && ie1)
-
 let blanked t = t.regs.(1) land 0x40 = 0
-let vram t = t.vram
-let tx_state t = (t.tx_active, !tx_count, t.tx_ny, t.tx_anx, t.tx_dy)
-let cmd_history t = List.rev t.cmd_log
-let regs t = t.regs
-let status0 t = t.status0
-let line_now t = (t.line, t.cycle_in_line)
-
-let write_log t =
-  let n = min t.wlog_i 65536 in
-  let out = ref [] in
-  for k = 1 to n do
-    out := t.wlog.((t.wlog_i - k) land 65535) :: !out
-  done;
-  !out
 
 (* 모드 판정 (V9938 모드표: M5=R0bit3, M4=R0bit2, M3=R0bit1,
    M2=R1bit3, M1=R1bit4). G4 비트맵 = MSX2 SCREEN5 (M4+M3),
@@ -566,97 +531,93 @@ let mode_s5 t =
    공통 비트(GRAPHIC 4 는 bit3=0 이라 mode_s5 가 먼저 잡는다). *)
 let mode_bitmap_hi t = not (mode_text t) && t.regs.(0) land 0x08 <> 0
 
-let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
-
 (* GRAPHIC 7 sprites take a fixed palette, not the palette registers
    (openMSX Renderer::GRAPHIC7_SPRITE_PALETTE, 0xGRB like [palette]). *)
 let graphic7_sprite_palette =
   [| 0x000; 0x002; 0x030; 0x032; 0x300; 0x302; 0x330; 0x332;
      0x472; 0x007; 0x070; 0x077; 0x700; 0x707; 0x770; 0x777 |]
 
-(* Sprite dots sit on the 256-dot grid. In the 512-wide GRAPHIC 5 a dot
-   covers two native pixels and its colour splits into two 2-bit palette
-   indices; GRAPHIC 6 repeats one colour across both (openMSX
-   SpriteConverter::drawMode2). *)
-let overlay_sprites t ~h set_rgb =
-  let put =
-    match display_mode t with
-    | Graphic5 -> fun y x c ->
-      set_rgb (2 * x) y (palette_rgb t (c lsr 2));
-      set_rgb ((2 * x) + 1) y (palette_rgb t (c land 3))
-    | Graphic6 -> fun y x c ->
-      let rgb = palette_rgb t c in
-      set_rgb (2 * x) y rgb;
-      set_rgb ((2 * x) + 1) y rgb
-    | Graphic7 -> fun y x c -> set_rgb x y (grb_to_rgb graphic7_sprite_palette.(c))
-    | Text1 | Text2 | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4
-    | Undefined _ -> fun y x c -> set_rgb x y (palette_rgb t c)
-  in
-  for y = 0 to h - 1 do
-    match sprites_on t ~display_line:y with
-    | None -> ()
-    | Some (mode, line) -> Vdp_sprite.draw mode ~regs:t.regs line (put y)
-  done
+(* Raster. Each display line is drawn into [raster] as the beam leaves it,
+   with the registers, palette and VRAM of that moment, so a split made by a
+   line interrupt shows from the next line on. Entering VBlank turns the
+   scanned lines into [shown], the frame clients read. *)
+let packed (r, g, b) = (r lsl 16) lor (g lsl 8) lor b
 
-let frame_dims t =
+(* SCREEN8 byte = GGGRRRBB, one byte per native pixel. *)
+let graphic7_rgb =
+  Array.init 256 (fun c ->
+    packed (((c lsr 2) land 7) * 255 / 7, ((c lsr 5) land 7) * 255 / 7,
+            (c land 3) * 255 / 3))
+
+let graphic7_sprite_rgb = Array.map (fun v -> packed (grb_to_rgb v)) graphic7_sprite_palette
+
+let line_width t = match display_mode t with Graphic5 | Graphic6 -> max_width | _ -> 256
+
+(* The frame a VBlank publishes: bitmap modes keep native width and R#9 LN
+   height; character modes are 256×192. *)
+let scan_dims t =
   match display_mode t with
   | Graphic4 | Graphic5 | Graphic6 | Graphic7 ->
-      ((bitmap_layout t).width, if t.regs.(9) land 0x80 = 0 then 192 else 212)
+      ((bitmap_layout t).width, visible_lines t)
   | _ -> (256, 192)
 
-let frame_rgb t =
-  let w, h = frame_dims t in
-  let img = Bytes.make (w * h * 3) '\000' in
-  let set_rgb x y (r, g, b) =
-    let i = (y * w + x) * 3 in
-    Bytes.set img i (Char.chr r);
-    Bytes.set img (i + 1) (Char.chr g);
-    Bytes.set img (i + 2) (Char.chr b)
-  in
-  let put x y c = set_rgb x y (palette_rgb t c) in
-  if blanked t then Bytes.to_string img
+(* [x] < max_width and [y] < max_lines at every call, so the three bytes
+   lie inside the raster; the renderer writes ~100K pixels a frame. *)
+let put_rgb raster base x v =
+  let o = base + (x * 3) in
+  Bytes.unsafe_set raster o (Char.unsafe_chr ((v lsr 16) land 0xff));
+  Bytes.unsafe_set raster (o + 1) (Char.unsafe_chr ((v lsr 8) land 0xff));
+  Bytes.unsafe_set raster (o + 2) (Char.unsafe_chr (v land 0xff))
+
+let render_line t y =
+  assert (y >= 0 && y < max_lines);
+  let width = line_width t in
+  Bytes.set t.raster_wide y (if width = max_width then '\001' else '\000');
+  let base = y * stride in
+  let raster = t.raster in
+  let set x v = if x >= 0 && x < width then put_rgb raster base x v in
+  let character_mode = not (mode_s5 t || mode_bitmap_hi t) in
+  if blanked t || (character_mode && y >= 192) then
+    Bytes.fill t.raster base (width * 3) '\000'
   else begin
+    let pal = Array.map (fun v -> packed (grb_to_rgb v)) t.palette in
     let vr addr = Char.code (Bytes.get t.vram (addr land 0x1ffff)) in
     let r = t.regs in
-    if mode_s5 t || mode_bitmap_hi t then begin
+    if not character_mode then begin
       let layout = bitmap_layout t in
       let page = if layout.planar then ((r.(2) lsr 6) land 1) * 256
         else ((r.(2) lsr 5) land 3) * 256 in
-      for y = 0 to h - 1 do
-        let vy = page + ((y + r.(23)) land 255) in
-        for x = 0 to w - 1 do
-          let color = point t false x vy in
-          if display_mode t = Graphic7 then begin
-            (* SCREEN8 byte = GGGRRRBB, one byte per native pixel. *)
-            let i = (y * w + x) * 3 in
-            Bytes.set img i (Char.chr (((color lsr 2) land 7) * 255 / 7));
-            Bytes.set img (i + 1) (Char.chr (((color lsr 5) land 7) * 255 / 7));
-            Bytes.set img (i + 2) (Char.chr ((color land 3) * 255 / 3))
-          end else put x y color
+      let bytes_per_line = layout.width / layout.pixels_per_byte in
+      let row = (page + ((y + r.(23)) land 255)) * bytes_per_line in
+      let byte_at i =
+        let a = (row + i) land 0x1ffff in
+        vr (if layout.planar then ((a land 1) lsl 16) lor (a lsr 1) else a)
+      in
+      match display_mode t with
+      | Graphic7 -> for x = 0 to 255 do set x graphic7_rgb.(byte_at x) done
+      | Text1 | Text2 | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4
+      | Graphic5 | Graphic6 | Undefined _ ->
+        let ppb = layout.pixels_per_byte in
+        let bits = 8 / ppb in
+        let mask = (1 lsl bits) - 1 in
+        for i = 0 to bytes_per_line - 1 do
+          let v = byte_at i in
+          for k = 0 to ppb - 1 do
+            set ((i * ppb) + k) pal.((v lsr ((ppb - 1 - k) * bits)) land mask)
+          done
         done
-      done;
-      overlay_sprites t ~h set_rgb
     end
     else if mode_text t then begin
       (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
       let nt = (r.(2) land 0x7f) lsl 10 in
       let pt = (r.(4) land 0x7) lsl 8 in
-      let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
-      for y = 0 to h - 1 do
-        for x = 0 to 7 do put x y bg done;
-        for x = w - 8 to w - 1 do put x y bg done
-      done;
-      for row = 0 to 23 do
-        for col = 0 to 39 do
-          let ch = vr (nt + row * 40 + col) in
-          for py = 0 to 7 do
-            let pat = vr (pt + ch * 8 + py) in
-            for px = 0 to 5 do
-              let x = 8 + col * 6 + px in
-              let y = row * 8 + py in
-              if (pat lsr (7 - px)) land 1 = 1 then put x y fg else put x y bg
-            done
-          done
+      let fg = pal.((r.(7) lsr 4) land 0xf) and bg = pal.(r.(7) land 0xf) in
+      for x = 0 to 7 do set x bg; set (255 - x) bg done;
+      let row = y / 8 and py = y land 7 in
+      for col = 0 to 39 do
+        let pat = vr (pt + (vr (nt + (row * 40) + col) * 8) + py) in
+        for px = 0 to 5 do
+          set (8 + (col * 6) + px) (if (pat lsr (7 - px)) land 1 = 1 then fg else bg)
         done
       done
     end
@@ -673,35 +634,129 @@ let frame_rgb t =
          11비트(name<<3 | 행), 컬러 5비트(name>>3). *)
       let pt_base = ((r.(4) land 0x3f) lsl 11) lor 0x7ff in
       let ct_base = ((r.(10) land 0x07) lsl 14) lor (r.(3) lsl 6) lor 0x3f in
-      for row = 0 to 23 do
-        let third = row lsr 3 in
-        for col = 0 to 31 do
-          let name = vr (nt + (row * 32) + col) in
-          for py = 0 to 7 do
-            let pat_addr, col_addr =
-              if g2 then begin
-                let index = (lnot 0 lsl 13) lor (third lsl 11) lor (name lsl 3) lor py in
-                (pt_base land index, ct_base land index)
-              end
-              else
-                ( pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor py),
-                  ct_base land ((lnot 0 lsl 6) lor (name lsr 3)) )
-            in
-            let bits = vr pat_addr in
-            let col_byte = vr col_addr in
-            let fg = (col_byte lsr 4) land 0xf and bg = col_byte land 0xf in
-            for px = 0 to 7 do
-              let x = (col * 8) + px in
-              let y = (row * 8) + py in
-              if (bits lsr (7 - px)) land 1 = 1 then put x y fg else put x y bg
-            done
-          done
+      let row = y / 8 and py = y land 7 in
+      let third = row lsr 3 in
+      for col = 0 to 31 do
+        let name = vr (nt + (row * 32) + col) in
+        let pat_addr, col_addr =
+          if g2 then begin
+            let index = (lnot 0 lsl 13) lor (third lsl 11) lor (name lsl 3) lor py in
+            (pt_base land index, ct_base land index)
+          end
+          else
+            ( pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor py),
+              ct_base land ((lnot 0 lsl 6) lor (name lsr 3)) )
+        in
+        let bits = vr pat_addr and col_byte = vr col_addr in
+        let fg = pal.((col_byte lsr 4) land 0xf) and bg = pal.(col_byte land 0xf) in
+        for px = 0 to 7 do
+          set ((col * 8) + px) (if (bits lsr (7 - px)) land 1 = 1 then fg else bg)
         done
-      done;
-      overlay_sprites t ~h set_rgb
+      done
     end;
-    Bytes.to_string img
+    (* Sprite dots sit on the 256-dot grid. In the 512-wide GRAPHIC 5 a dot
+       covers two native pixels and its colour splits into two 2-bit palette
+       indices; GRAPHIC 6 repeats one colour across both (openMSX
+       SpriteConverter::drawMode2). *)
+    match sprites_on t ~display_line:y with
+    | None -> ()
+    | Some (mode, line) ->
+      let put =
+        match display_mode t with
+        | Graphic5 -> fun x c -> set (2 * x) pal.(c lsr 2); set ((2 * x) + 1) pal.(c land 3)
+        | Graphic6 -> fun x c -> set (2 * x) pal.(c); set ((2 * x) + 1) pal.(c)
+        | Graphic7 -> fun x c -> set x graphic7_sprite_rgb.(c)
+        | Text1 | Text2 | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4
+        | Undefined _ -> fun x c -> set x pal.(c)
+      in
+      Vdp_sprite.draw mode ~regs:t.regs line put
   end
+
+(* A line scanned at the other width is resized: a 256-wide line doubles
+   each dot into a 512-wide frame, a 512-wide line keeps the left pixel of
+   each pair in a 256-wide frame. *)
+let present t =
+  let w, h = scan_dims t in
+  for y = 0 to h - 1 do
+    let src = y * stride and dst = y * w * 3 in
+    let wide = Bytes.get t.raster_wide y = '\001' in
+    if wide = (w = max_width) then Bytes.blit t.raster src t.shown dst (w * 3)
+    else if w = max_width then
+      for x = 0 to 255 do
+        Bytes.blit t.raster (src + (x * 3)) t.shown (dst + (x * 6)) 3;
+        Bytes.blit t.raster (src + (x * 3)) t.shown (dst + (x * 6) + 3) 3
+      done
+    else
+      for x = 0 to 255 do
+        Bytes.blit t.raster (src + (x * 6)) t.shown (dst + (x * 3)) 3
+      done
+  done;
+  t.shown_w <- w;
+  t.shown_h <- h
+
+let advance t ~cycles =
+  let hit = ref false in
+  t.cycle_in_line <- t.cycle_in_line + cycles;
+  while t.cycle_in_line >= cycles_per_line do
+    t.cycle_in_line <- t.cycle_in_line - cycles_per_line;
+    let finished = t.line in
+    if finished < visible_lines t then begin
+      render_line t finished;
+      (* 라인 인터럽트: 빔이 표시 라인 (R#19 - R#23) mod 256 의 오른쪽 끝을
+         지날 때 S#1 bit0 — openMSX scheduleHScan. R#23 으로 스크롤해도
+         분할 위치는 화면에 고정된다. FH 는 IE1(R#0 bit4) 이 켜져 있을 때만
+         래치된다(openMSX execHScan: "if (controlRegs[0] & 0x10)"). IE1 없이
+         세우면 IE1=0 인 게임이 매 프레임 S#1 읽기에서 1 을 본다. *)
+      if t.regs.(0) land 0x10 <> 0
+         && finished = (t.regs.(19) - t.regs.(23)) land 0xff
+      then begin
+        t.status1 <- t.status1 lor 1;
+        t.int_pending <- true;
+        hit := true
+      end
+    end;
+    t.line <- t.line + 1;
+    if t.line = visible_lines t then begin
+      t.status0 <- t.status0 lor 0x80;
+      t.int_pending <- true;
+      hit := true;
+      (* 인터럽트 발생 시 상태 레지스터 선택(R#15)을 0 으로 되돌린다 —
+         V9938 계약. BIOS KEYINT 는 `in a,(0x99)` 후 `jp p,int_end` 로
+         VBlank 플래그(S#0 bit7)를 검사하는데, 게임이 S#1 선택(R#15=1)을
+         남긴 채 인터럽트가 걸리면 이 리셋이 없는 한 KEYINT 는 S#1 을
+         읽고 스캔 없이 종료한다 — 키가 영원히 KEYBUF 에 들어가지 않는다
+         (룬마스터 1 의 CONIN 이 비는 경로). *)
+      t.regs.(15) <- 0;
+      present t
+    end;
+    if t.line >= lines_per_frame then t.line <- 0;
+    if t.line < visible_lines t then check_sprites t ~display_line:t.line
+  done;
+  !hit
+
+let int_active t =
+  let ie0 = t.regs.(1) land 0x20 <> 0 and ie1 = t.regs.(0) land 0x10 <> 0 in
+  (t.status0 land 0x80 <> 0 && ie0) || (t.status1 land 1 <> 0 && ie1)
+
+let vram t = t.vram
+let tx_state t = (t.tx_active, !tx_count, t.tx_ny, t.tx_anx, t.tx_dy)
+let cmd_history t = List.rev t.cmd_log
+let regs t = t.regs
+let status0 t = t.status0
+let line_now t = (t.line, t.cycle_in_line)
+
+let write_log t =
+  let n = min t.wlog_i 65536 in
+  let out = ref [] in
+  for k = 1 to n do
+    out := t.wlog.((t.wlog_i - k) land 65535) :: !out
+  done;
+  !out
+
+let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
+
+let frame_dims t = (t.shown_w, t.shown_h)
+let frame_rgb t = Bytes.sub_string t.shown 0 (t.shown_w * t.shown_h * 3)
 
 let write_state w t =
   State_codec.put_int_array w t.regs;
@@ -734,6 +789,13 @@ let write_state w t =
   (* v4: sprite collision coordinates (S#3-S#6). *)
   State_codec.put_int w t.collision_x;
   State_codec.put_int w t.collision_y;
+  (* v5: what the screen shows — the published frame and the lines already
+     scanned in this one — so a restored machine shows the same pixels. *)
+  State_codec.put_bytes w t.raster;
+  State_codec.put_bytes w t.raster_wide;
+  State_codec.put_int w t.shown_w;
+  State_codec.put_int w t.shown_h;
+  State_codec.put_bytes w (Bytes.sub t.shown 0 (t.shown_w * t.shown_h * 3));
   ()
 
 let read_state r t =
@@ -770,6 +832,26 @@ let read_state r t =
   if State_codec.version r >= 4 then begin
     t.collision_x <- State_codec.get_int r ~min:0 ~max:0x1ff;
     t.collision_y <- State_codec.get_int r ~min:0 ~max:0x3ff
+  end;
+  if State_codec.version r >= 5 then begin
+    let same_size name src dst =
+      if Bytes.length src <> Bytes.length dst then State_codec.fail ("invalid " ^ name);
+      Bytes.blit src 0 dst 0 (Bytes.length src)
+    in
+    same_size "VDP raster" (State_codec.get_bytes r) t.raster;
+    let wide = State_codec.get_bytes r in
+    if Bytes.exists (fun c -> c <> '\000' && c <> '\001') wide then
+      State_codec.fail "invalid VDP raster widths";
+    same_size "VDP raster widths" wide t.raster_wide;
+    let w = State_codec.get_int r ~min:256 ~max:512 in
+    let h = State_codec.get_int r ~min:192 ~max:212 in
+    if (w <> 256 && w <> 512) || (h <> 192 && h <> 212) then
+      State_codec.fail "invalid VDP frame size";
+    let shown = State_codec.get_bytes r in
+    if Bytes.length shown <> w * h * 3 then State_codec.fail "invalid VDP frame";
+    Bytes.blit shown 0 t.shown 0 (Bytes.length shown);
+    t.shown_w <- w;
+    t.shown_h <- h
   end;
   if t.tx_active && (t.tx_nx = 0 || t.tx_anx = 0 || t.tx_anx > t.tx_nx || t.tx_ny = 0) then
     State_codec.fail "invalid active VDP transfer"
