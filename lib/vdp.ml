@@ -350,6 +350,29 @@ let commands_enabled t =
 let reg_nx t = reg_y t 40 41
 let reg_ny t = reg_y t 42 43
 
+(* The engine runs on SX..NY themselves and leaves them where it stopped,
+   so a command the CPU starts without rewriting them carries on from
+   there (openMSX VDPCmdEngine keeps them as live state; the CPU cannot
+   read them back). Y and NY are 10 bits and wrap. *)
+let set_reg_y t lo hi v =
+  let v = v land 0x3ff in
+  t.regs.(lo) <- v land 0xff;
+  t.regs.(hi) <- v lsr 8
+
+(* [rows] finished rows of a block command or transfer move DY (and SY when
+   the command reads a source area) one line each in the ARG DIY direction
+   and count NY down (openMSX executeLmmv ... executeHmmc: "SY += TY;
+   DY += TY; --NY"). DX, SX and NX stay. *)
+type row_registers = Dst | Src | Src_and_dst
+
+let finish_rows t regs ~rows ~step =
+  let move lo hi = set_reg_y t lo hi (reg_y t lo hi + (step * rows)) in
+  (match regs with
+   | Dst -> move 38 39
+   | Src -> move 34 35
+   | Src_and_dst -> move 34 35; move 38 39);
+  set_reg_y t 42 43 (reg_ny t - rows)
+
 (* ARG (R#45) bits. *)
 let arg_maj = 0x01
 let arg_eq = 0x02
@@ -386,7 +409,8 @@ let search t =
    last value for S#8/S#9. The order of the end tests follows openMSX
    executeLine ("confirmed on real HW"): leaving the line ends after the
    dot is drawn, and leaving the top edge ends the command while the bottom
-   edge wraps. *)
+   edge wraps. DY is left at the last minor step, -1 (0x3FF) when the line
+   left the top edge; DX, NX and NY stay. *)
 let draw_line t =
   let arg = t.regs.(45) and op = t.regs.(46) land 0x0f in
   let cl = t.regs.(44) and ppl = (bitmap_layout t).width in
@@ -399,26 +423,28 @@ let draw_line t =
     pset t mxd adx dy op cl;
     if x_major then begin
       let adx = adx + tx in
-      if anx = nx || adx land ppl <> 0 then asx
+      if anx = nx || adx land ppl <> 0 then (asx, dy)
       else if asx < ny then begin
         let asx = asx + nx and dy = dy + ty in
-        if ty < 0 && dy < 0 then asx
+        if ty < 0 && dy < 0 then (asx, dy)
         else dot ~asx:(next asx) ~adx ~dy ~anx:(anx + 1)
       end
       else dot ~asx:(next asx) ~adx ~dy ~anx:(anx + 1)
     end else begin
       let dy = dy + ty in
-      if ty < 0 && dy < 0 then asx
+      if ty < 0 && dy < 0 then (asx, dy)
       else
         let asx, adx = if asx < ny then (asx + nx, adx + tx) else (asx, adx) in
         let asx = next asx in
-        if anx = nx || adx land ppl <> 0 then asx
+        if anx = nx || adx land ppl <> 0 then (asx, dy)
         else dot ~asx ~adx ~dy ~anx:(anx + 1)
     end
   in
   (* openMSX computes (NX - 1) >> 1 unsigned: NX = 0 starts at 0x7FFFFFFF. *)
   let asx = ((nx - 1) land 0xffff_ffff) lsr 1 in
-  t.cmd_asx <- dot ~asx ~adx:(reg16 t 36 37) ~dy:(reg_y t 38 39) ~anx:0 land 0x3ff
+  let asx, dy = dot ~asx ~adx:(reg16 t 36 37) ~dy:(reg_y t 38 39) ~anx:0 in
+  t.cmd_asx <- asx land 0x3ff;
+  set_reg_y t 38 39 dy
 
 (* 블록 명령 실행 — 즉시 완료 (CE 는 관찰되지 않는다). *)
 let block_command t block =
@@ -464,6 +490,7 @@ let block_command t block =
       end
     done
   done;
+  finish_rows t (if copy then Src_and_dst else Dst) ~rows:ny ~step:(step_y 1);
   (* LMMM and HMMM leave ASX back at SX (openMSX executeLmmm/executeHmmm
      reset it at each row end); the other block commands do not use it. *)
   match block with
@@ -477,8 +504,10 @@ let tx_count = ref 0
 
 (* The walking corner reached the end of a row: go to the next row, and
    end the command after the last one. *)
-let next_tx_row t ~diy =
-  t.tx_dy <- t.tx_dy + (if diy then 1 else -1);
+let next_tx_row t regs ~diy =
+  let step = if diy then 1 else -1 in
+  t.tx_dy <- t.tx_dy + step;
+  finish_rows t regs ~rows:1 ~step;
   t.tx_adx <- t.tx_dx;
   t.tx_anx <- t.tx_nx;
   t.tx_ny <- t.tx_ny - 1;
@@ -504,7 +533,7 @@ let transfer_byte t ~hm v =
     t.tx_adx <- t.tx_adx + (if dix then 1 else -1)
   end;
   t.tx_anx <- t.tx_anx - 1;
-  if t.tx_anx = 0 then next_tx_row t ~diy
+  if t.tx_anx = 0 then next_tx_row t Dst ~diy
 
 (* LMCM: read the dot under the corner into COL (R#44, seen as S#7) and
    step on. The CPU takes it with an S#7 read, which asks for the next one;
@@ -516,7 +545,7 @@ let fetch_dot t =
   t.regs.(44) <- cmd_point t (arg land arg_mxs <> 0) t.tx_adx t.tx_dy;
   t.tx_adx <- t.tx_adx + (if dix then 1 else -1);
   t.tx_anx <- t.tx_anx - 1;
-  if t.tx_anx = 0 then next_tx_row t ~diy;
+  if t.tx_anx = 0 then next_tx_row t Src ~diy;
   t.cmd_asx <- t.tx_adx land 0x3ff
 
 (* One transfer step: COL (R#44) goes out as a dot or byte for LMMC/HMMC,
