@@ -107,3 +107,8 @@
  (name cmd_test)
  (modules cmd_test)
  (libraries vdpcore))
+
+(test
+ (name status2_test)
+ (modules status2_test)
+ (libraries vdpcore))

@@ -8,7 +8,8 @@
     VDP, memory, mounted media, the WD2793 drive state (format v3,
     ocaml-msx #46), the VDP sprite collision coordinates (format v4), the
     VDP raster and published frame (format v5), the VDP LMCM transfer, BD
-    and ASX (format v6) and device state; file IO belongs to callers. *)
+    and ASX (format v6), the VDP S#2 EO bit and 50/60 Hz frame length
+    (format v7) and device state; file IO belongs to callers. *)
 
 type key =
   | Up
