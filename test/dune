@@ -117,3 +117,8 @@
  (name backdrop_test)
  (modules backdrop_test)
  (libraries vdpcore))
+
+(test
+ (name psg_test)
+ (modules psg_test)
+ (libraries psgcore msx state_codec))
