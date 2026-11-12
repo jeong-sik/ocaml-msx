@@ -40,6 +40,10 @@ type t = {
      when the colours do not alternate. *)
   mutable blink_on : bool;
   mutable blink_count : int;
+  (* R#18 vertical adjust as latched by the display line counter reset:
+     lines the display sits below its neutral place, -7..8 (openMSX
+     scheduleLineCountReset reads getVerticalAdjust there). *)
+  mutable v_shift : int;
   mutable int_pending : bool;
   mutable cmd_ce : bool;
   (* 전송 상태 — CMR 를 쓰면 진입한다. tx_* 는 걷는 모서리다: LMMC/HMMC 는
@@ -135,6 +139,7 @@ let create () =
     pal = false;
     blink_on = false;
     blink_count = 0;
+    v_shift = 0;
     int_pending = false;
     cmd_ce = false;
     tx = None;
@@ -221,6 +226,13 @@ let frame_start_line t =
 (* The line where the display line counter resets: 8 lines below the frame
    start (openMSX scheduleLineCountReset). *)
 let line_count_reset t = frame_start_line t + 8
+
+(* R#18 set-adjust: bits 3-0 move the display right and bits 7-4 move it
+   down, each by (nibble xor 7) - 7, from -7 to 8; 0 is neutral (openMSX
+   execHorAdjust and getVerticalAdjust keep nibble xor 7, neutral 7). *)
+let adjust nibble = (nibble lxor 7) - 7
+let horizontal_adjust t = adjust (t.regs.(18) land 0x0f)
+let vertical_adjust t = adjust (t.regs.(18) lsr 4)
 
 let horizontal_retrace t =
   t.cycle_in_line < (if text_timing t then hr_cycles_text else hr_cycles_graphic)
@@ -1023,7 +1035,7 @@ let bitmap_vram_line t ~planar dy =
   let page_mask = (if planar then 0 else 0x200) lor (if odd_page then 0x100 else 0) in
   (((r.(2) land 0x7f) lsl 3) lor 7) land (page_mask lor dy)
 
-let render_line t y =
+let scan_line t y =
   assert (y >= 0 && y < max_lines);
   let width = line_width t in
   Bytes.set t.raster_wide y (if width = max_width then '\001' else '\000');
@@ -1103,14 +1115,47 @@ let render_line t y =
       Vdp_sprite.draw mode ~regs:t.regs line put
   end
 
+(* This model shows the display area at its neutral place. R#18
+   horizontal adjust moves a scanned line, sprites included (openMSX
+   getLeftSprites), inside that window; the dots it uncovers show the
+   border. A 512-wide line moves two dots per step. The value in R#18 when
+   the line is scanned applies (openMSX takes it from the next line). *)
+let adjust_line t y =
+  let width = line_width t in
+  let shift = horizontal_adjust t * (width / 256) in
+  if shift <> 0 && not (blanked t) then begin
+    let base = y * stride in
+    let raw = Array.map (fun v -> packed (grb_to_rgb v)) t.palette in
+    let kept = (width - abs shift) * 3 in
+    if shift > 0 then begin
+      Bytes.blit t.raster base t.raster (base + (shift * 3)) kept;
+      for x = 0 to shift - 1 do put_rgb t.raster base x (border_rgb t raw x) done
+    end
+    else begin
+      Bytes.blit t.raster (base - (shift * 3)) t.raster base kept;
+      for x = width + shift to width - 1 do put_rgb t.raster base x (border_rgb t raw x) done
+    end
+  end
+
+let render_line t y =
+  scan_line t y;
+  adjust_line t y
+
 (* A line scanned at the other width is resized: a 256-wide line doubles
    each dot into a 512-wide frame, a 512-wide line keeps the left pixel of
-   each pair in a 256-wide frame. *)
+   each pair in a 256-wide frame. The latched vertical adjust moves the
+   display down ([v_shift] > 0) or up inside the window; the rows it
+   uncovers show the border. *)
 let present t =
   let w, h = scan_dims t in
+  let raw = Array.map (fun v -> packed (grb_to_rgb v)) t.palette in
   for y = 0 to h - 1 do
-    let src = y * stride and dst = y * w * 3 in
-    let wide = Bytes.get t.raster_wide y = '\001' in
+    let line = y - t.v_shift in
+    let src = line * stride and dst = y * w * 3 in
+    if line < 0 || line >= h then
+      for x = 0 to w - 1 do put_rgb t.shown dst x (border_rgb t raw x) done
+    else
+    let wide = Bytes.get t.raster_wide line = '\001' in
     if wide = (w = max_width) then Bytes.blit t.raster src t.shown dst (w * 3)
     else if w = max_width then
       for x = 0 to 255 do
@@ -1163,6 +1208,7 @@ let advance t ~cycles =
       t.even_odd <- not t.even_odd;
       step_blink t
     end;
+    if t.line = line_count_reset t then t.v_shift <- vertical_adjust t;
     if t.line < visible_lines t then check_sprites t ~display_line:t.line
   done;
   !hit
@@ -1238,15 +1284,24 @@ let write_state w t =
   State_codec.put_bool w t.pal;
   ()
 
-(* v10: R#13 blinking. Msx appends it after the sound chips, so older
-   payloads stay prefixes of newer ones. *)
-let write_blink w t =
+(* Fields added after v9. Msx writes them after the sound chips, so older
+   payloads stay prefixes of newer ones: v10 R#13 blinking, v11 the
+   latched vertical adjust. *)
+let write_appended w t =
   State_codec.put_bool w t.blink_on;
-  State_codec.put_int w t.blink_count
+  State_codec.put_int w t.blink_count;
+  State_codec.put_int w t.v_shift
 
-let read_blink r t =
-  t.blink_on <- State_codec.get_bool r;
-  t.blink_count <- State_codec.get_int r ~min:0 ~max:150
+(* Older states keep blinking off and take the vertical adjust from R#18,
+   which read_state has restored. *)
+let read_appended r t =
+  if State_codec.version r >= 10 then begin
+    t.blink_on <- State_codec.get_bool r;
+    t.blink_count <- State_codec.get_int r ~min:0 ~max:150
+  end;
+  t.v_shift <-
+    (if State_codec.version r >= 11 then State_codec.get_int r ~min:(-7) ~max:8
+     else vertical_adjust t)
 
 let read_state r t =
   State_codec.fill_int_array r ~min:0 ~max:255 t.regs;

@@ -230,11 +230,11 @@ let () =
   for _ = 1 to 13 do next_frame t done;
   let w = State_codec.writer () in
   Vdp.write_state w t;
-  Vdp.write_blink w t;
+  Vdp.write_appended w t;
   let r = State_codec.reader (State_codec.finish w) in
   let q = Vdp.create () in
   Vdp.read_state r q;
-  Vdp.read_blink r q;
+  Vdp.read_appended r q;
   State_codec.end_of_input r;
   check "restored blinking continues the same sequence"
     (sample t 60 probe = sample q 60 probe);
