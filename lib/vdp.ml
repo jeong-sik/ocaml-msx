@@ -1,6 +1,6 @@
 (* V9938 의 TMS9918 호환 표면. 모드 비트: M3 = R0 bit1, M2 = R1 bit3,
    M1 = R1 bit4 (텍스트). 테이블 베이스:
-   TEXT   NT=R2<<10, PT=R4<<8,  색 = R7 (FG<<4|BG)
+   TEXT   NT=R2<<10, PT=R4<<11, 색 = R7 (FG<<4|BG)
    G1     NT=R2<<10, PT=R4<<11, CT=R3<<6 (타일/8 바이트)
    G2     NT=R2<<10, PT=R4<<11, CT=R3<<6 — 어드레싱에 0x800/0x40 미러
    팔레트 쓰기: 0x9A 인덱스, 0x9B 두 번 — 첫 (R<<4|B), 둘째 (G<<4).
@@ -821,6 +821,30 @@ let put_rgb raster base x v =
   Bytes.unsafe_set raster (o + 1) (Char.unsafe_chr ((v lsr 8) land 0xff));
   Bytes.unsafe_set raster (o + 2) (Char.unsafe_chr (v land 0xff))
 
+(* Background colour 0 shows the backdrop, R#7 bits 3-0, unless R#8 TP is
+   set (openMSX SDLRasterizer::precalcColorIndex0). TEXT1, TEXT2 and
+   MULTICOLOR ignore TP (measured on a V9958, openMSX #2218, which lists the
+   TEXT1Q and MULTIQ codes 0x05 and 0x06 with them); GRAPHIC7 never makes
+   colour 0 transparent. *)
+let colour0_transparent t =
+  match display_mode t with
+  | Text1 | Text2 | Multicolor | Undefined (0x05 | 0x06) -> true
+  | Graphic7 -> false
+  | Graphic1 | Graphic2 | Graphic3 | Graphic4 | Graphic5 | Graphic6 | Undefined _ ->
+    t.regs.(8) land 0x20 = 0
+
+(* The border colour at native dot [x], which also fills a blanked line
+   (openMSX SDLRasterizer::getBorderColors). GRAPHIC5 splits R#7 into bits
+   3-2 for even dots and 1-0 for odd ones; GRAPHIC7 reads all of R#7 as a
+   GGGRRRBB colour. [raw] is the palette as RGB. *)
+let border_rgb t raw x =
+  let r7 = t.regs.(7) in
+  match display_mode t with
+  | Graphic7 -> graphic7_rgb.(r7)
+  | Graphic5 -> raw.(if x land 1 = 0 then (r7 lsr 2) land 3 else r7 land 3)
+  | Text1 | Text2 | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4
+  | Graphic6 | Undefined _ -> raw.(r7 land 0x0f)
+
 let render_line t y =
   assert (y >= 0 && y < max_lines);
   let width = line_width t in
@@ -829,10 +853,15 @@ let render_line t y =
   let raster = t.raster in
   let set x v = if x >= 0 && x < width then put_rgb raster base x v in
   let character_mode = not (mode_s5 t || mode_bitmap_hi t) in
-  if blanked t || (character_mode && y >= 192) then
-    Bytes.fill t.raster base (width * 3) '\000'
+  let raw = Array.map (fun v -> packed (grb_to_rgb v)) t.palette in
+  if blanked t then for x = 0 to width - 1 do set x (border_rgb t raw x) done
+  else if character_mode && y >= 192 then Bytes.fill t.raster base (width * 3) '\000'
   else begin
-    let pal = Array.map (fun v -> packed (grb_to_rgb v)) t.palette in
+    (* [tp]: the palette index colour 0 shows. GRAPHIC5 takes bits 3-2 of
+       it for even dots and 1-0 for odd ones. *)
+    let tp = if colour0_transparent t then t.regs.(7) land 0x0f else 0 in
+    let pal = Array.copy raw in
+    pal.(0) <- raw.(tp);
     let vr addr = Char.code (Bytes.get t.vram (addr land 0x1ffff)) in
     let r = t.regs in
     if not character_mode then begin
@@ -847,8 +876,17 @@ let render_line t y =
       in
       match display_mode t with
       | Graphic7 -> for x = 0 to 255 do set x graphic7_rgb.(byte_at x) done
+      | Graphic5 ->
+        let even0 = raw.(tp lsr 2) and odd0 = raw.(tp land 3) in
+        for i = 0 to bytes_per_line - 1 do
+          let v = byte_at i in
+          for k = 0 to 3 do
+            let c = (v lsr ((3 - k) * 2)) land 3 and x = (i * 4) + k in
+            set x (if c <> 0 then raw.(c) else if x land 1 = 0 then even0 else odd0)
+          done
+        done
       | Text1 | Text2 | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4
-      | Graphic5 | Graphic6 | Undefined _ ->
+      | Graphic6 | Undefined _ ->
         let ppb = layout.pixels_per_byte in
         let bits = 8 / ppb in
         let mask = (1 lsl bits) - 1 in
@@ -860,9 +898,10 @@ let render_line t y =
         done
     end
     else if mode_text t then begin
-      (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
+      (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. 패턴 테이블은
+         다른 문자 모드처럼 R#4 << 11 이다 (openMSX VDP::updatePatternBase). *)
       let nt = (r.(2) land 0x7f) lsl 10 in
-      let pt = (r.(4) land 0x7) lsl 8 in
+      let pt = (r.(4) land 0x3f) lsl 11 in
       let fg = pal.((r.(7) lsr 4) land 0xf) and bg = pal.(r.(7) land 0xf) in
       for x = 0 to 7 do set x bg; set (255 - x) bg done;
       let row = y / 8 and py = y land 7 in
@@ -909,17 +948,19 @@ let render_line t y =
     (* Sprite dots sit on the 256-dot grid. In the 512-wide GRAPHIC 5 a dot
        covers two native pixels and its colour splits into two 2-bit palette
        indices; GRAPHIC 6 repeats one colour across both (openMSX
-       SpriteConverter::drawMode2). *)
+       SpriteConverter::drawMode2). Sprites read the palette itself: an
+       opaque colour-0 sprite (TP set) is palette 0, not the backdrop
+       (SpriteConverter takes palBg). *)
     match sprites_on t ~display_line:y with
     | None -> ()
     | Some (mode, line) ->
       let put =
         match display_mode t with
-        | Graphic5 -> fun x c -> set (2 * x) pal.(c lsr 2); set ((2 * x) + 1) pal.(c land 3)
-        | Graphic6 -> fun x c -> set (2 * x) pal.(c); set ((2 * x) + 1) pal.(c)
+        | Graphic5 -> fun x c -> set (2 * x) raw.(c lsr 2); set ((2 * x) + 1) raw.(c land 3)
+        | Graphic6 -> fun x c -> set (2 * x) raw.(c); set ((2 * x) + 1) raw.(c)
         | Graphic7 -> fun x c -> set x graphic7_sprite_rgb.(c)
         | Text1 | Text2 | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4
-        | Undefined _ -> fun x c -> set x pal.(c)
+        | Undefined _ -> fun x c -> set x raw.(c)
       in
       Vdp_sprite.draw mode ~regs:t.regs line put
   end
