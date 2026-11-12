@@ -20,7 +20,7 @@ let rejection name expected state =
 (* Recompute the envelope after payload edits: these cases must reach the
    decoder, rather than merely fail the corruption checksum. *)
 let edit_payload state edit =
-  let magic = "OCAML-MSX\000\006" in
+  let magic = "OCAML-MSX\000\007" in
   let offset = String.length magic + 16 in
   let payload = String.sub state offset (String.length state - offset) |> edit in
   magic ^ Digest.string payload ^ payload
@@ -195,18 +195,21 @@ let () =
     (edit_payload state (fun payload -> String.sub payload 0 (String.length payload - 1)));
   rejection "valid checksum with extra payload" "trailing data in MSX state"
     (edit_payload state (fun payload -> payload ^ "extra"));
-  (* Older payloads are this one without its VDP tail: v5 lacks the LMCM
-     flag, BD and ASX (v6), v4 also the raster and published frame (v5), v3
-     also the two collision ints (v4). They restore with a black screen
-     and, once two frames have been scanned, match the original machine
-     stepped the same way. *)
-  let offset = String.length "OCAML-MSX\000\006" + 16 in
-  let v6_payload = String.sub state offset (String.length state - offset) in
+  (* Older payloads are this one without its VDP tail: v6 lacks the EO bit
+     and the PAL latch (v7), v5 also the LMCM flag, BD and ASX (v6), v4 also
+     the raster and published frame (v5), v3 also the two collision ints
+     (v4). They restore with a black screen, EO = 0 and 60 Hz, and once two
+     frames have been scanned match the original machine stepped the same
+     way from EO = 0. *)
+  let v7 payload = "OCAML-MSX\000\007" ^ Digest.string payload ^ payload in
+  let offset = String.length (v7 "") in
+  let v7_payload = String.sub state offset (String.length state - offset) in
   let fw, fh = Msx.frame_dims t in
+  let frame_tail = 1 + 1 in
   let command_tail = 1 + 1 + 8 in
   let raster_tail = (8 + (512 * 212 * 3)) + (8 + 212) + 8 + 8 + (8 + (fw * fh * 3)) in
   let older version cut =
-    let payload = String.sub v6_payload 0 (String.length v6_payload - cut) in
+    let payload = String.sub v7_payload 0 (String.length v7_payload - cut) in
     Printf.sprintf "OCAML-MSX\000%c" (Char.chr version) ^ Digest.string payload ^ payload
   in
   let stepped state =
@@ -214,11 +217,17 @@ let () =
     | Error e -> failwith ("older state must restore: " ^ e)
     | Ok m -> Msx.step m ~frames:2; Msx.serialize m
   in
-  let reference = stepped state in
+  let n = String.length v7_payload in
+  check "the state under test runs at 60 Hz" (v7_payload.[n - 1] = '\000');
+  let reference =
+    stepped (v7 (String.sub v7_payload 0 (n - frame_tail) ^ "\000\000"))
+  in
+  check "v6 restores and rescans to the same machine"
+    (stepped (older 6 frame_tail) = reference);
   check "v5 restores and rescans to the same machine"
-    (stepped (older 5 command_tail) = reference);
+    (stepped (older 5 (frame_tail + command_tail)) = reference);
   check "v4 restores and rescans to the same machine"
-    (stepped (older 4 (command_tail + raster_tail)) = reference);
+    (stepped (older 4 (frame_tail + command_tail + raster_tail)) = reference);
   check "v3 restores and rescans to the same machine"
-    (stepped (older 3 (command_tail + raster_tail + 16)) = reference);
+    (stepped (older 3 (frame_tail + command_tail + raster_tail + 16)) = reference);
   print_endline "state: CPU continuation, device latches, media and rejection passed"

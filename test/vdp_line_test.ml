@@ -48,13 +48,18 @@ let () =
   check "IE1 clear resets latched FH" (read_status t 1 land 1 = 0);
   Msx.step t ~frames:1;
   check "IE1 off after reset: FH not latched" (read_status t 1 land 1 = 0);
-  (* 인터럽트 발생 시 상태 레지스터 선택(R#15)은 0 으로 돌아간다 — V9938
-     계약. 게임이 S#1 선택을 남긴 채 VBlank 가 걸리면 BIOS KEYINT 의
-     `in a,(0x99)` 가 S#1 을 읽고 스캔 없이 종료한다(룬마스터 1 관측). *)
-  set_reg t 15 1;
-  Msx.step t ~frames:200;
-  check "interrupt resets S# select to 0"
-    ((Msx.vdp_regs t).(15) land 0x0f = 0);
+  (* VBlank 는 상태 레지스터 선택(R#15)을 건드리지 않는다. openMSX VDP 는
+     R#15 를 레지스터 쓰기로만 바꾸고, NMS 8250 BIOS(0x0C3C → 0x1479)와
+     C-BIOS(0x199A)의 KEYINT 도 H.KEYI 다음에 `in a,(0x99)` 를 그대로
+     읽는다. 인터럽트를 끈 채 S#2 를 고르고 VR 을 기다리는 게임은 VBlank 를
+     지나도 S#2 를 읽어야 한다. *)
+  set_reg t 15 2;
+  Msx.step t ~frames:3;
+  check "VBlank keeps the S# select"
+    ((Msx.vdp_regs t).(15) land 0x0f = 2);
+  check "the select still reads S#2 (bits 3-2 set)"
+    (Msx.port_in t 0x99 land 0x0c = 0x0c);
+  set_reg t 15 0;
   (if !failures = 0 then Printf.printf "vdp_line_test: all passed\n"
    else begin
      Printf.printf "vdp_line_test: %d failure(s)\n" !failures;

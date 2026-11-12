@@ -29,6 +29,11 @@ type t = {
   mutable collision_y : int;
   mutable line : int;
   mutable cycle_in_line : int;
+  (* S#2 EO: the field parity, flipped once a frame (openMSX frameStart). *)
+  mutable even_odd : bool;
+  (* R#9 bit 1 as latched when the line counter wraps: 313 lines a frame
+     (PAL, 50 Hz) or 262 (NTSC, 60 Hz). openMSX fixes it at frameStart. *)
+  mutable pal : bool;
   mutable int_pending : bool;
   mutable cmd_ce : bool;
   (* 전송 상태 — CMR 를 쓰면 진입한다. tx_* 는 걷는 모서리다: LMMC/HMMC 는
@@ -65,9 +70,26 @@ type t = {
   mutable shown_h : int;
 }
 
-let lines_per_frame = 262
 let cycles_per_line = 228
+let lines_per_frame t = if t.pal then 313 else 262
 let visible_lines t = if t.regs.(9) land 0x80 = 0 then 192 else 212
+
+(* Frame timing in this model's coordinates. Line 0 is display line 0, and a
+   line runs from one right border to the next: the line interrupt fires at
+   the boundary, as openMSX scheduleHScan puts it at getRightBorder(). One
+   Z80 cycle is 6 VDP ticks (1368 ticks, 228 cycles a line).
+
+   HR (openMSX getHR) is 1 for 312 ticks after the right border, 404 in the
+   text modes: 52 and 67.3 cycles.
+   VR (openMSX readStatusReg case 2) drops one line before display start, at
+   tick 202 of the line above display line 0. That is 1368 - 1282 + 202 =
+   288 ticks, 48 cycles, into our last line. It rises with S#0 F when the
+   counter reaches the display end. openMSX raises both 48 cycles later, at
+   tick 202 of the line below the last display line; this model's VScan sits
+   at the right border. *)
+let hr_cycles_graphic = 52
+let hr_cycles_text = 68
+let vr_fall_cycle = 48
 
 (* Raster buffer geometry: the widest native line by the tallest frame. *)
 let max_width = 512
@@ -103,6 +125,8 @@ let create () =
     collision_y = 0;
     line = 0;
     cycle_in_line = 0;
+    even_odd = false;
+    pal = false;
     int_pending = false;
     cmd_ce = false;
     tx = None;
@@ -165,6 +189,38 @@ let display_mode t =
   | 0x01 -> Text1
   | 0x09 -> Text2
   | code -> Undefined code
+
+(* HR's length follows openMSX DisplayMode::isTextMode: TEXT1, TEXT2 and
+   TEXT1Q (code 0x05, which this table leaves Undefined). *)
+let text_timing t =
+  match display_mode t with
+  | Text1 | Text2 | Undefined 0x05 -> true
+  | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4 | Graphic5
+  | Graphic6 | Graphic7 | Undefined _ -> false
+
+(* openMSX frameStart (where EO flips) lies 8 + 17/27 lines above display
+   line 0 at 60 Hz and 8 + 44/54 at 50 Hz, for 212/192 lines: the line
+   counter resets on line 8 (scheduleLineCountReset) and display starts that
+   many lines later (execLineCountReset). R#18 vertical adjust is not
+   modelled. If R#9 bit 7 changes inside the top border the flip can be
+   skipped or doubled for that one frame. *)
+let frame_start_line t =
+  let to_display =
+    (if t.pal then 44 else 17) + if t.regs.(9) land 0x80 <> 0 then 0 else 10
+  in
+  lines_per_frame t - 8 - to_display
+
+(* The line where the display line counter resets: 8 lines below the frame
+   start (openMSX scheduleLineCountReset). *)
+let line_count_reset t = frame_start_line t + 8
+
+let horizontal_retrace t =
+  t.cycle_in_line < (if text_timing t then hr_cycles_text else hr_cycles_graphic)
+
+let vertical_retrace t =
+  let last = lines_per_frame t - 1 in
+  t.line >= visible_lines t
+  && not (t.line = last && t.cycle_in_line >= vr_fall_cycle)
 
 let display_mode_to_string = function
   | Text1 -> "TEXT1"
@@ -629,11 +685,15 @@ let io_read t ~port =
            해제한다 (openMSX commandDone: "TR is reset when S#2 is
            read next") — 완료 감지는 그다음 읽기부터 TR=0 && CE=0. *)
         let transferring = Option.is_some t.tx in
+        let bit b mask = if b then mask else 0 in
         let v =
-          ((if t.cmd_ce then 1 else 0)
-           lor (if t.cmd_tr || transferring then 0x80 else 0)
-           lor (if t.cmd_bd then 0x10 else 0))
-          lor 0x6e
+          bit (t.cmd_tr || transferring) 0x80
+          lor bit (vertical_retrace t) 0x40
+          lor bit (horizontal_retrace t) 0x20
+          lor bit t.cmd_bd 0x10
+          lor 0x0c (* bits 3-2 read 1 (openMSX statusReg2 = 0x0C at reset) *)
+          lor bit t.even_odd 0x02
+          lor bit t.cmd_ce 0x01
         in
         if not transferring then t.cmd_tr <- false;
         v
@@ -892,36 +952,35 @@ let advance t ~cycles =
   while t.cycle_in_line >= cycles_per_line do
     t.cycle_in_line <- t.cycle_in_line - cycles_per_line;
     let finished = t.line in
-    if finished < visible_lines t then begin
-      render_line t finished;
-      (* 라인 인터럽트: 빔이 표시 라인 (R#19 - R#23) mod 256 의 오른쪽 끝을
-         지날 때 S#1 bit0 — openMSX scheduleHScan. R#23 으로 스크롤해도
-         분할 위치는 화면에 고정된다. FH 는 IE1(R#0 bit4) 이 켜져 있을 때만
-         래치된다(openMSX execHScan: "if (controlRegs[0] & 0x10)"). IE1 없이
-         세우면 IE1=0 인 게임이 매 프레임 S#1 읽기에서 1 을 본다. *)
-      if t.regs.(0) land 0x10 <> 0
-         && finished = (t.regs.(19) - t.regs.(23)) land 0xff
-      then begin
-        t.status1 <- t.status1 lor 1;
-        t.int_pending <- true;
-        hit := true
-      end
+    if finished < visible_lines t then render_line t finished;
+    (* 라인 인터럽트: 빔이 줄 (R#19 - R#23) mod 256 의 오른쪽 끝을 지날 때
+       S#1 bit0 — openMSX scheduleHScan. R#23 으로 스크롤해도 분할 위치는
+       화면에 고정된다. 줄 카운터는 표시 줄 0 부터 다음 카운터 리셋
+       (frame_start_line + 8) 직전까지 세므로 아래·위 테두리 줄도 맞으면
+       걸린다 (scheduleHScan: 리셋 뒤의 일치는 "never"). FH 는 IE1(R#0
+       bit4) 이 켜져 있을 때만 래치된다(openMSX execHScan: "if
+       (controlRegs[0] & 0x10)"). IE1 없이 세우면 IE1=0 인 게임이 매
+       프레임 S#1 읽기에서 1 을 본다. *)
+    if t.regs.(0) land 0x10 <> 0
+       && finished < line_count_reset t
+       && finished = (t.regs.(19) - t.regs.(23)) land 0xff
+    then begin
+      t.status1 <- t.status1 lor 1;
+      t.int_pending <- true;
+      hit := true
     end;
     t.line <- t.line + 1;
     if t.line = visible_lines t then begin
       t.status0 <- t.status0 lor 0x80;
       t.int_pending <- true;
       hit := true;
-      (* 인터럽트 발생 시 상태 레지스터 선택(R#15)을 0 으로 되돌린다 —
-         V9938 계약. BIOS KEYINT 는 `in a,(0x99)` 후 `jp p,int_end` 로
-         VBlank 플래그(S#0 bit7)를 검사하는데, 게임이 S#1 선택(R#15=1)을
-         남긴 채 인터럽트가 걸리면 이 리셋이 없는 한 KEYINT 는 S#1 을
-         읽고 스캔 없이 종료한다 — 키가 영원히 KEYBUF 에 들어가지 않는다
-         (룬마스터 1 의 CONIN 이 비는 경로). *)
-      t.regs.(15) <- 0;
       present t
     end;
-    if t.line >= lines_per_frame then t.line <- 0;
+    if t.line >= lines_per_frame t then begin
+      t.line <- 0;
+      t.pal <- t.regs.(9) land 0x02 <> 0
+    end;
+    if t.line = frame_start_line t then t.even_odd <- not t.even_odd;
     if t.line < visible_lines t then check_sprites t ~display_line:t.line
   done;
   !hit
@@ -992,6 +1051,9 @@ let write_state w t =
   State_codec.put_bool w (t.tx = Some Lmcm);
   State_codec.put_bool w t.cmd_bd;
   State_codec.put_int w t.cmd_asx;
+  (* v7: S#2 EO and the latched 50/60 Hz frame length. *)
+  State_codec.put_bool w t.even_odd;
+  State_codec.put_bool w t.pal;
   ()
 
 let read_state r t =
@@ -1007,7 +1069,7 @@ let read_state r t =
   t.pal_idx <- State_codec.get_int r ~min:(0) ~max:15;
   t.status0 <- State_codec.get_int r ~min:(0) ~max:255;
   t.status1 <- State_codec.get_int r ~min:(0) ~max:255;
-  t.line <- State_codec.get_int r ~min:(0) ~max:261;
+  t.line <- State_codec.get_int r ~min:(0) ~max:312;
   t.cycle_in_line <- State_codec.get_int r ~min:(0) ~max:227;
   t.tx_dx <- State_codec.get_int r ~min:(0) ~max:511;
   (* ARG and mode can change during a transfer: permit every coordinate
@@ -1059,5 +1121,10 @@ let read_state r t =
     t.cmd_bd <- State_codec.get_bool r;
     t.cmd_asx <- State_codec.get_int r ~min:0 ~max:0x3ff
   end;
+  if State_codec.version r >= 7 then begin
+    t.even_odd <- State_codec.get_bool r;
+    t.pal <- State_codec.get_bool r
+  end;
+  if t.line >= lines_per_frame t then State_codec.fail "invalid VDP line";
   if Option.is_some t.tx && (t.tx_nx = 0 || t.tx_anx = 0 || t.tx_anx > t.tx_nx || t.tx_ny = 0) then
     State_codec.fail "invalid active VDP transfer"
