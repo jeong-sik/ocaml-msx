@@ -20,7 +20,7 @@ let rejection name expected state =
 (* Recompute the envelope after payload edits: these cases must reach the
    decoder, rather than merely fail the corruption checksum. *)
 let edit_payload state edit =
-  let magic = "OCAML-MSX\000\004" in
+  let magic = "OCAML-MSX\000\005" in
   let offset = String.length magic + 16 in
   let payload = String.sub state offset (String.length state - offset) |> edit in
   magic ^ Digest.string payload ^ payload
@@ -195,14 +195,26 @@ let () =
     (edit_payload state (fun payload -> String.sub payload 0 (String.length payload - 1)));
   rejection "valid checksum with extra payload" "trailing data in MSX state"
     (edit_payload state (fun payload -> payload ^ "extra"));
-  (* A v3 payload is a v4 payload without the trailing sprite collision
-     coordinates (two ints); it restores with both coordinates at 0. *)
-  let magic_v4 = "OCAML-MSX\000\004" in
-  let offset = String.length magic_v4 + 16 in
-  let v4_payload = String.sub state offset (String.length state - offset) in
-  let v3_payload = String.sub v4_payload 0 (String.length v4_payload - 16) in
-  let v3_state = "OCAML-MSX\000\003" ^ Digest.string v3_payload ^ v3_payload in
-  (match Msx.restore ~state:v3_state with
-   | Error e -> failwith ("v3 state must restore: " ^ e)
-   | Ok m -> check "v3 restores as the same machine" (Msx.serialize m = state));
+  (* Older payloads are this one without its VDP tail: v4 lacks the raster
+     and published frame (v5), v3 also the two collision ints (v4). They
+     restore with a black screen and, once two frames have been scanned,
+     match the original machine stepped the same way. *)
+  let offset = String.length "OCAML-MSX\000\005" + 16 in
+  let v5_payload = String.sub state offset (String.length state - offset) in
+  let fw, fh = Msx.frame_dims t in
+  let raster_tail = (8 + (512 * 212 * 3)) + (8 + 212) + 8 + 8 + (8 + (fw * fh * 3)) in
+  let older version cut =
+    let payload = String.sub v5_payload 0 (String.length v5_payload - cut) in
+    Printf.sprintf "OCAML-MSX\000%c" (Char.chr version) ^ Digest.string payload ^ payload
+  in
+  let stepped state =
+    match Msx.restore ~state with
+    | Error e -> failwith ("older state must restore: " ^ e)
+    | Ok m -> Msx.step m ~frames:2; Msx.serialize m
+  in
+  let reference = stepped state in
+  check "v4 restores and rescans to the same machine"
+    (stepped (older 4 raster_tail) = reference);
+  check "v3 restores and rescans to the same machine"
+    (stepped (older 3 (raster_tail + 16)) = reference);
   print_endline "state: CPU continuation, device latches, media and rejection passed"

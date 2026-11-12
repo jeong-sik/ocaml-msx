@@ -6,8 +6,9 @@
 
     Sound output remains unimplemented. Versioned save states include CPU,
     VDP, memory, mounted media, the WD2793 drive state (format v3,
-    ocaml-msx #46), the VDP sprite collision coordinates (format v4) and
-    device state; file IO belongs to callers. *)
+    ocaml-msx #46), the VDP sprite collision coordinates (format v4), the
+    VDP raster and published frame (format v5) and device state; file IO
+    belongs to callers. *)
 
 type key =
   | Up
@@ -214,9 +215,10 @@ val debug_dump : t -> unit
 (** VDP 레지스터·VRAM 통계·PPI 를 stderr 로 — 부트 디버깅용. *)
 
 val frame_dims : t -> int * int
-(** Native frame size; query again after a display mode change. *)
+(** Size of the last completed frame ({!Vdp.frame_dims}). *)
 
 val frame_rgb : t -> string
+(** The last completed frame as the beam drew it ({!Vdp.frame_rgb}). *)
 
 val serialize : t -> string
 (** Versioned, checksummed machine snapshot. Includes mounted ROM/disk bytes,

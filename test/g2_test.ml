@@ -19,7 +19,12 @@ let vram_w t a v =
   Vdp.io_write t ~port:0x99 (0x40 lor ((a lsr 8) land 0x3f));
   Vdp.io_write t ~port:0x98 v
 
+(* Two frames: the second VBlank publishes lines all scanned after the
+   first, so every line reflects the state written before. *)
+let show t = ignore (Vdp.advance t ~cycles:(2 * 262 * 228))
+
 let px t x y =
+  show t;
   let rgb = Vdp.frame_rgb t in
   let i = ((y * 256) + x) * 3 in
   (Char.code rgb.[i], Char.code rgb.[i + 1], Char.code rgb.[i + 2])
