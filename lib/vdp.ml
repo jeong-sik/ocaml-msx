@@ -19,6 +19,10 @@ type t = {
   palette : int array;
   mutable status0 : int;
   mutable status1 : int;
+  (* S#3-S#6: where the last sprite collision was seen, +12 / +8 as the
+     V9938 reports it (openMSX SpriteChecker collisionX/Y). *)
+  mutable collision_x : int;
+  mutable collision_y : int;
   mutable line : int;
   mutable cycle_in_line : int;
   mutable int_pending : bool;
@@ -73,6 +77,8 @@ let create () =
     palette = pal;
     status0 = 0;
     status1 = 0;
+    collision_x = 0;
+    collision_y = 0;
     line = 0;
     cycle_in_line = 0;
     int_pending = false;
@@ -410,8 +416,10 @@ let io_read t ~port =
     let s =
       match t.regs.(15) land 0x0f with
       | 0 ->
+        (* F, 5S and C clear on read; the 5th/9th sprite number stays
+           (openMSX SpriteChecker::resetStatus keeps bits 0-4). *)
         let x = t.status0 in
-        t.status0 <- 0;
+        t.status0 <- t.status0 land 0x1f;
         t.int_pending <- false;
         x
       | 1 ->
@@ -430,11 +438,61 @@ let io_read t ~port =
         in
         if not t.tx_active then t.cmd_tr <- false;
         v
+      | 3 -> t.collision_x land 0xff
+      | 4 -> (t.collision_x lsr 8) lor 0xfe
+      | 5 ->
+        (* Reading S#5 clears both coordinates (openMSX resetCollision). *)
+        let v = t.collision_y land 0xff in
+        t.collision_x <- 0;
+        t.collision_y <- 0;
+        v
+      | 6 -> (t.collision_y lsr 8) lor 0xfc
       | _ -> 0xff
     in
     t.latch_first <- true;
     s
   | _ -> 0xff
+
+(* Sprites: the display mode picks the sprite mode, R#8 SPD (bit1) and a
+   blanked screen (R#1 BL clear) switch the engine off (openMSX
+   VDP::spritesEnabled). *)
+let sprite_mode t =
+  match display_mode t with
+  | Graphic1 | Graphic2 | Multicolor -> Some Vdp_sprite.Mode1
+  | Graphic3 | Graphic4 | Graphic5 | Graphic6 | Graphic7 -> Some Vdp_sprite.Mode2
+  | Text1 | Text2 | Undefined _ -> None
+
+let sprites_on t ~display_line =
+  match sprite_mode t with
+  | Some mode when t.regs.(8) land 0x02 = 0 && t.regs.(1) land 0x40 <> 0 ->
+    let read a = read_vram t (physical_addr t a) in
+    Some (mode, Vdp_sprite.evaluate mode ~regs:t.regs ~read ~display_line)
+  | Some _ | None -> None
+
+(* Per display line: S#0 5S/9S with the overflowing sprite number, or else
+   the number of sprites scanned; then C and S#3-S#6. The 5S number is only
+   taken while F and 5S are both clear (openMSX checkSprites1/2, after
+   TMS9918.pdf), and C stays until S#0 is read. *)
+let check_sprites t ~display_line =
+  match sprites_on t ~display_line with
+  | None -> ()
+  | Some (mode, line) ->
+    let s = t.status0 in
+    let s =
+      match line.overflow with
+      | Some n when s land 0xc0 = 0 -> 0x40 lor (s land 0x20) lor n
+      | Some _ | None -> s
+    in
+    let s = if s land 0x40 = 0 then (s land 0x20) lor min line.scanned 31 else s in
+    t.status0 <- (t.status0 land 0x80) lor (s land 0x7f);
+    if t.status0 land 0x20 = 0 then
+      match Vdp_sprite.collision mode ~regs:t.regs line with
+      | None -> ()
+      | Some x ->
+        t.status0 <- t.status0 lor 0x20;
+        t.collision_x <- x + 12;
+        (* The checked line is one above the shown one. *)
+        t.collision_y <- display_line - 1 + 8
 
 let advance t ~cycles =
   let hit = ref false in
@@ -466,7 +524,8 @@ let advance t ~cycles =
       t.int_pending <- true;
       hit := true
     end;
-    if t.line >= lines_per_frame then t.line <- 0
+    if t.line >= lines_per_frame then t.line <- 0;
+    if t.line < visible_lines t then check_sprites t ~display_line:t.line
   done;
   !hit
 
@@ -509,66 +568,35 @@ let mode_bitmap_hi t = not (mode_text t) && t.regs.(0) land 0x08 <> 0
 
 let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
 
-(* 스프라이트 모드 1 — SCREEN1-3. SAT = R#5<<7 (32엔트리 × 4바이트:
-   Y, X, 패턴번호, 컬러), PT = R#6<<11. R#1 bit0 = MAG(2배), bit1 =
-   SIZE(16×16). Y 값은 실제보다 1 크고, 0xD0 인 엔트리부터 뒤는 없으며
-   0xFF 는 그 엔트리만 화면 밖이다. 컬러 0 은 투명, 컬러 bit7(EC) 은
-   X 를 16px 왼쪽으로 민다. 우선순위는 번호가 낮은 쪽이 위 — 큰 번호부터
-   그린다. 라인당 표시 제한(4/8)과 5th-sprite·충돌 플래그(S#0 bit6/5)
-   는 아직 없다. *)
-let render_sprites t ~w ~h put =
-  let vr a = Char.code (Bytes.get t.vram a) in
-  let sat = (t.regs.(5) land 0x7f) lsl 7 in
-  let pt = (t.regs.(6) land 0x07) lsl 11 in
-  let size16 = t.regs.(1) land 0x02 <> 0 in
-  let mag = t.regs.(1) land 0x01 <> 0 in
-  let pat_len = if size16 then 32 else 8 in
-  let edge = if size16 then 16 else 8 in
-  let step = if mag then 2 else 1 in
-  let sput x y c =
-    if x >= 0 && x < w && y >= 0 && y < h then put x y c
+(* GRAPHIC 7 sprites take a fixed palette, not the palette registers
+   (openMSX Renderer::GRAPHIC7_SPRITE_PALETTE, 0xGRB like [palette]). *)
+let graphic7_sprite_palette =
+  [| 0x000; 0x002; 0x030; 0x032; 0x300; 0x302; 0x330; 0x332;
+     0x472; 0x007; 0x070; 0x077; 0x700; 0x707; 0x770; 0x777 |]
+
+(* Sprite dots sit on the 256-dot grid. In the 512-wide GRAPHIC 5 a dot
+   covers two native pixels and its colour splits into two 2-bit palette
+   indices; GRAPHIC 6 repeats one colour across both (openMSX
+   SpriteConverter::drawMode2). *)
+let overlay_sprites t ~h set_rgb =
+  let put =
+    match display_mode t with
+    | Graphic5 -> fun y x c ->
+      set_rgb (2 * x) y (palette_rgb t (c lsr 2));
+      set_rgb ((2 * x) + 1) y (palette_rgb t (c land 3))
+    | Graphic6 -> fun y x c ->
+      let rgb = palette_rgb t c in
+      set_rgb (2 * x) y rgb;
+      set_rgb ((2 * x) + 1) y rgb
+    | Graphic7 -> fun y x c -> set_rgb x y (grb_to_rgb graphic7_sprite_palette.(c))
+    | Text1 | Text2 | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4
+    | Undefined _ -> fun y x c -> set_rgb x y (palette_rgb t c)
   in
-  (* 표시할 엔트리를 번호순으로 모은 뒤 역순으로 그린다 — 0xD0 는
-     목록 수집 자체를 끝낸다. *)
-  let active = ref [] in
-  (try
-     for i = 0 to 31 do
-       let e = sat + i * 4 in
-       match vr e with
-       | 0xd0 -> raise Exit
-       | 0xff -> () (* 이 엔트리만 화면 밖 *)
-       | _ -> active := i :: !active
-     done
-   with Exit -> ());
-  List.iter
-    (fun i ->
-      let e = sat + i * 4 in
-      let y0 = ((vr e - 1) land 0xff) and x_raw = vr (e + 1) in
-      let pat = vr (e + 2) and col = vr (e + 3) in
-      let c = col land 0x0f in
-      let x0 = if col land 0x80 <> 0 then x_raw - 16 else x_raw in
-      if c <> 0 then
-        let pbase =
-          pt + (if size16 then (pat land 0xfc) * pat_len else pat * pat_len)
-        in
-        for row = 0 to edge - 1 do
-          (* 16×16 은 한 줄이 2바이트: 상위 바이트가 왼쪽 8px. *)
-          let bits =
-            if size16 then
-              (vr (pbase + row * 2) lsl 8) lor vr (pbase + row * 2 + 1)
-            else vr (pbase + row)
-          in
-          let top = if size16 then 15 else 7 in
-          for b = 0 to edge - 1 do
-            if (bits lsr (top - b)) land 1 = 1 then
-              for my = 0 to step - 1 do
-                for mx = 0 to step - 1 do
-                  sput (x0 + b * step + mx) (y0 + row * step + my) c
-                done
-              done
-          done
-        done)
-    !active
+  for y = 0 to h - 1 do
+    match sprites_on t ~display_line:y with
+    | None -> ()
+    | Some (mode, line) -> Vdp_sprite.draw mode ~regs:t.regs line (put y)
+  done
 
 let frame_dims t =
   match display_mode t with
@@ -579,13 +607,13 @@ let frame_dims t =
 let frame_rgb t =
   let w, h = frame_dims t in
   let img = Bytes.make (w * h * 3) '\000' in
-  let put x y c =
-    let (r, g, b) = palette_rgb t c in
+  let set_rgb x y (r, g, b) =
     let i = (y * w + x) * 3 in
     Bytes.set img i (Char.chr r);
     Bytes.set img (i + 1) (Char.chr g);
     Bytes.set img (i + 2) (Char.chr b)
   in
+  let put x y c = set_rgb x y (palette_rgb t c) in
   if blanked t then Bytes.to_string img
   else begin
     let vr addr = Char.code (Bytes.get t.vram (addr land 0x1ffff)) in
@@ -606,7 +634,8 @@ let frame_rgb t =
             Bytes.set img (i + 2) (Char.chr ((color land 3) * 255 / 3))
           end else put x y color
         done
-      done
+      done;
+      overlay_sprites t ~h set_rgb
     end
     else if mode_text t then begin
       (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
@@ -632,7 +661,8 @@ let frame_rgb t =
       done
     end
     else begin
-      let g2 = mode_g2 t in
+      (* GRAPHIC 3 (SCREEN4) is GRAPHIC 2 tiles under sprite mode 2. *)
+      let g2 = mode_g2 t || display_mode t = Graphic3 in
       let nt = (r.(2) land 0x7f) lsl 10 in
       (* 패턴/컬러 주소 = base land index (openMSX VRAMWindow::readNP).
          base 는 레지스터를 제자리에 두고 안 쓰는 하위 비트를 1 로 채운 값,
@@ -668,9 +698,7 @@ let frame_rgb t =
           done
         done
       done;
-      (* SCREEN1-3 에서만 모드 1 스프라이트를 올린다 (TEXT 는 스프라이트가
-         없고 SCREEN5+ 는 모드 2 가 따로 있다). *)
-      render_sprites t ~w ~h put
+      overlay_sprites t ~h set_rgb
     end;
     Bytes.to_string img
   end
@@ -703,6 +731,9 @@ let write_state w t =
   State_codec.put_bool w t.tx_hm;
   State_codec.put_bool w t.cmd_tr;
   State_codec.put_bool w t.tx_pending;
+  (* v4: sprite collision coordinates (S#3-S#6). *)
+  State_codec.put_int w t.collision_x;
+  State_codec.put_int w t.collision_y;
   ()
 
 let read_state r t =
@@ -736,5 +767,9 @@ let read_state r t =
   t.tx_hm <- State_codec.get_bool r;
   t.cmd_tr <- State_codec.get_bool r;
   t.tx_pending <- State_codec.get_bool r;
+  if State_codec.version r >= 4 then begin
+    t.collision_x <- State_codec.get_int r ~min:0 ~max:0x1ff;
+    t.collision_y <- State_codec.get_int r ~min:0 ~max:0x3ff
+  end;
   if t.tx_active && (t.tx_nx = 0 || t.tx_anx = 0 || t.tx_anx > t.tx_nx || t.tx_ny = 0) then
     State_codec.fail "invalid active VDP transfer"

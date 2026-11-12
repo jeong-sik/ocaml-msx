@@ -20,7 +20,7 @@ let rejection name expected state =
 (* Recompute the envelope after payload edits: these cases must reach the
    decoder, rather than merely fail the corruption checksum. *)
 let edit_payload state edit =
-  let magic = "OCAML-MSX\000\003" in
+  let magic = "OCAML-MSX\000\004" in
   let offset = String.length magic + 16 in
   let payload = String.sub state offset (String.length state - offset) |> edit in
   magic ^ Digest.string payload ^ payload
@@ -195,4 +195,14 @@ let () =
     (edit_payload state (fun payload -> String.sub payload 0 (String.length payload - 1)));
   rejection "valid checksum with extra payload" "trailing data in MSX state"
     (edit_payload state (fun payload -> payload ^ "extra"));
+  (* A v3 payload is a v4 payload without the trailing sprite collision
+     coordinates (two ints); it restores with both coordinates at 0. *)
+  let magic_v4 = "OCAML-MSX\000\004" in
+  let offset = String.length magic_v4 + 16 in
+  let v4_payload = String.sub state offset (String.length state - offset) in
+  let v3_payload = String.sub v4_payload 0 (String.length v4_payload - 16) in
+  let v3_state = "OCAML-MSX\000\003" ^ Digest.string v3_payload ^ v3_payload in
+  (match Msx.restore ~state:v3_state with
+   | Error e -> failwith ("v3 state must restore: " ^ e)
+   | Ok m -> check "v3 restores as the same machine" (Msx.serialize m = state));
   print_endline "state: CPU continuation, device latches, media and rejection passed"
