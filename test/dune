@@ -92,3 +92,9 @@
  (name state_fdc_test)
  (modules state_fdc_test)
  (libraries msx))
+
+(test
+ (name core_purity_test)
+ (modules core_purity_test)
+ (deps
+  (glob_files %{project_root}/lib/*.ml)))

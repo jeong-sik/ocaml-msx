@@ -328,6 +328,13 @@ let fdc_status m =
   let busy = if f.busy then 0x01 else 0x00 in
   base lor trk0 lor head lor drq lor busy
 
+(* Debug traces to stderr, off by default. The caller switches them on; the
+   core never reads its environment. *)
+let fdc_trace = ref false
+let set_fdc_trace on = fdc_trace := on
+let ppi_trace = ref false
+let set_ppi_trace on = ppi_trace := on
+
 let fdc_load_sector m =
   let f = m.fdc in
   if Bytes.length m.disk = 0 then f.drq <- false
@@ -335,21 +342,17 @@ let fdc_load_sector m =
     let logical = ((f.track * 2) + f.side) * 9 + (f.sector - 1) in
     let off = logical * 512 in
     if off + 512 > Bytes.length m.disk then begin
-      (try
-         if Sys.getenv "FDC_TRACE" <> "" then
-           Printf.eprintf "FDC readsec MISS t=%d side=%d sec=%d -> logical %d (off %d, len %d)\n%!"
-             f.track f.side f.sector logical off (Bytes.length m.disk)
-       with Not_found -> ());
+      if !fdc_trace then
+        Printf.eprintf "FDC readsec MISS t=%d side=%d sec=%d -> logical %d (off %d, len %d)\n%!"
+          f.track f.side f.sector logical off (Bytes.length m.disk);
       f.drq <- false
     end
     else begin
       Bytes.blit m.disk off f.buf 0 512;
-      (try
-         if Sys.getenv "FDC_TRACE" <> "" then
-           Printf.eprintf "FDC readsec t=%d side=%d sec=%d -> logical %d (off %d) buf0=%02x drive=%d motor=%b\n%!"
-             f.track f.side f.sector logical off (Char.code (Bytes.get f.buf 0))
-             (f.drive_reg land 3) f.motor
-       with Not_found -> ());
+      if !fdc_trace then
+        Printf.eprintf "FDC readsec t=%d side=%d sec=%d -> logical %d (off %d) buf0=%02x drive=%d motor=%b\n%!"
+          f.track f.side f.sector logical off (Char.code (Bytes.get f.buf 0))
+          (f.drive_reg land 3) f.motor;
       f.pos <- 0;
       f.drq <- true;
       f.busy <- true
@@ -406,12 +409,10 @@ let fdc_read m port =
   | 0xD2 -> f.sector
   | 0xD3 ->
       let b = Char.code (Bytes.get f.buf f.pos) in
-      (try
-         if f.pos < 2 && Sys.getenv "FDC_TRACE" <> "" then
-           Printf.eprintf "FDC pump pos=%d buf0=%02x b=%02x cmd=%02x drq=%b hl=%04x ppi=%02x sl3=%02x\n%!"
-             f.pos (Char.code (Bytes.get f.buf 0)) b f.cmd f.drq
-             (Z80.dump_hl m.cpu) m.ppi_a m.slot3_sel
-       with Not_found -> ());
+      if f.pos < 2 && !fdc_trace then
+        Printf.eprintf "FDC pump pos=%d buf0=%02x b=%02x cmd=%02x drq=%b hl=%04x ppi=%02x sl3=%02x\n%!"
+          f.pos (Char.code (Bytes.get f.buf 0)) b f.cmd f.drq
+          (Z80.dump_hl m.cpu) m.ppi_a m.slot3_sel;
       if f.pos < 511 then f.pos <- f.pos + 1
       else begin
         f.drq <- false;
@@ -488,13 +489,11 @@ let mem_read m addr =
          land (if m.fdc.drq then lnot 0x80 else 0xff)
          land (if m.fdc.intr then lnot 0x40 else 0xff)
        in
-       (try
-         if Sys.getenv "FDC_TRACE" <> "" && v <> !last_poll then begin
-           Printf.eprintf "FDC poll %02x -> %02x @%04x pos=%d cmd=%02x\n%!"
-             !last_poll v (Z80.dump_pc m.cpu) m.fdc.pos m.fdc.cmd;
-           last_poll := v
-         end
-       with Not_found -> ());
+       if !fdc_trace && v <> !last_poll then begin
+         Printf.eprintf "FDC poll %02x -> %02x @%04x pos=%d cmd=%02x\n%!"
+           !last_poll v (Z80.dump_pc m.cpu) m.fdc.pos m.fdc.cmd;
+         last_poll := v
+       end;
        fdc_note m 0 0xd7 v;
        v)
   else if
@@ -625,10 +624,7 @@ let mem_write m addr v =
        드라이브(bits0-1)·모터(bit7) — 0xD4 포트 계열과는 비트 배치가 다르다
        (openMSX PhilipsFDC 정본). *)
     begin
-      (let fdc_trace =
-         try Sys.getenv "FDC_TRACE" <> "" with Not_found -> false
-       in
-       if fdc_trace then begin
+      (if !fdc_trace then begin
          Printf.eprintf "fdcwin W %04x=%02x @%04x sp=%04x ppi=%02x sl3=%02x\n  ring:"
            a (v land 0xff) (Z80.dump_pc m.cpu) (Z80.dump_sp m.cpu)
            m.ppi_a m.slot3_sel;
@@ -738,9 +734,7 @@ let port_read m port =
   | _ -> 0xff
 
 let port_write m port v =
-  let ppi_trace =
-    try Sys.getenv "PPI_TRACE" <> "" with Not_found -> false
-  in
+  let ppi_trace = !ppi_trace in
   (if ppi_trace && (port land 0xff) = 0xA8 then
      Printf.eprintf "a8 %02x @%04x iff=%b hl=%04x ret=%04x sl3=%02x m=%d,%d,%d,%d\n%!"
        (v land 0xff) (Z80.dump_pc m.cpu) (Z80.dump_iff1 m.cpu) (Z80.dump_hl m.cpu)
@@ -947,37 +941,29 @@ let bios_vector_origin m addr =
    loader actually exercises (_RDBLK 27 calls in Sangokushi II's loader). *)
 let bdos_call_counts : int array = Array.make 256 0
 
-(* 실제 디스크 ROM — DISK_ROM 환경변수로 임의의 실ROM(예: NMS8250 덤프)을
-   지정할 수 있다. 기본은 cbios_disk.rom: 헤더 0x4000-0x400F 가 비어 카트로
-   못 띄우므로 AB + INIT 벡터만 얹는다. ROM 이 자기 헤더("AB" + INIT 벡터)를
-   이미 가지면 그대로 쓴다 — C-BIOS 가 ROM 자기 INIT(하드웨어 초기화·page0
-   프리미티브 설치·부트 절차)을 실행하게 한다. *)
-let disk_rom_real () =
-  let read p =
-    try
-      let ic = open_in_bin p in
-      let s = really_input_string ic (in_channel_length ic) in
-      close_in ic;
-      Some (Bytes.of_string s)
-    with Sys_error _ -> None
-  in
-  let override = try [Sys.getenv "DISK_ROM"] with Not_found -> [] in
-  let candidates =
-    override
-    @ [ "roms/cbios/cbios_disk.rom"; "../roms/cbios/cbios_disk.rom";
-        "../../roms/cbios/cbios_disk.rom"; "../../../roms/cbios/cbios_disk.rom" ]
-  in
-  match List.find_map read candidates with
-  | Some rom when Bytes.length rom >= 0x4000 ->
-      let b = Bytes.sub rom 0 0x4000 in
-      if not (Bytes.length b >= 2 && Bytes.get b 0 = 'A' && Bytes.get b 1 = 'B') then begin
-        Bytes.set b 0 'A';
-        Bytes.set b 1 'B';
-        Bytes.set b 2 (Char.chr (disk_inienv_entry land 0xff));
-        Bytes.set b 3 (Char.chr ((disk_inienv_entry lsr 8) land 0xff))
-      end;
-      Some b
-  | _ -> None
+(* 실제 디스크 ROM(예: NMS8250 덤프, cbios_disk.rom). 앞 16KB 를 쓴다.
+   cbios_disk.rom 은 헤더 0x4000-0x400F 가 비어 카트로 못 띄우므로 AB + INIT
+   벡터만 얹는다. ROM 이 자기 헤더("AB" + INIT 벡터)를 이미 가지면 그대로
+   쓴다 — C-BIOS 가 ROM 자기 INIT(하드웨어 초기화·page0 프리미티브 설치·부트
+   절차)을 실행하게 한다. 파일은 호출자가 읽는다. *)
+type disk_rom = Bytes.t
+
+let disk_rom_size = 0x4000
+
+let disk_rom_of_string rom =
+  if String.length rom < disk_rom_size then
+    Error (Printf.sprintf "disk ROM is %d bytes; it needs at least %d"
+             (String.length rom) disk_rom_size)
+  else begin
+    let b = Bytes.of_string (String.sub rom 0 disk_rom_size) in
+    if not (Bytes.get b 0 = 'A' && Bytes.get b 1 = 'B') then begin
+      Bytes.set b 0 'A';
+      Bytes.set b 1 'B';
+      Bytes.set b 2 (Char.chr (disk_inienv_entry land 0xff));
+      Bytes.set b 3 (Char.chr ((disk_inienv_entry lsr 8) land 0xff))
+    end;
+    Ok b
+  end
 
 let disk_rom_bytes () =
   let rom = Bytes.make 0x4000 '\xc9' (* every unentered byte is a RET *) in
@@ -1099,7 +1085,7 @@ let fat12_open t name11 =
     | None -> None
     | Some e -> Some (fat12_read t fs e)
 
-let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
+let load_disk ?(interface_rom = true) ?disk_rom t dsk =
   t.disk <- Bytes.of_string dsk;
   Hashtbl.reset t.bdos_files;
   t.disk_dma <- 0x0080;
@@ -1115,7 +1101,7 @@ let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
      {!boot_disk} mounts the ROM at replay time, when a 2nd-stage loader that
      walks EXPTBL looking for a disk interface (Rune Master's kernel) needs its
      "AB" header findable. *)
-  (match (if real_rom then disk_rom_real () else None) with
+  (match disk_rom with
    | Some real ->
      (* 실ROM 은 슬롯3-3 의 원래 자리에만 둔다 — 실기 NMS8250 배선. [cart] 에
          바이트를 얹되(3-3 page1 뷰가 여기를 읽는다) load_cartridge 를 부르지
@@ -1125,7 +1111,7 @@ let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
          FDC 레지스터 창(레거시 배선)에 스택(0x7FF8-0x7FFF)이 겹쳐 무한 루프
          한다(실측: 09-11, 0x02C0 프리미티브가 8만 회). HLE 트랩은 유지 — 부트
          섹터 로드와 BIOS 엔트리는 트랩이, 나머지는 실ROM 코드가 맡는다. *)
-     t.cart <- real;
+     t.cart <- Bytes.copy real;
      t.cart_mapper <- Flat;
      t.cart_banks.(0) <- 0;
      t.cart_banks.(1) <- 1;
