@@ -1,5 +1,6 @@
 (* AY-3-8910 PSG: three square-wave tones, one noise source and one
-   envelope, mixed to mono 16-bit PCM at 44.1 kHz.
+   envelope. [chip_sample] gives the mixed level of one chip sample;
+   [Mixer] turns those levels into 44.1 kHz PCM.
 
    The model follows openMSX src/sound/AY8910.cc. The chip runs at half the
    CPU clock and produces one internal sample every 8 of its clocks, so one
@@ -13,19 +14,8 @@
    - Mixer (generateChannels): a channel sounds while
      (tone or tone disabled) and (noise or noise disabled), so with both
      disabled the volume register alone sets a constant level.
-   - Volume (volumeTab): 3 dB per step; level 0 is silence.
-
-   Output: each 44.1 kHz sample is the mean of the chip samples since the
-   previous one. Levels are unsigned (silence is 0, three channels at
-   level 15 make 24573); removing the DC offset is the client's job. *)
-
-let cpu_hz = 3_579_545
-let cycles_per_chip_sample = 16
-let sample_rate = 44_100
-
-(* One chip sample moves the output phase by this much; an output sample is
-   due every [cpu_hz] of phase. Exact: chip samples are 16 CPU cycles. *)
-let phase_step = cycles_per_chip_sample * sample_rate
+   - Volume (volumeTab): 3 dB per step; level 0 is silence. Levels are
+     unsigned: three channels at level 15 make 24573. *)
 
 (* 2^(-(15 - i) / 2) scaled to 8191: 3 dB per level, three channels fit in
    16 bits. *)
@@ -48,13 +38,6 @@ type t = {
   mutable env_hold : bool;
   mutable env_alternate : bool;
   mutable env_holding : bool;
-  (* Resampler: CPU cycles short of a chip sample, the output phase, and the
-     chip samples summed for the next output sample. *)
-  mutable cycle_rest : int;
-  mutable phase : int;
-  mutable acc : int;
-  mutable acc_n : int;
-  out : Buffer.t;
 }
 
 let tone_period t ch = max 1 (t.regs.(2 * ch) + (256 * (t.regs.((2 * ch) + 1) land 0x0f)))
@@ -106,11 +89,6 @@ let create () =
       env_hold = true;
       env_alternate = false;
       env_holding = false;
-      cycle_rest = 0;
-      phase = 0;
-      acc = 0;
-      acc_n = 0;
-      out = Buffer.create 4096;
     }
   in
   set_shape t 0;
@@ -183,25 +161,6 @@ let chip_sample t =
   end;
   !level
 
-let advance t ~cycles =
-  let total = t.cycle_rest + cycles in
-  let n = total / cycles_per_chip_sample in
-  t.cycle_rest <- total - (n * cycles_per_chip_sample);
-  for _ = 1 to n do
-    t.acc <- t.acc + chip_sample t;
-    t.acc_n <- t.acc_n + 1;
-    t.phase <- t.phase + phase_step;
-    if t.phase >= cpu_hz then begin
-      t.phase <- t.phase - cpu_hz;
-      Buffer.add_int16_le t.out (t.acc / t.acc_n);
-      t.acc <- 0;
-      t.acc_n <- 0
-    end
-  done
-
-let clear_output t = Buffer.clear t.out
-let output t = Buffer.contents t.out
-
 let write_regs w t = State_codec.put_int_array w t.regs
 
 let read_regs r t =
@@ -224,11 +183,7 @@ let write_state w t =
   State_codec.put_int w t.env_attack;
   State_codec.put_bool w t.env_hold;
   State_codec.put_bool w t.env_alternate;
-  State_codec.put_bool w t.env_holding;
-  State_codec.put_int w t.cycle_rest;
-  State_codec.put_int w t.phase;
-  State_codec.put_int w t.acc;
-  State_codec.put_int w t.acc_n
+  State_codec.put_bool w t.env_holding
 
 (* Counters are read back below their periods, which [read_regs] has set
    from the registers. *)
@@ -247,8 +202,4 @@ let read_state r t =
   t.env_attack <- attack;
   t.env_hold <- State_codec.get_bool r;
   t.env_alternate <- State_codec.get_bool r;
-  t.env_holding <- State_codec.get_bool r;
-  t.cycle_rest <- State_codec.get_int r ~min:0 ~max:(cycles_per_chip_sample - 1);
-  t.phase <- State_codec.get_int r ~min:0 ~max:(cpu_hz - 1);
-  t.acc <- State_codec.get_int r ~min:0 ~max:max_int;
-  t.acc_n <- State_codec.get_int r ~min:0 ~max:max_int
+  t.env_holding <- State_codec.get_bool r

@@ -20,7 +20,7 @@ let rejection name expected state =
 (* Recompute the envelope after payload edits: these cases must reach the
    decoder, rather than merely fail the corruption checksum. *)
 let edit_payload state edit =
-  let magic = "OCAML-MSX\000\008" in
+  let magic = "OCAML-MSX\000\009" in
   let offset = String.length magic + 16 in
   let payload = String.sub state offset (String.length state - offset) |> edit in
   magic ^ Digest.string payload ^ payload
@@ -195,17 +195,21 @@ let () =
     (edit_payload state (fun payload -> String.sub payload 0 (String.length payload - 1)));
   rejection "valid checksum with extra payload" "trailing data in MSX state"
     (edit_payload state (fun payload -> payload ^ "extra"));
-  (* Older payloads are this one without its tail: v7 lacks the PSG
-     generators (v8), v6 also the EO bit and the PAL latch (v7), v5 also the
+  (* Older payloads are this one without its tail: v8 lacks the SCC (v9),
+     v7 also the PSG generators (v8), v6 also the EO bit and the PAL latch (v7), v5 also the
      LMCM flag, BD and ASX (v6), v4 also the raster and published frame
      (v5), v3 also the two collision ints (v4). They restore with the PSG
      counters at power-on, a black screen, EO = 0 and 60 Hz, and once two
      frames have been scanned match the v7 machine stepped the same way
-     from EO = 0. A v7 state shows the same picture as the v8 one: the PSG
-     does not reach the screen. *)
+     from EO = 0. v8 and v7 states show the same picture as the v9 one:
+     sound does not reach the screen. *)
+  let v9 payload = "OCAML-MSX\000\009" ^ Digest.string payload ^ payload in
+  let offset = String.length (v9 "") in
+  let v9_payload = String.sub state offset (String.length state - offset) in
+  let wave_bytes = 5 * 32 * 8 and channel_arrays = 6 * 5 * 8 and scalars = 5 * 8 in
+  let scc_tail = 1 + wave_bytes + channel_arrays + scalars in
+  let v8_payload = String.sub v9_payload 0 (String.length v9_payload - scc_tail) in
   let v8 payload = "OCAML-MSX\000\008" ^ Digest.string payload ^ payload in
-  let offset = String.length (v8 "") in
-  let v8_payload = String.sub state offset (String.length state - offset) in
   let psg_tail = (3 * (8 + 1)) + (5 * 8) + 3 + (4 * 8) in
   let v7_payload = String.sub v8_payload 0 (String.length v8_payload - psg_tail) in
   let v7 payload = "OCAML-MSX\000\007" ^ Digest.string payload ^ payload in
@@ -232,7 +236,8 @@ let () =
     | Error e -> failwith ("state must restore: " ^ e)
     | Ok m -> Msx.step m ~frames:2; Msx.frame_rgb m
   in
-  check "v7 restores and shows the v8 picture" (picture (v7 v7_payload) = picture state);
+  check "v8 restores and shows the v9 picture" (picture (v8 v8_payload) = picture state);
+  check "v7 restores and shows the v9 picture" (picture (v7 v7_payload) = picture state);
   check "v6 restores and rescans to the same machine"
     (stepped (older 6 frame_tail) = reference);
   check "v5 restores and rescans to the same machine"

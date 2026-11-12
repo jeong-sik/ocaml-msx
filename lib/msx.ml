@@ -84,7 +84,7 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    segments per window and swaps them when the running code writes a bank
    register. [Flat] is the plain 16/32KB cart with no banking. The four here are
    the common ones (openMSX RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16);
-   the SCC sound chip is not modelled, only its banking. *)
+   a Konami SCC cart also carries the SCC sound chip ([scc]). *)
 type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
 
 (* WD279x 근사 상태. 즉시-완료 모델: 명령을 받으면 상태 읽기 한 번 안에
@@ -184,6 +184,11 @@ type t = {
   mutable slot3_sel : int;
   keys : bool array;  (** key_rows × 8, 눌림=true *)
   psg : Psg.t;
+  scc : Scc.t;
+  mutable scc_enabled : bool;
+      (** Konami SCC carts: bank register 0x9000 = 0x3F puts the SCC registers
+          at 0x9800-0x9FFF (openMSX RomKonamiSCC). *)
+  mixer : Mixer.t;
   mutable psg_latch : int;
   mutable joy1 : int;  (** 조이스틱 1 입력 6비트, active low — 빈 포트 0x3F *)
   cpu_ref : t option ref;
@@ -228,6 +233,10 @@ let cart_bank_write m a v =
      | 0x6000 -> m.cart_banks.(0) <- v
      | 0x7000 -> m.cart_banks.(1) <- v
      | _ -> ())
+
+(* The SCC register window: 0x9800-0x9FFF of a Konami SCC cart while bank
+   register 0x9000 holds 0x3F (openMSX RomKonamiSCC). *)
+let scc_window m a = m.cart_mapper = Konami_scc && m.scc_enabled && a >= 0x9800 && a < 0xa000
 
 (* Guess a mapper from the ROM by looking at where its code writes bank
    registers ([ld (nn),a]). Only for ROMs over 32KB; smaller carts sit flat.
@@ -497,6 +506,7 @@ let mem_read m addr =
        with Not_found -> ());
        fdc_note m 0 0xd7 v;
        v)
+  else if slot = 2 && scc_window m a then Scc.read m.scc a
   else if
     a >= 0x4000 && a < 0xc000 && slot = 2 && m.cart_mapper <> Flat
     && Bytes.length m.cart > 0
@@ -651,6 +661,9 @@ let mem_write m addr v =
       | _ -> ()
     end
   else if
+    slot = 2 && scc_window m a
+  then Scc.write m.scc a v
+  else if
     slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
   then begin
     let w = (a lsr 13) - 2 in
@@ -663,9 +676,12 @@ let mem_write m addr v =
       let off = ((m.cart_banks.(w) land (pages - 1)) * 0x2000) + (a land 0x1fff) in
       Bytes.set m.cart_sram off (Char.chr (v land 0xff))
     end
-    else
+    else begin
       (* Otherwise a write into the cart window is a bank select, not a store. *)
-      cart_bank_write m a (v land 0xff)
+      cart_bank_write m a (v land 0xff);
+      if m.cart_mapper = Konami_scc && a land 0xf800 = 0x9000 then
+        m.scc_enabled <- v land 0x3f = 0x3f
+    end
   end
   else if slot = 3 && slot3_sub m page = 2 then begin
     (* 슬롯3 의 쓰기 면은 정본 배치에서 서브2(RAM 매퍼)뿐 — sub ROM(서브0)
@@ -832,6 +848,9 @@ let create ~machine =
       slot3_sel = 0x00;
       keys = Array.make (key_rows * 8) false;
       psg = Psg.create ();
+      scc = Scc.create ();
+      scc_enabled = false;
+      mixer = Mixer.create ();
       psg_latch = 0;
       joy1 = joystick_idle;
       cpu_ref = m_ref;
@@ -854,6 +873,8 @@ let load_cartridge ?mapper t rom =
   t.cart_banks.(1) <- 1;
   t.cart_banks.(2) <- 2;
   t.cart_banks.(3) <- 3;
+  t.scc_enabled <- false;
+  Scc.power_up t.scc;
   (* A Koei cart gets 32KB of battery RAM (covers KoeiSRAM8 and KoeiSRAM32); the
      SRAM-select bit is the first bit above the ROM's segment range. *)
   (match t.cart_mapper with
@@ -1918,8 +1939,20 @@ let trace_remaining = ref 0
 let watch_enter : (int * int) option ref = ref None
 let pc_hist = Array.make 256 0
 
+(* PSG and SCC on one scale. openMSX gives the PSG volume 21000 (machine
+   XML) at amplification 1, and a cartridge SCC volume 9000 (HardwareConfig)
+   at amplification 1/128. A PSG channel at level 15 is 8191 here, so one SCC
+   unit weighs 9000 / 128 * 8191 / 21000 = 27.4. *)
+let scc_weight = 27
+
+let sound_level t =
+  let psg = Psg.chip_sample t.psg in
+  match t.cart_mapper with
+  | Konami_scc -> psg + (scc_weight * Scc.tick t.scc)
+  | Flat | Konami | Ascii8 | Ascii16 | Ascii8_sram -> psg
+
 let step t ~frames =
-  Psg.clear_output t.psg;
+  Mixer.clear_output t.mixer;
   for _ = 1 to frames do
     let budget = ref cycles_per_frame in
     while !budget > 0 do
@@ -1971,15 +2004,17 @@ let step t ~frames =
       let used = if disk_trap t pc then 18 else Z80.step t.cpu in
       incr instr_count;
       ignore (Vdp.advance t.vdp ~cycles:used);
-      Psg.advance t.psg ~cycles:used;
+      for _ = 1 to Mixer.ticks t.mixer ~cycles:used do
+        Mixer.push t.mixer (sound_level t)
+      done;
       budget := !budget - used
     done;
     t.frames <- t.frames + 1
   done
 
 let frame_number t = t.frames
-let audio t = Psg.output t.psg
-let audio_sample_rate = Psg.sample_rate
+let audio t = Mixer.output t.mixer
+let audio_sample_rate = Mixer.sample_rate
 let dump_pc t = Z80.dump_pc t.cpu
 
 let screen_text t =
@@ -2144,6 +2179,10 @@ let serialize t =
   Vdp.write_state w t.vdp;
   (* v8: PSG counters, LFSR, envelope position and resampler. *)
   Psg.write_state w t.psg;
+  Mixer.write_state w t.mixer;
+  (* v9: the cartridge SCC. *)
+  State_codec.put_bool w t.scc_enabled;
+  Scc.write_state w t.scc;
   State_codec.finish w
 
 let restore_with_reader reader state =
@@ -2224,7 +2263,14 @@ let restore_with_reader reader state =
     end;
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
-    if State_codec.version r >= 8 then Psg.read_state r t.psg;
+    if State_codec.version r >= 8 then begin
+      Psg.read_state r t.psg;
+      Mixer.read_state r t.mixer
+    end;
+    if State_codec.version r >= 9 then begin
+      t.scc_enabled <- State_codec.get_bool r;
+      Scc.read_state r t.scc
+    end;
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message
