@@ -2183,8 +2183,8 @@ let serialize t =
   (* v9: the cartridge SCC. *)
   State_codec.put_bool w t.scc_enabled;
   Scc.write_state w t.scc;
-  (* v10: VDP R#13 blinking. *)
-  Vdp.write_blink w t.vdp;
+  (* v10: VDP R#13 blinking; v11: latched R#18 vertical adjust. *)
+  Vdp.write_appended w t.vdp;
   State_codec.finish w
 
 let restore_with_reader reader state =
@@ -2273,7 +2273,7 @@ let restore_with_reader reader state =
       t.scc_enabled <- State_codec.get_bool r;
       Scc.read_state r t.scc
     end;
-    if State_codec.version r >= 10 then Vdp.read_blink r t.vdp;
+    Vdp.read_appended r t.vdp;
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message

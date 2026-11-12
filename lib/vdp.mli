@@ -49,6 +49,10 @@ val frame_rgb : t -> string
     R,G,B). Each line holds what was scanned out for it, so changes made
     mid-frame (scroll, palette, mode) show from the line they reached.
     A line drawn at the other width is doubled or halved to the frame's.
+    The frame is the display area at its neutral place: R#18 set-adjust
+    moves the display inside it (horizontally per line, vertically as
+    latched at the line counter reset) and the uncovered edge shows the
+    border colour.
     BLANK(R1 bit6) 이 꺼진 라인은 검다. *)
 
 val vram : t -> Bytes.t
@@ -102,7 +106,10 @@ val write_state : State_codec.writer -> t -> unit
 
 val read_state : State_codec.reader -> t -> unit
 
-val write_blink : State_codec.writer -> t -> unit
-(** R#13 blinking (save format v10), written after the sound chips. *)
+val write_appended : State_codec.writer -> t -> unit
+(** State added after format v9, written after the sound chips: R#13
+    blinking (v10) and the latched R#18 vertical adjust (v11). *)
 
-val read_blink : State_codec.reader -> t -> unit
+val read_appended : State_codec.reader -> t -> unit
+(** Reads what the state's format holds of {!write_appended}; call it
+    after {!read_state}. *)

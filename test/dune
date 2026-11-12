@@ -132,3 +132,8 @@
  (name charmode_test)
  (modules charmode_test)
  (libraries vdpcore state_codec))
+
+(test
+ (name adjust_test)
+ (modules adjust_test)
+ (libraries vdpcore state_codec))
