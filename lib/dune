@@ -19,8 +19,15 @@
  (libraries state_codec))
 
 (library
+ (name psgcore)
+ (public_name ocaml-msx.psgcore)
+ (wrapped false)
+ (modules psg)
+ (libraries state_codec))
+
+(library
  (name msx)
  (public_name ocaml-msx.msx)
  (wrapped false)
  (modules msx disk_fat12)
- (libraries z80core vdpcore state_codec))
+ (libraries z80core vdpcore psgcore state_codec))

@@ -10,6 +10,31 @@ let watch_mem = ref ""
 let cart = ref ""
 let disk = ref ""
 let disk_warm = ref false
+let wav = ref ""
+let audio = Buffer.create (1 lsl 20)
+
+(* RIFF/WAVE, PCM 16비트 모노. *)
+let write_wav path pcm =
+  let le32 b n = Buffer.add_int32_le b (Int32.of_int n) in
+  let le16 b n = Buffer.add_int16_le b n in
+  let b = Buffer.create 44 in
+  let bytes_per_sample = 2 in
+  Buffer.add_string b "RIFF";
+  le32 b (36 + String.length pcm);
+  Buffer.add_string b "WAVEfmt ";
+  le32 b 16;
+  le16 b 1;
+  le16 b 1;
+  le32 b Msx.audio_sample_rate;
+  le32 b (Msx.audio_sample_rate * bytes_per_sample);
+  le16 b bytes_per_sample;
+  le16 b 16;
+  Buffer.add_string b "data";
+  le32 b (String.length pcm);
+  let oc = open_out_bin path in
+  Buffer.output_buffer oc b;
+  output_string oc pcm;
+  close_out oc
 let disk_real = ref false
 let cart_mapper = ref ""
 let tap_space : int list ref = ref []
@@ -107,6 +132,7 @@ let () =
         "N[,N..]  해당 프레임마다 스페이스 탭 (down 5프레임)" );
       ("--watch-mem", Arg.Set_string watch_mem, "A,B,C  RAM 쓰기 감시 (hex, 콤마 구분)");
       ("--frames", Arg.Int (fun n -> frames := n), "N  실행할 프레임");
+      ("--wav", Arg.Set_string wav, "PATH  PSG 소리를 44.1 kHz 모노 WAV 로 저장");
       ("--roms", Arg.String (fun s -> rom_dir := s), "DIR  C-BIOS roms 디렉터리");
       ("--out", Arg.String (fun s -> out_prefix := s), "PREFIX  덤프 접두어") ]
     (fun _ -> ())
@@ -171,6 +197,7 @@ let () =
     if n = 0 then ()
     else begin
       Msx.step t ~frames:1;
+      if !wav <> "" then Buffer.add_string audio (Msx.audio t);
       (try
          let env = Sys.getenv "WATCH_ENTER_AT" in
          if !ridx = int_of_string env then begin
@@ -425,4 +452,8 @@ let () =
   let oc = open_out_bin (!out_prefix ^ ".ppm") in
   Printf.fprintf oc "P6\n256 192\n255\n%s" rgb;
   close_out oc;
-  Printf.printf "wrote %s.ppm\n" !out_prefix
+  Printf.printf "wrote %s.ppm\n" !out_prefix;
+  if !wav <> "" then begin
+    write_wav !wav (Buffer.contents audio);
+    Printf.printf "wrote %s (%d samples)\n" !wav (Buffer.length audio / 2)
+  end

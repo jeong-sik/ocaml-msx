@@ -183,7 +183,7 @@ type t = {
   mutable ppi_c : int;
   mutable slot3_sel : int;
   keys : bool array;  (** key_rows × 8, 눌림=true *)
-  psg : int array;
+  psg : Psg.t;
   mutable psg_latch : int;
   mutable joy1 : int;  (** 조이스틱 1 입력 6비트, active low — 빈 포트 0x3F *)
   cpu_ref : t option ref;
@@ -682,8 +682,8 @@ let joystick_idle = 0x3f
 
 let psg_read m =
   match m.psg_latch with
-  | 14 -> if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle
-  | r when r < 16 -> m.psg.(r)
+  | 14 -> if Psg.reg m.psg 15 land 0x40 = 0 then m.joy1 else joystick_idle
+  | r when r < 16 -> Psg.reg m.psg r
   | _ -> 0xff
 
 (* RP5C01 접근 면(openMSX RP5C01.cc peekPort/writePort 정본): 뱅크 = 모드
@@ -760,7 +760,7 @@ let port_write m port v =
   | 0xA8 -> m.ppi_a <- v land 0xff
   | 0xAA -> m.ppi_c <- v land 0xff
   | 0xA0 -> m.psg_latch <- v land 0xff
-  | 0xA1 -> if m.psg_latch < 16 then m.psg.(m.psg_latch) <- v land 0xff
+  | 0xA1 -> if m.psg_latch < 16 then Psg.write m.psg m.psg_latch v
   | 0xFC | 0xFD | 0xFE | 0xFF ->
     mapper_writes.(port land 3) <- mapper_writes.(port land 3) + 1;
     m.mapper.(port land 3) <- v land 0x3f
@@ -831,7 +831,7 @@ let create ~machine =
       ppi_c = 0x00;
       slot3_sel = 0x00;
       keys = Array.make (key_rows * 8) false;
-      psg = Array.make 16 0;
+      psg = Psg.create ();
       psg_latch = 0;
       joy1 = joystick_idle;
       cpu_ref = m_ref;
@@ -1919,6 +1919,7 @@ let watch_enter : (int * int) option ref = ref None
 let pc_hist = Array.make 256 0
 
 let step t ~frames =
+  Psg.clear_output t.psg;
   for _ = 1 to frames do
     let budget = ref cycles_per_frame in
     while !budget > 0 do
@@ -1970,12 +1971,15 @@ let step t ~frames =
       let used = if disk_trap t pc then 18 else Z80.step t.cpu in
       incr instr_count;
       ignore (Vdp.advance t.vdp ~cycles:used);
+      Psg.advance t.psg ~cycles:used;
       budget := !budget - used
     done;
     t.frames <- t.frames + 1
   done
 
 let frame_number t = t.frames
+let audio t = Psg.output t.psg
+let audio_sample_rate = Psg.sample_rate
 let dump_pc t = Z80.dump_pc t.cpu
 
 let screen_text t =
@@ -2093,7 +2097,7 @@ let serialize t =
   State_codec.put_int w (mapper_code t.cart_mapper);
   State_codec.put_int_array w t.cart_banks;
   State_codec.put_int_array w t.mapper;
-  State_codec.put_int_array w t.psg;
+  Psg.write_regs w t.psg;
   Array.iter (State_codec.put_bool w) t.keys;
   State_codec.put_int w t.frames;
   State_codec.put_int w t.cart_sram_bit;
@@ -2138,6 +2142,8 @@ let serialize t =
   State_codec.put_bool w f.intr_fired;
   Z80.write_state w t.cpu;
   Vdp.write_state w t.vdp;
+  (* v8: PSG counters, LFSR, envelope position and resampler. *)
+  Psg.write_state w t.psg;
   State_codec.finish w
 
 let restore_with_reader reader state =
@@ -2163,7 +2169,7 @@ let restore_with_reader reader state =
     t.cart_mapper <- mapper_of_code (State_codec.get_int r ~min:0 ~max:5);
     State_codec.fill_int_array r ~min:0 ~max:255 t.cart_banks;
     State_codec.fill_int_array r ~min:0 ~max:63 t.mapper;
-    State_codec.fill_int_array r ~min:0 ~max:255 t.psg;
+    Psg.read_regs r t.psg;
     Array.iteri (fun i _ -> t.keys.(i) <- State_codec.get_bool r) t.keys;
     t.frames <- State_codec.get_int r ~min:0 ~max:max_int;
     t.cart_sram_bit <- State_codec.get_int r ~min:0 ~max:max_int;
@@ -2218,6 +2224,7 @@ let restore_with_reader reader state =
     end;
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
+    if State_codec.version r >= 8 then Psg.read_state r t.psg;
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message

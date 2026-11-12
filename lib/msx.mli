@@ -4,12 +4,14 @@
     {!step} 호출로만 진행한다. P0 의 Z80 과 P1 의 V9938(TMS 호환)·PPI·
     RAM 매퍼를 배선한 MSX2 머신이다.
 
-    Sound output remains unimplemented. Versioned save states include CPU,
+    Sound: the PSG (AY-3-8910) fills a PCM buffer, see {!audio}; SCC and
+    FM are not modelled. Versioned save states include CPU,
     VDP, memory, mounted media, the WD2793 drive state (format v3,
     ocaml-msx #46), the VDP sprite collision coordinates (format v4), the
     VDP raster and published frame (format v5), the VDP LMCM transfer, BD
     and ASX (format v6), the VDP S#2 EO bit and 50/60 Hz frame length
-    (format v7) and device state; file IO belongs to callers. *)
+    (format v7), the PSG generators (format v8) and device state; file IO
+    belongs to callers. *)
 
 type key =
   | Up
@@ -144,6 +146,14 @@ val port_out : t -> int -> int -> unit
 
 val step : t -> frames:int -> unit
 (** [frames] 프레임만큼 진행. 한 프레임 = 262 라인 × 228 사이클. *)
+
+val audio : t -> string
+(** 마지막 {!step} 호출이 만든 PSG 소리. 부호 있는 16비트 리틀엔디언
+    모노 PCM, {!audio_sample_rate} Hz. 한 프레임에 735~737 샘플(평균 735.95)이다.
+    값은 0(무음)부터 24573 까지이고 DC 를 빼는 일은 클라이언트 몫이다.
+    세이브에서 막 복원한 기계는 다음 [step] 전까지 빈 문자열을 준다. *)
+
+val audio_sample_rate : int
 
 val frame_number : t -> int
 (** Completed frames since creation; preserved by save states. *)
