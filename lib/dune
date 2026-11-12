@@ -19,10 +19,10 @@
  (libraries state_codec))
 
 (library
- (name psgcore)
- (public_name ocaml-msx.psgcore)
+ (name soundcore)
+ (public_name ocaml-msx.soundcore)
  (wrapped false)
- (modules psg)
+ (modules psg mixer scc)
  (libraries state_codec))
 
 (library
@@ -30,4 +30,4 @@
  (public_name ocaml-msx.msx)
  (wrapped false)
  (modules msx disk_fat12)
- (libraries z80core vdpcore psgcore state_codec))
+ (libraries z80core vdpcore soundcore state_codec))

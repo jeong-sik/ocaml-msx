@@ -9,7 +9,8 @@ type reader = { input : string; mutable pos : int; version : int }
    v6: appends the VDP LMCM flag, S#2 BD and ASX (S#8/S#9).
    v7: appends the VDP S#2 EO bit and the latched PAL frame length.
    v8: appends the PSG counters, LFSR, envelope position and resampler.
-   Readers accept 1-8; writers emit v8. *)
+   v9: appends the cartridge SCC (enable latch, registers, counters).
+   Readers accept 1-9; writers emit v9. *)
 let magic_prefix = "OCAML-MSX\000"
 let magic = magic_prefix ^ "\002"
 let magic_v3 = magic_prefix ^ "\003"
@@ -18,6 +19,7 @@ let magic_v5 = magic_prefix ^ "\005"
 let magic_v6 = magic_prefix ^ "\006"
 let magic_v7 = magic_prefix ^ "\007"
 let magic_v8 = magic_prefix ^ "\008"
+let magic_v9 = magic_prefix ^ "\009"
 let magic_v1 = magic_prefix ^ "\001"
 let writer () = Buffer.create 1024
 let put_int w n =
@@ -29,13 +31,14 @@ let put_bytes w b = put_int w (Bytes.length b); Buffer.add_bytes w b
 let put_int_array w a = Array.iter (put_int w) a
 let finish w =
   let payload = Buffer.contents w in
-  magic_v8 ^ Digest.string payload ^ payload
+  magic_v9 ^ Digest.string payload ^ payload
 let reader input =
   let start = String.length magic + 16 in
   if String.length input < start then fail "unsupported or truncated MSX state header";
   let head = String.sub input 0 (String.length magic) in
   let version =
-    if head = magic_v8 then 8
+    if head = magic_v9 then 9
+    else if head = magic_v8 then 8
     else if head = magic_v7 then 7
     else if head = magic_v6 then 6
     else if head = magic_v5 then 5
@@ -43,7 +46,7 @@ let reader input =
     else if head = magic_v3 then 3
     else if head = magic then 2 else if head = magic_v1 then 1
     else if String.sub head 0 (String.length magic_prefix) = magic_prefix then
-      fail (Printf.sprintf "MSX state saved as format %d; this build reads formats 1-8"
+      fail (Printf.sprintf "MSX state saved as format %d; this build reads formats 1-9"
               (Char.code head.[String.length magic_prefix]))
     else fail "unsupported or truncated MSX state header" in
   let payload = String.sub input start (String.length input - start) in

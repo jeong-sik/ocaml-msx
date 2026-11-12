@@ -121,4 +121,9 @@
 (test
  (name psg_test)
  (modules psg_test)
- (libraries psgcore msx state_codec))
+ (libraries soundcore msx state_codec))
+
+(test
+ (name scc_test)
+ (modules scc_test)
+ (libraries soundcore msx state_codec))
