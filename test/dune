@@ -112,3 +112,8 @@
  (name status2_test)
  (modules status2_test)
  (libraries vdpcore))
+
+(test
+ (name backdrop_test)
+ (modules backdrop_test)
+ (libraries vdpcore))

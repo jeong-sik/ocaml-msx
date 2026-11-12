@@ -36,6 +36,23 @@ let parse_tap_keys spec =
       | [ f; name ] -> (int_of_string f, key_of_name name)
       | _ -> Printf.ksprintf failwith "bad --tap-key entry %s" pair)
     (String.split_on_char ',' spec)
+(* --hold-key KEY:FROM-TO: KEY is down from frame FROM until frame TO.
+   Koei disks ask for CTRL held through the reset, until the drive lamp
+   lights: the disk ROM then sets up one drive and leaves the game more
+   RAM. *)
+let hold_keys : (Msx.key * int * int) list ref = ref []
+
+let parse_hold_keys spec =
+  List.map
+    (fun entry ->
+      match String.split_on_char ':' entry with
+      | [ name; range ] -> (
+        match String.split_on_char '-' range with
+        | [ a; b ] -> (key_of_name name, int_of_string a, int_of_string b)
+        | _ -> Printf.ksprintf failwith "bad --hold-key range %s" entry)
+      | _ -> Printf.ksprintf failwith "bad --hold-key entry %s" entry)
+    (String.split_on_char ',' spec)
+
 let assert_boot = ref false
 
 let contains_sub hay needle =
@@ -81,6 +98,9 @@ let () =
       ( "--tap-key",
         Arg.String (fun spec -> tap_key_spec := spec),
         "F:KEY[,F:KEY..]  해당 프레임에 키 탭 (space/return/up/.../shift/a)" );
+      ( "--hold-key",
+        Arg.String (fun spec -> hold_keys := parse_hold_keys spec),
+        "KEY:FROM-TO[,..]  프레임 FROM 부터 TO 까지 키를 누르고 있다 (ctrl:0-300)" );
       ( "--tap-space",
         Arg.String
           (fun s -> tap_space := List.map int_of_string (String.split_on_char ',' s)),
@@ -169,6 +189,11 @@ let () =
           if !ridx = f then ignore (Msx.set_key t k ~pressed:true);
           if !ridx = f + 5 then ignore (Msx.set_key t k ~pressed:false))
         !tap_keys;
+      List.iter
+        (fun (k, a, b) ->
+          if !ridx = a then assert (Msx.set_key t k ~pressed:true);
+          if !ridx = b then assert (Msx.set_key t k ~pressed:false))
+        !hold_keys;
       ring.(!ridx land 63) <- Msx.dump_pc t;
       incr ridx;
       let dlo, dhi =
