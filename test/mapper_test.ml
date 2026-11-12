@@ -92,9 +92,12 @@ let ascii16 () =
   check "ascii16 0x7000 low half is seg6" (win t 0x8000 = 6);
   check "ascii16 0x7000 high half is seg7" (win t 0xA000 = 7)
 
-(* A ROM whose code writes to the given register addresses via [ld (nn),a]. *)
+(* A 64KB ROM whose code writes to the given register addresses via
+   [ld (nn),a]. It starts with an "AB" header, as a MegaROM's segment 0 does:
+   a 64KB ROM without one is plain (openMSX RomFactory). *)
 let rom_with_writes addrs =
   let b = Bytes.of_string (synth 8) in
+  Bytes.blit_string "AB" 0 b 0 2;
   List.iteri
     (fun i addr ->
       let p = 0x100 + (i * 3) in
@@ -120,6 +123,8 @@ let detection () =
      = Msx.Ascii8_sram);
   check "ascii16 from 0x6000/0x7000"
     (Msx.guess_mapper (rom_with_writes [ 0x6000; 0x7000 ]) = Msx.Ascii16);
+  check "a 64KB rom without a header at its first byte is plain"
+    (Msx.guess_mapper (synth 8) = Msx.Flat);
   (* a flat 32KB cart reads through the flat path, not a bank register *)
   let t = machine () in
   Msx.load_cartridge t (synth 4);
@@ -146,6 +151,56 @@ let koei_sram () =
   Msx.mem_write t 0x7000 0x20;
   check "koei sram retained across bank switch" (win t 0x8000 = 0xab)
 
+(* Plain ROMs (openMSX RomPlain, type Mirrored). Each 8KB page of the file
+   holds its own index at offset 0x100; the "AB" header at file offset
+   [header] with routine pointers [ptrs] (INIT, STATEMENT, ...) decides where
+   the ROM starts. All four CPU pages are switched to slot 2 and each 8KB page
+   is read at +0x100. *)
+let plain_rom ~size ~header ptrs =
+  let b = Bytes.make size '\000' in
+  for p = 0 to (size / 0x2000) - 1 do
+    Bytes.set b ((p * 0x2000) + 0x100) (Char.chr p)
+  done;
+  Bytes.blit_string "AB" 0 b header 2;
+  List.iteri
+    (fun i ptr ->
+      Bytes.set b (header + 2 + (2 * i)) (Char.chr (ptr land 0xff));
+      Bytes.set b (header + 3 + (2 * i)) (Char.chr (ptr lsr 8)))
+    ptrs;
+  Bytes.to_string b
+
+let plain () =
+  let shows name rom expect =
+    let t = machine () in
+    Msx.load_cartridge t rom;
+    Msx.port_out t 0xA8 0xAA;
+    let got = List.init 8 (fun p -> Msx.mem_read t ((p * 0x2000) + 0x100)) in
+    check (name ^ " is plain") (Msx.cart_mapper t = Msx.Flat);
+    check
+      (Printf.sprintf "%s: pages %s" name (String.concat "," (List.map string_of_int got)))
+      (got = expect)
+  in
+  let at_4000 = [ 2; 3; 0; 1; 2; 3; 0; 1 ] and at_8000 = [ 0; 1; 2; 3; 0; 1; 2; 3 ] in
+  shows "8KB at 0x4000" (plain_rom ~size:0x2000 ~header:0 [ 0x4010 ]) [ 0; 0; 0; 0; 0; 0; 0; 0 ];
+  shows "16KB at 0x4000" (plain_rom ~size:0x4000 ~header:0 [ 0x4010 ]) [ 0; 1; 0; 1; 0; 1; 0; 1 ];
+  shows "32KB at 0x4000" (plain_rom ~size:0x8000 ~header:0 [ 0x4010 ]) at_4000;
+  shows "32KB at 0x8000" (plain_rom ~size:0x8000 ~header:0 [ 0x8010 ]) at_8000;
+  (* A pointer counts from its header's place in the file: a header at file
+     offset 0x4000 pointing into 0x8000 votes for the file starting at 0x4000. *)
+  shows "32KB, header at 0x4000 into 0x8000" (plain_rom ~size:0x8000 ~header:0x4000 [ 0x8010 ]) at_4000;
+  (* One vote each for 0x0000 and 0x4000: 0x4000 wins the tie. One each for
+     0x0000 and 0x8000: 0x0000 wins. A 24KB ROM tells the two apart: from
+     0x0000 page 3 shows 3 land 2 = 2; from 0x8000 page 1 shows -3 land 2 = 0. *)
+  shows "32KB, tie 0x0000/0x4000" (plain_rom ~size:0x8000 ~header:0 [ 0x0010; 0x4020 ]) at_4000;
+  shows "24KB, tie 0x0000/0x8000"
+    (plain_rom ~size:0x6000 ~header:0 [ 0x0010; 0x8020 ])
+    [ 0; 1; 2; 2; 0; 0; 2; 2 ];
+  shows "24KB at 0x8000" (plain_rom ~size:0x6000 ~header:0 [ 0x8020 ]) [ 0; 0; 2; 2; 0; 1; 2; 2 ];
+  (* The header sits at file offset 0x4000 and points into 0x4000: the file
+     starts at 0x0000. 48KB is six pages: page 6 shows 6 land 5 = 4. *)
+  shows "48KB at 0x0000" (plain_rom ~size:0xc000 ~header:0x4000 [ 0x4010 ]) [ 0; 1; 2; 3; 4; 5; 4; 5 ];
+  shows "64KB at 0x0000" (plain_rom ~size:0x10000 ~header:0x4000 [ 0x4010 ]) [ 0; 1; 2; 3; 4; 5; 6; 7 ]
+
 let () =
   konami ();
   konami_scc ();
@@ -153,6 +208,7 @@ let () =
   ascii16 ();
   koei_sram ();
   detection ();
+  plain ();
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1

@@ -82,7 +82,7 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
 (* MegaROM cartridge mappers. A cart larger than 32KB (or a 32KB one built for a
    mapper) can't sit flat in the 0x4000-0xBFFF window; it shows one of its
    segments per window and swaps them when the running code writes a bank
-   register. [Flat] is the plain 16/32KB cart with no banking. The four here are
+   register. [Flat] is a plain ROM of up to 64KB with no banking. The four here are
    the common ones (openMSX RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16);
    the SCC sound chip is not modelled, only its banking. *)
 type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
@@ -121,6 +121,9 @@ type t = {
   mutable logo_rom : Bytes.t;
   mutable sub_rom : Bytes.t;
   mutable cart : Bytes.t;
+  mutable cart_first_page : int;
+      (** 8KB page (0-7) where a [Flat] cart's first byte sits. Derived from
+      [cart] by [plain_rom_first_page]; [set_cart] keeps the two together. *)
   mutable cart_mapper : cart_mapper;
   cart_banks : int array;
       (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
@@ -230,7 +233,8 @@ let cart_bank_write m a v =
      | _ -> ())
 
 (* Guess a mapper from the ROM by looking at where its code writes bank
-   registers ([ld (nn),a]). Only for ROMs over 32KB; smaller carts sit flat.
+   registers ([ld (nn),a]). A ROM under 64KB is plain, and so is a 64KB one
+   without an "AB" header at its first byte (openMSX RomFactory guessRomType).
 
    The decision is by *distinctive* register, not raw count: an ASCII8 game also
    writes 0x6000/0x7000 (those are two of its four registers), so a plain count
@@ -241,7 +245,8 @@ let cart_bank_write m a v =
    wrong; [load_cartridge ~mapper] overrides it. *)
 let guess_mapper rom =
   let len = String.length rom in
-  if len <= 0x8000 then Flat
+  let header_at_0 = len >= 2 && rom.[0] = 'A' && rom.[1] = 'B' in
+  if len < 0x10000 || (len = 0x10000 && not header_at_0) then Flat
   else begin
     let a8 = ref 0 and scc = ref 0 and konami = ref 0 and a16 = ref 0 in
     for i = 0 to len - 3 do
@@ -425,6 +430,49 @@ let fdc_recent_calls () =
   Array.init (min !fdc_log_i 256) (fun k -> fdc_log.((!fdc_log_i - min !fdc_log_i 256 + k) land 255))
 
 
+(* Where a plain ROM starts (openMSX RomPlain::guessLocation): each "AB"
+   header at file offset 0 or 0x4000 votes, per non-zero routine pointer
+   (INIT, STATEMENT, DEVICE, TEXT), for the 16KB page the pointer falls in,
+   counted from that header's place in the file. 0x4000 wins ties, then
+   0x0000, then 0x8000; with no vote the ROM starts at 0x0000. Returned as an
+   8KB page index. *)
+let plain_rom_first_page rom =
+  let len = Bytes.length rom in
+  let byte i = Char.code (Bytes.get rom i) in
+  let votes = Array.make 3 0 in
+  let header offset =
+    if byte offset = Char.code 'A' && byte (offset + 1) = Char.code 'B' then
+      for i = 0 to 3 do
+        let addr = byte (offset + 2 + (2 * i)) + (256 * byte (offset + 3 + (2 * i))) in
+        let page = (addr lsr 14) - (offset lsr 14) in
+        if addr <> 0 && page >= 0 && page <= 2 then votes.(page) <- votes.(page) + 1
+      done
+  in
+  let header_size = 0x10 in
+  if len >= header_size then header 0;
+  if len >= 0x4000 + header_size then header 0x4000;
+  let base =
+    if votes.(1) > 0 && votes.(1) >= votes.(0) && votes.(1) >= votes.(2) then 0x4000
+    else if votes.(0) > 0 && votes.(0) >= votes.(2) then 0x0000
+    else if votes.(2) > 0 then 0x8000
+    else 0x0000
+  in
+  base / 0x2000
+
+let set_cart m rom =
+  m.cart <- rom;
+  m.cart_first_page <- plain_rom_first_page rom
+
+(* The cart byte a plain ROM shows at CPU address [a] (openMSX RomPlain,
+   type Mirrored): the ROM's own 8KB pages from its first page on, and outside
+   them page (p - first) land (pages - 1), which mirrors a power-of-two ROM
+   over the whole 64KB. *)
+let plain_rom_offset m a =
+  let pages = max 1 (Bytes.length m.cart / 0x2000) in
+  let p = (a lsr 13) - m.cart_first_page in
+  let p = if p >= 0 && p < pages then p else p land (pages - 1) in
+  (p * 0x2000) + (a land 0x1fff)
+
 (* 0xFFFF 서브슬롯 레지스터의 페이지별 해석: 8비트가 4페이지 × 2비트로
    각 페이지가 볼 슬롯3 의 서브를 따로 고른다(bits0-1=page0 … bits6-7=page3).
    실기 BIOS/C-BIOS 의 RAM 검색(chkram: 0xFFFF 에 0xF0,0xE0,… 를 쓰며 순회)
@@ -525,10 +573,6 @@ let mem_read m addr =
     let off = a land 0x3fff in
     match slot with
     | 0 | 1 | 2 ->
-      (* 32KB 카트리지 파일: 앞 16KB 가 페이지1(0x4000), 뒷 16KB 가
-         페이지2(0x8000) — 페이지 내 주소 off 에 페이지2 면 0x4000 을
-         더해 파일 뒷반을 읽는다 (앞반을 다시 보면 미러가 된다). *)
-      let cart_off = if page = 2 then 0x4000 + off else off in
       let rom, roff =
         match slot, page with
         | 0, 0 | 0, 1 ->
@@ -545,29 +589,16 @@ let mem_read m addr =
              오인한다. 슬롯2 의 page0 폴백(main ROM) 과는 다르다 — 그쪽은 카트
              없는 C-BIOS 부트가 쓰는 경로다. *)
           (Bytes.make 0 '\000', 0)
-        | 2, 2 ->
-          (* 32KB 카트는 뒷 16KB. 16KB 카트는 A15 를 해독하지 않아 페이지2 에
-             앞 16KB 가 다시 보인다 (미러). 경계는 >= — 정확히 0x8000 인
-             파일이 로고 ROM 으로 새는 게 스펠렁커 halt 사태의 원인이었다.
-             [cart] 가 디스크 인터페이스 ROM(실ROM 부트)이면 카트리지 슬롯은
+        | 2, _ when m.cart_is_disk_rom ->
+          (* 실ROM 부트의 디스크 인터페이스는 3-3 에만 있다. 카트리지 슬롯은
              실기처럼 비어 있다 — 전 페이지 빈 버스. *)
-          if m.cart_is_disk_rom then (Bytes.make 0 '\000', 0)
-          else if Bytes.length m.cart >= 0x8000 then (m.cart, cart_off)
-          else if Bytes.length m.cart >= 0x4000 then (m.cart, off)
-          else (m.logo_rom, off)
-        | 2, 0 ->
-          (* 실기 NMS8250: 카트리지는 page1(0x4000) 부터 보인다 — page0 은
-             빈 버스. 카트 파일 앞 16KB("AB" 헤더)를 page0 에서도 돌려주면
-             실 BIOS 의 슬롯 스캔 판정을 오염시킨다. 카트가 없는 부트의 기존
-             폴백(main ROM 미러)은 유지 — 그 부트가 이 뷰를 읽는다. 실ROM
-             부트의 인터페이스는 3-3 에만 있으므로 여기도 빈 버스다. *)
-          if m.cart_is_disk_rom || Bytes.length m.cart >= 0x4000
-          then (Bytes.make 0 '\000', 0)
-          else (m.main_rom, off)
-        | 2, 1 ->
-          if m.cart_is_disk_rom then (Bytes.make 0 '\000', 0)
-          else if Bytes.length m.cart >= 0x4000 then (m.cart, cart_off)
-          else (m.main_rom, off)
+          (Bytes.make 0 '\000', 0)
+        | 2, _ when Bytes.length m.cart > 0 -> (m.cart, plain_rom_offset m a)
+        | 2, 0 | 2, 1 ->
+          (* 카트가 없는 C-BIOS 부트의 기존 폴백(main ROM 미러) — 그 부트가
+             이 뷰를 읽는다. *)
+          (m.main_rom, off)
+        | 2, 2 -> (m.logo_rom, off)
         | 0, 3 | 1, 3 | 2, 3 ->
           (* 실기 NMS8250: 슬롯0-2 의 page3(0xC000-) 는 빈 버스(0xFF) 다.
              main ROM(32KB) 이 page0-1 까지라 page3 에서 그 마지막 바이트를
@@ -801,6 +832,7 @@ let create ~machine =
       logo_rom = rom_or_empty logo;
       sub_rom = rom_or_empty sub;
       cart = Bytes.make 0 '\000';
+      cart_first_page = 0;
       cart_mapper = Flat;
       cart_banks = [| 0; 1; 2; 3 |];
       cart_sram = Bytes.make 0 '\000';
@@ -845,7 +877,7 @@ let palette_entries t = Array.init 16 (Vdp.palette_rgb t.vdp)
 let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
 
 let load_cartridge ?mapper t rom =
-  t.cart <- Bytes.of_string rom;
+  set_cart t (Bytes.of_string rom);
   t.cart_mapper <- (match mapper with Some m -> m | None -> guess_mapper rom);
   (* Reset the banks linear so a MegaROM boots: segment 0 at 0x4000 holds the
      "AB" header and INIT vector, and the running code sets the selectable banks
@@ -1125,7 +1157,7 @@ let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
          FDC 레지스터 창(레거시 배선)에 스택(0x7FF8-0x7FFF)이 겹쳐 무한 루프
          한다(실측: 09-11, 0x02C0 프리미티브가 8만 회). HLE 트랩은 유지 — 부트
          섹터 로드와 BIOS 엔트리는 트랩이, 나머지는 실ROM 코드가 맡는다. *)
-     t.cart <- real;
+     set_cart t real;
      t.cart_mapper <- Flat;
      t.cart_banks.(0) <- 0;
      t.cart_banks.(1) <- 1;
@@ -1176,7 +1208,7 @@ let boot_disk t =
        3-2 뷰의 문턱(>= 0x4000)과 같은 조건으로, 이미 올라온 ROM(interface_rom
        경로, 실ROM 하이브리드)은 그대로 둔다. *)
     if Bytes.length t.cart < 0x4000 then begin
-      t.cart <- Bytes.of_string (disk_rom_bytes ());
+      set_cart t (Bytes.of_string (disk_rom_bytes ()));
       t.cart_mapper <- Flat;
       t.cart_banks.(0) <- 0;
       t.cart_banks.(1) <- 1;
@@ -2154,7 +2186,7 @@ let restore_with_reader reader state =
     let t = create ~machine:{ram_kb = ram_size / 1024; vram_kb = 128;
         roms = List.map Bytes.to_string [main; logo; sub]} in
     Bytes.blit ram 0 t.ram 0 ram_size;
-    t.cart <- State_codec.get_bytes r;
+    set_cart t (State_codec.get_bytes r);
     t.cart_sram <- State_codec.get_bytes r;
     let sram_size = Bytes.length t.cart_sram in
     if sram_size <> 0 && (sram_size mod 8192 <> 0 || sram_size land (sram_size - 1) <> 0) then
