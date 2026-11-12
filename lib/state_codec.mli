@@ -12,7 +12,8 @@ val reader : string -> reader
 val reader_with_current_v1_layout : string -> reader
 val version : reader -> int
 (* Layout version of the decoded state: 1 (pre-#38), 2 (#38 envelope),
-    or 3 (#47 WD2793 drive state). Bumped when the payload layout changes. *)
+    3 (#47 WD2793 drive state) or 4 (VDP sprite collision coordinates).
+    Bumped when the payload layout changes. *)
 val end_of_input : reader -> unit
 val remaining : reader -> int
 val fail : string -> 'a

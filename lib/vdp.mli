@@ -1,7 +1,9 @@
-(** V9938 — TMS9918 호환 표면(텍스트/G1/G2) + SCREEN5(G4) 비트맵 렌더,
+(** V9938 — TMS9918 호환 표면(텍스트/G1/G2/G3) + SCREEN5-8 비트맵 렌더,
     블록 명령(LMMV/HMMV/HMMM/YMMM/LMMM) 과 CPU 동기 전송(LMMC/HMMC),
     레지스터·VRAM 래치, 팔레트, VBlank·라인 인터럽트.
-    SCREEN6-8·스프라이트·POINT/SRCH/LINE 은 아직 없다. *)
+    스프라이트 모드 1·2 는 {!Vdp_sprite} 가 그리고, [advance] 가 표시 라인마다
+    S#0 의 5S/9S·충돌 비트와 S#3-S#6 충돌 좌표를 갱신한다.
+    POINT/SRCH/LINE/LMCM 은 아직 없다. *)
 
 type t
 
