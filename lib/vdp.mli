@@ -3,8 +3,11 @@
     레지스터·VRAM 래치, 팔레트, VBlank·라인 인터럽트.
     명령 엔진은 SCREEN5-8 에서만 돈다: STOP, POINT, PSET, SRCH, LINE, 블록
     명령(LMMV/HMMV/HMMM/YMMM/LMMM), CPU 동기 전송(LMMC/HMMC 는 R#44 쓰기,
-    LMCM 은 S#7 읽기). 전송이 아닌 명령은 CMR 쓰기 안에서 끝나고, 명령이
-    바꾼 SX/SY/DX/DY/NX/NY 는 레지스터에 되쓰지 않는다.
+    LMCM 은 S#7 읽기). 전송이 아닌 명령은 CMR 쓰기 안에서 끝난다. 명령은
+    멈춘 자리를 레지스터에 남긴다: 블록 명령과 전송은 끝낸 줄마다 DY(원본을
+    읽으면 SY 도)를 한 줄 옮기고 NY 를 하나 줄이며, LINE 은 DY 를 마지막
+    자리에 둔다. 그래서 CPU 가 일부 레지스터만 다시 쓰고 CMR 을 쓰면 다음
+    명령이 그 자리에서 이어진다.
     스프라이트 모드 1·2 는 {!Vdp_sprite} 가 그리고, [advance] 가 표시 라인마다
     S#0 의 5S/9S·충돌 비트와 S#3-S#6 충돌 좌표를 갱신한다. *)
 

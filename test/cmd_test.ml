@@ -289,6 +289,111 @@ let () =
   command t ~sx:30 ~sy:0 ~dx:0 ~dy:8 ~nx:3 ~ny:2 0x90;
   check "LMMM leaves ASX at SX" (border_x t = 30)
 
+(* Register write-back: the engine runs on SY, DY and NY themselves and
+   leaves them where it stopped (openMSX VDPCmdEngine: "SY += TY; DY += TY;
+   --NY" per finished row, DY moved by LINE). The CPU cannot read them
+   back, so each case starts a second command by writing only some of
+   R#32-R#46 and looks at where it draws. *)
+let only t r v = reg t r v
+let row_filled t y v = raw t (y * 128) = v && raw t ((y * 128) + 3) = v
+let hmmm = 0xd0
+let ymmm = 0xe0
+let pset = 0x50
+
+let () =
+  (* HMMV over rows 10-12 leaves DY = 13, NY = 0. *)
+  let t = fresh 0x06 in
+  command t ~dx:0 ~dy:10 ~nx:8 ~ny:3 ~col:0x11 hmmv;
+  only t 42 2;
+  only t 46 hmmv;
+  check "HMMV leaves DY on the next row" (row_filled t 13 0x11 && row_filled t 14 0x11);
+  check "HMMV continuation stops after the new NY" (raw t (15 * 128) = 0);
+  (* NY counted down to 0 means 1024 rows: the continuation fills from
+     row 15 through the whole 1024-line space. *)
+  only t 46 hmmv;
+  check "HMMV leaves NY at 0, read as 1024 rows"
+    (row_filled t 15 0x11 && row_filled t 200 0x11 && row_filled t 9 0x11);
+  (* DIY up: rows 10, 9, 8, then DY = 7. *)
+  let t = fresh 0x06 in
+  command t ~dx:0 ~dy:10 ~nx:8 ~ny:3 ~col:0x22 ~arg:arg_diy hmmv;
+  only t 42 1;
+  only t 46 hmmv;
+  check "HMMV DIY leaves DY above the last row" (row_filled t 7 0x22 && raw t (6 * 128) = 0);
+  (* Clipped at the top: rows 1 and 0 of NY 5, then DY = -1 = 1023 and
+     NY = 3. *)
+  let t = fresh 0x06 in
+  command t ~dx:0 ~dy:1 ~nx:8 ~ny:5 ~col:0x33 ~arg:arg_diy hmmv;
+  check "HMMV DIY clips at row 0" (row_filled t 0 0x33 && row_filled t 1 0x33);
+  only t 46 hmmv;
+  check "clipped HMMV wraps DY to 1023 and keeps NY - rows"
+    (row_filled t 1023 0x33 && row_filled t 1021 0x33 && raw t (1020 * 128) = 0);
+  (* HMMM moves SY with DY: rows 0-1 to 100-101, then row 2 to 102. *)
+  let t = fresh 0x06 in
+  List.iter (fun y -> poke t (y * 128) (0x40 + y)) [ 0; 1; 2; 3 ];
+  command t ~sx:0 ~sy:0 ~dx:0 ~dy:100 ~nx:2 ~ny:2 hmmm;
+  only t 42 1;
+  only t 46 hmmm;
+  check "HMMM leaves SY and DY on the next row"
+    (raw t (100 * 128) = 0x40 && raw t (101 * 128) = 0x41 && raw t (102 * 128) = 0x42
+     && raw t (103 * 128) = 0);
+  (* YMMM likewise. *)
+  let t = fresh 0x06 in
+  List.iter (fun y -> poke t (y * 128) (0x50 + y)) [ 0; 1; 2 ];
+  command t ~sy:0 ~dx:0 ~dy:50 ~ny:1 ymmm;
+  only t 46 ymmm;
+  check "YMMM leaves SY and DY on the next row" (raw t (51 * 128) = 0x51);
+  (* LINE, Y major: dots on rows 10-13, then DY = 14 (DY steps before the
+     end test). A PSET started with CMR alone lands there. *)
+  let t = fresh 0x06 in
+  command t ~dx:4 ~dy:10 ~nx:3 ~ny:0 ~col:7 ~arg:arg_maj line;
+  only t 44 9;
+  only t 46 pset;
+  check "LINE Y-major leaves DY one past the last dot"
+    (dot5 t 4 13 = 7 && dot5 t 4 14 = 9);
+  (* LINE, Y major, DIY up from row 1: dots on rows 1 and 0, then DY steps
+     to -1 and the command ends there, so DY = 1023. *)
+  let t = fresh 0x06 in
+  command t ~dx:4 ~dy:1 ~nx:5 ~ny:0 ~col:7 ~arg:(arg_maj lor arg_diy) line;
+  only t 44 9;
+  only t 46 pset;
+  check "LINE leaving the top edge leaves DY = 1023"
+    (dot5 t 4 0 = 7 && dot5 t 4 1023 = 9);
+  (* LINE, X major: DY stays on the last dot's row. *)
+  let t = fresh 0x06 in
+  command t ~dx:4 ~dy:10 ~nx:4 ~ny:2 ~col:7 line;
+  only t 44 9;
+  only t 36 40;
+  only t 46 pset;
+  check "LINE X-major leaves DY on the last dot's row" (dot5 t 40 12 = 9);
+  (* LMMC: two rows of one dot, then DY = 22. The R#44 written before CMR
+     is the first dot. *)
+  let t = fresh 0x06 in
+  command t ~dx:6 ~dy:20 ~nx:1 ~ny:2 ~col:3 lmmc;
+  only t 44 4;
+  only t 44 5;
+  only t 46 pset;
+  check "LMMC leaves DY on the next row"
+    (dot5 t 6 20 = 3 && dot5 t 6 21 = 4 && dot5 t 6 22 = 5);
+  (* STOP during LMMC keeps the rows already done: 2 of 4, so DY = 42 and
+     NY = 2. *)
+  let t = fresh 0x06 in
+  command t ~dx:0 ~dy:40 ~nx:1 ~ny:4 ~col:1 lmmc;
+  only t 44 1;
+  only t 46 0x00;
+  only t 40 8;
+  only t 44 0x66;
+  only t 46 hmmv;
+  check "STOP during LMMC keeps the finished rows"
+    (row_filled t 42 0x66 && row_filled t 43 0x66 && raw t (44 * 128) = 0);
+  (* LMCM moves SY: one dot from row 30, then POINT reads row 31. *)
+  let t = fresh 0x06 in
+  set5 t 2 30 0xa;
+  set5 t 2 31 0xb;
+  command t ~sx:2 ~sy:30 ~nx:1 ~ny:1 lmcm;
+  check "LMCM reads its dot" (status t 7 = 0x0a);
+  only t 46 point_cmd;
+  check "LMCM leaves SY on the next row" (status t 7 = 0x0b)
+
 let () =
   if !failures > 0 then begin
     Printf.eprintf "cmd_test: %d failure(s)\n%!" !failures;
