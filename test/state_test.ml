@@ -20,7 +20,7 @@ let rejection name expected state =
 (* Recompute the envelope after payload edits: these cases must reach the
    decoder, rather than merely fail the corruption checksum. *)
 let edit_payload state edit =
-  let magic = "OCAML-MSX\000\005" in
+  let magic = "OCAML-MSX\000\006" in
   let offset = String.length magic + 16 in
   let payload = String.sub state offset (String.length state - offset) |> edit in
   magic ^ Digest.string payload ^ payload
@@ -195,16 +195,18 @@ let () =
     (edit_payload state (fun payload -> String.sub payload 0 (String.length payload - 1)));
   rejection "valid checksum with extra payload" "trailing data in MSX state"
     (edit_payload state (fun payload -> payload ^ "extra"));
-  (* Older payloads are this one without its VDP tail: v4 lacks the raster
-     and published frame (v5), v3 also the two collision ints (v4). They
-     restore with a black screen and, once two frames have been scanned,
-     match the original machine stepped the same way. *)
-  let offset = String.length "OCAML-MSX\000\005" + 16 in
-  let v5_payload = String.sub state offset (String.length state - offset) in
+  (* Older payloads are this one without its VDP tail: v5 lacks the LMCM
+     flag, BD and ASX (v6), v4 also the raster and published frame (v5), v3
+     also the two collision ints (v4). They restore with a black screen
+     and, once two frames have been scanned, match the original machine
+     stepped the same way. *)
+  let offset = String.length "OCAML-MSX\000\006" + 16 in
+  let v6_payload = String.sub state offset (String.length state - offset) in
   let fw, fh = Msx.frame_dims t in
+  let command_tail = 1 + 1 + 8 in
   let raster_tail = (8 + (512 * 212 * 3)) + (8 + 212) + 8 + 8 + (8 + (fw * fh * 3)) in
   let older version cut =
-    let payload = String.sub v5_payload 0 (String.length v5_payload - cut) in
+    let payload = String.sub v6_payload 0 (String.length v6_payload - cut) in
     Printf.sprintf "OCAML-MSX\000%c" (Char.chr version) ^ Digest.string payload ^ payload
   in
   let stepped state =
@@ -213,8 +215,10 @@ let () =
     | Ok m -> Msx.step m ~frames:2; Msx.serialize m
   in
   let reference = stepped state in
+  check "v5 restores and rescans to the same machine"
+    (stepped (older 5 command_tail) = reference);
   check "v4 restores and rescans to the same machine"
-    (stepped (older 4 raster_tail) = reference);
+    (stepped (older 4 (command_tail + raster_tail)) = reference);
   check "v3 restores and rescans to the same machine"
-    (stepped (older 3 (raster_tail + 16)) = reference);
+    (stepped (older 3 (command_tail + raster_tail + 16)) = reference);
   print_endline "state: CPU continuation, device latches, media and rejection passed"

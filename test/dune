@@ -102,3 +102,8 @@
  (name raster_test)
  (modules raster_test)
  (libraries vdpcore))
+
+(test
+ (name cmd_test)
+ (modules cmd_test)
+ (libraries vdpcore))

@@ -1,9 +1,11 @@
 (** V9938 — TMS9918 호환 표면(텍스트/G1/G2/G3) + SCREEN5-8 비트맵 렌더,
-    블록 명령(LMMV/HMMV/HMMM/YMMM/LMMM) 과 CPU 동기 전송(LMMC/HMMC),
     레지스터·VRAM 래치, 팔레트, VBlank·라인 인터럽트.
+    명령 엔진은 SCREEN5-8 에서만 돈다: STOP, POINT, PSET, SRCH, LINE, 블록
+    명령(LMMV/HMMV/HMMM/YMMM/LMMM), CPU 동기 전송(LMMC/HMMC 는 R#44 쓰기,
+    LMCM 은 S#7 읽기). 전송이 아닌 명령은 CMR 쓰기 안에서 끝나고, 명령이
+    바꾼 SX/SY/DX/DY/NX/NY 는 레지스터에 되쓰지 않는다.
     스프라이트 모드 1·2 는 {!Vdp_sprite} 가 그리고, [advance] 가 표시 라인마다
-    S#0 의 5S/9S·충돌 비트와 S#3-S#6 충돌 좌표를 갱신한다.
-    POINT/SRCH/LINE/LMCM 은 아직 없다. *)
+    S#0 의 5S/9S·충돌 비트와 S#3-S#6 충돌 좌표를 갱신한다. *)
 
 type t
 
@@ -14,8 +16,11 @@ val io_write : t -> port:int -> int -> unit
     인덱스 / 0x9B 팔레트 데이터. *)
 
 val io_read : t -> port:int -> int
-(** 0x98 VRAM 읽기(버퍼) / 0x99 status0 — 읽으면 VBlank 비트와
-    인터럽트 요청이 지워진다. *)
+(** 0x98 VRAM 읽기(버퍼) / 0x99 R#15 가 고른 상태 레지스터. S#0 을 읽으면
+    VBlank 비트와 인터럽트 요청이 지워진다. S#2 는 CE·TR·BD, S#7 은 COL
+    (POINT·LMCM 의 점; 읽으면 LMCM 이 다음 점을 꺼낸다), S#8/S#9 는 ASX
+    (SRCH 가 멈춘 X), S#9 를 읽으면 BD 가 지워진다. S#2 의 VR·HR·EO 는
+    아직 늘 1 이다. *)
 
 val advance : t -> cycles:int -> bool
 (** 경과 T-state 만큼 스캔라인을 진행한다. 표시 라인을 벗어날 때마다 그
