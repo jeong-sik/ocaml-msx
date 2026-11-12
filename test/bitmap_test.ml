@@ -8,7 +8,9 @@ let seek t ~write a =
   Vdp.io_write t ~port:0x99 (((a lsr 8) land 63) lor if write then 64 else 0)
 let data t xs = List.iter (Vdp.io_write t ~port:0x98) xs
 let raw t a = Vdp.vram_read t a
-let fresh mode = let t = Vdp.create () in reg t 0 mode; reg t 1 0x40; t
+(* Page 0 with R#2 bits 4-0 set: those bits mask the display line
+   (openMSX SDLRasterizer::drawDisplay), so the BIOS writes them as 1. *)
+let fresh mode = let t = Vdp.create () in reg t 0 mode; reg t 1 0x40; reg t 2 0x1f; t
 let xy t r x = reg t r (x land 255); reg t (r + 1) (x lsr 8)
 let command t ~cmd ~dx ~dy ~nx ~ny ~arg ~color =
   xy t 36 dx; xy t 38 dy; xy t 40 nx; xy t 42 ny;
@@ -59,11 +61,12 @@ let () =
   check "last native pixel in 212-line mode" (pixel t 511 211 = (255,255,255));
   reg t 23 211;
   check "vertical scroll uses selected display page" (pixel t 511 0 = (255,255,255));
-  (* R2 selects page 3 in SCREEN5/6, page 1 in SCREEN7/8. Scroll
+  (* R#2 bits 6-5 select page 3 in SCREEN5/6 (0x7F); the planar
+     SCREEN7/8 have two pages and take bit 5 (0x3F is page 1). Scroll
      wraps from line 255 to line 0 within that page, not into page 0. *)
-  List.iter (fun (name, mode, page_base, stride, last_physical, first_physical, color, rgb) ->
+  List.iter (fun (name, mode, r2, page_base, stride, last_physical, first_physical, color, rgb) ->
     let t = fresh mode in white t;
-    reg t 2 0x60;
+    reg t 2 r2;
     seek t ~write:true (page_base + 255 * stride); data t [color];
     seek t ~write:true page_base; data t [color];
     check (name ^ " selected page physical addresses")
@@ -71,13 +74,13 @@ let () =
     reg t 23 255;
     check (name ^ " scroll selects last line of nonzero page") (pixel t 0 0 = rgb);
     check (name ^ " scroll wraps within nonzero page") (pixel t 0 1 = rgb);
-    reg t 2 0;
+    reg t 2 0x1f;
     check (name ^ " page zero remains distinct")
       (pixel t 0 0 = (0,0,0) && pixel t 0 1 = (0,0,0))
-  ) [ "SCREEN5", 0x06, 0x18000, 128, 0x1ff80, 0x18000, 0x10, (255,255,255);
-      "SCREEN6", 0x08, 0x18000, 128, 0x1ff80, 0x18000, 0x40, (255,255,255);
-      "SCREEN7", 0x0a, 0x10000, 256, 0x0ff80, 0x08000, 0x10, (255,255,255);
-      "SCREEN8", 0x0e, 0x10000, 256, 0x0ff80, 0x08000, 0x1c, (255,0,0) ];
+  ) [ "SCREEN5", 0x06, 0x7f, 0x18000, 128, 0x1ff80, 0x18000, 0x10, (255,255,255);
+      "SCREEN6", 0x08, 0x7f, 0x18000, 128, 0x1ff80, 0x18000, 0x40, (255,255,255);
+      "SCREEN7", 0x0a, 0x3f, 0x10000, 256, 0x0ff80, 0x08000, 0x10, (255,255,255);
+      "SCREEN8", 0x0e, 0x3f, 0x10000, 256, 0x0ff80, 0x08000, 0x1c, (255,0,0) ];
   (* NX is pixels even for byte transfer commands. Two bytes, not four. *)
   let t = fresh 0x0a in
   command t ~cmd:0xf0 ~dx:0 ~dy:0 ~nx:4 ~ny:1 ~arg:0 ~color:0x12;

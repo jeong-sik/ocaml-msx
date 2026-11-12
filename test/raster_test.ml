@@ -54,12 +54,14 @@ let px t x y =
 let white = (255, 255, 255)
 let red = (255, 0, 0)
 
-(* SCREEN5 (R#0=0x06), display on. Rows [0, split) hold colour 1, the rest
-   colour 2; colour 1 is white and 2 red. *)
+(* SCREEN5 (R#0=0x06), display on, page 0 (R#2 = 0x1F: bits 4-0 set so
+   every line shows). Rows [0, split) hold colour 1, the rest colour 2;
+   colour 1 is white and 2 red. *)
 let screen5 ?(split = 256) () =
   let t = Vdp.create () in
   reg t 0 0x06;
   reg t 1 0x40;
+  reg t 2 0x1f;
   palette t 1 (7, 7, 7);
   palette t 2 (7, 0, 0);
   seek t 0;

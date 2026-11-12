@@ -34,6 +34,12 @@ type t = {
   (* R#9 bit 1 as latched when the line counter wraps: 313 lines a frame
      (PAL, 50 Hz) or 262 (NTSC, 60 Hz). openMSX fixes it at frameStart. *)
   mutable pal : bool;
+  (* R#13 blinking (openMSX blinkState / blinkCount): [blink_on] is the
+     ON period, which shows the R#12 colours in TEXT2 and the even page in
+     the bitmap modes; [blink_count] is the frames left in this period, 0
+     when the colours do not alternate. *)
+  mutable blink_on : bool;
+  mutable blink_count : int;
   mutable int_pending : bool;
   mutable cmd_ce : bool;
   (* 전송 상태 — CMR 를 쓰면 진입한다. tx_* 는 걷는 모서리다: LMMC/HMMC 는
@@ -127,6 +133,8 @@ let create () =
     cycle_in_line = 0;
     even_odd = false;
     pal = false;
+    blink_on = false;
+    blink_count = 0;
     int_pending = false;
     cmd_ce = false;
     tx = None;
@@ -579,9 +587,30 @@ let start_command t =
       start_transfer t Lmcm ~x:(reg16 t 32 33) ~y:(reg_y t 34 35);
       fetch_dot t
 
+(* Writing R#13 restarts blinking even when the value is unchanged (openMSX
+   VDP::changeRegister): the ON period starts now unless it is 0 frames,
+   and the colours alternate only when both periods are non-zero. *)
+let restart_blink t v =
+  if t.blink_on = (v land 0xf0 = 0) then t.blink_on <- not t.blink_on;
+  t.blink_count <-
+    (if v land 0xf0 <> 0 && v land 0x0f <> 0 then (v lsr 4) * 10 else 0)
+
+(* One frame of R#13 blinking, at frame start (openMSX VDP::frameStart):
+   each nibble counts tens of frames, high for ON and low for OFF. *)
+let step_blink t =
+  if t.blink_count <> 0 then begin
+    t.blink_count <- t.blink_count - 1;
+    if t.blink_count = 0 then begin
+      t.blink_on <- not t.blink_on;
+      let r13 = t.regs.(13) in
+      t.blink_count <- (if t.blink_on then r13 lsr 4 else r13 land 0x0f) * 10
+    end
+  end
+
 let set_reg t r v =
   t.regs.(r) <- v land 0xff;
   if r = 44 then request_transfer t
+  else if r = 13 then restart_blink t (v land 0xff)
   else if r = 46 then start_command t
   else if r = 16 then begin
     (* R#16 이 팔레트 인덱스를 다시 고르면 진행 중이던 첫 바이트는 버린다.
@@ -768,8 +797,8 @@ let blanked t = t.regs.(1) land 0x40 = 0
 
 (* 모드 판정 (V9938 모드표: M5=R0bit3, M4=R0bit2, M3=R0bit1,
    M2=R1bit3, M1=R1bit4). G4 비트맵 = MSX2 SCREEN5 (M4+M3),
-   베이스는 R#2 의 A16/A15 (bit6/5) × 32K — 하위 5비트는 11111 고정.
-   멀티컬러(M2) 는 아직 없다. *)
+   베이스는 R#2 의 A16/A15 (bit6/5) × 32K — 하위 5비트는 11111 이어야
+   모든 줄이 보인다 ({!bitmap_vram_line}). *)
 let mode_text t = t.regs.(1) land 0x10 <> 0
 let mode_g2 t =
   not (mode_text t) && t.regs.(0) land 0x02 <> 0
@@ -803,15 +832,16 @@ let graphic7_rgb =
 
 let graphic7_sprite_rgb = Array.map (fun v -> packed (grb_to_rgb v)) graphic7_sprite_palette
 
-let line_width t = match display_mode t with Graphic5 | Graphic6 -> max_width | _ -> 256
-
-(* The frame a VBlank publishes: bitmap modes keep native width and R#9 LN
-   height; character modes are 256×192. *)
-let scan_dims t =
+let line_width t =
   match display_mode t with
-  | Graphic4 | Graphic5 | Graphic6 | Graphic7 ->
-      ((bitmap_layout t).width, visible_lines t)
-  | _ -> (256, 192)
+  | Text2 | Graphic5 | Graphic6 -> max_width
+  | Text1 | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4 | Graphic7
+  | Undefined _ -> 256
+
+(* The frame a VBlank publishes: native width and R#9 LN height. Character
+   modes show rows 24-26 too when LN selects 212 lines (openMSX renders
+   every display line through CharacterConverter). *)
+let scan_dims t = (line_width t, visible_lines t)
 
 (* [x] < max_width and [y] < max_lines at every call, so the three bytes
    lie inside the raster; the renderer writes ~100K pixels a frame. *)
@@ -845,6 +875,125 @@ let border_rgb t raw x =
   | Text1 | Text2 | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4
   | Graphic6 | Undefined _ -> raw.(r7 land 0x0f)
 
+(* Character tables are read as openMSX VRAMWindow::readNP reads them: the
+   address is [base land index], where [base] is the register value with
+   its unused low bits set and [index] is the offset with every bit from
+   [bits] up set. Register bits that overlap the offset act as a mask, the
+   source of the TMS-era table mirrors. *)
+let table t ~base ~bits index =
+  Char.code (Bytes.get t.vram (base land ((lnot 0 lsl bits) lor index) land 0x1ffff))
+
+let name_base t = ((t.regs.(2) land 0x7f) lsl 10) lor 0x3ff
+let pattern_base t = ((t.regs.(4) land 0x3f) lsl 11) lor 0x7ff
+let colour_base t =
+  ((t.regs.(10) land 0x07) lsl 14) lor (t.regs.(3) lsl 6) lor 0x3f
+
+(* TEXT1 and TEXT2 start 9 dots (18 at 512 wide) right of the other modes'
+   display start (openMSX getLeftSprites, V99x8, openMSX issue #708); the
+   rest of the line is the R#7 background. The character row ignores R#23,
+   which only moves the dot row inside each character (openMSX
+   PixelRenderer::draw keeps its own text row counter). *)
+let text_left = 9
+
+let draw_text_cell set ~x0 ~fg ~bg pattern =
+  for px = 0 to 5 do
+    set (x0 + px) (if (pattern lsr (7 - px)) land 1 = 1 then fg else bg)
+  done
+
+let draw_text1 t set pal y =
+  let r = t.regs in
+  let fg = pal.((r.(7) lsr 4) land 0xf) and bg = pal.(r.(7) land 0xf) in
+  for x = 0 to 255 do set x bg done;
+  let row = y / 8 and dot_row = (y + r.(23)) land 7 in
+  for col = 0 to 39 do
+    (* openMSX renderText1: name index (n + 0xC00) over 12 bits, so R#2
+       bits 1-0 pass through for the first 1K names. *)
+    let name = (row * 40) + col in
+    let code = table t ~base:(name_base t) ~bits:12 ((name + 0xc00) land 0xfff) in
+    let pattern = table t ~base:(pattern_base t) ~bits:11 ((code * 8) + dot_row) in
+    draw_text_cell set ~x0:(text_left + (col * 6)) ~fg ~bg pattern
+  done
+
+(* TEXT2: 80 columns of 6 dots on the 512-dot grid. Each colour table bit
+   marks one character (bit 7 = the leftmost of eight); a marked character
+   takes the R#12 colours while blinking is in its ON period. The blink
+   colours come from the palette itself, and a blink foreground of 0 shows
+   the blink background (openMSX CharacterConverter::renderText2). *)
+let draw_text2 t set pal raw y =
+  let r = t.regs in
+  let plain_fg = pal.((r.(7) lsr 4) land 0xf) and plain_bg = pal.(r.(7) land 0xf) in
+  let blink_fg, blink_bg =
+    if t.blink_on then begin
+      let f = (r.(12) lsr 4) land 0xf and b = r.(12) land 0xf in
+      (raw.(if f <> 0 then f else b), raw.(b))
+    end
+    else (plain_fg, plain_bg)
+  in
+  for x = 0 to max_width - 1 do set x plain_bg done;
+  let row = y / 8 and dot_row = (y + r.(23)) land 7 in
+  for col = 0 to 79 do
+    let marks = table t ~base:(colour_base t) ~bits:9 ((row * 10) + (col / 8)) in
+    let marked = (marks lsr (7 - (col land 7))) land 1 = 1 in
+    let code = table t ~base:(name_base t) ~bits:12 ((row * 80) + col) in
+    let pattern = table t ~base:(pattern_base t) ~bits:11 ((code * 8) + dot_row) in
+    let fg, bg = if marked then (blink_fg, blink_bg) else (plain_fg, plain_bg) in
+    draw_text_cell set ~x0:((2 * text_left) + (col * 6)) ~fg ~bg pattern
+  done
+
+(* MULTICOLOR: each name picks 8 pattern bytes; the byte for this line is
+   (scrolled line / 4) mod 8, and its nibbles colour a 4×4 block each
+   (openMSX CharacterConverter::renderMulti). *)
+let draw_multicolor t set pal dy =
+  let row = dy / 8 in
+  for col = 0 to 31 do
+    let code = table t ~base:(name_base t) ~bits:10 ((row * 32) + col) in
+    let c = table t ~base:(pattern_base t) ~bits:11 ((code * 8) lor ((dy / 4) land 7)) in
+    let left = pal.(c lsr 4) and right = pal.(c land 0xf) in
+    for px = 0 to 3 do
+      set ((col * 8) + px) left;
+      set ((col * 8) + 4 + px) right
+    done
+  done
+
+(* GRAPHIC 1-3 tiles at scrolled line [dy]. GRAPHIC 3 (SCREEN4) is GRAPHIC
+   2 tiles under sprite mode 2. G2 indexes patterns and colours over 13
+   bits (third << 11 | name << 3 | dot row), so R#3 bits 6-0 and R#4 bits
+   1-0 mask the high index bits; it reads one colour byte per dot row. G1
+   indexes patterns over 11 bits and colours over 6 (name >> 3). *)
+let draw_tiles t set pal ~g2 dy =
+  let row = dy / 8 and dot_row = dy land 7 in
+  let third = row lsr 3 in
+  for col = 0 to 31 do
+    let name = table t ~base:(name_base t) ~bits:10 ((row * 32) + col) in
+    let pattern, colour =
+      if g2 then begin
+        let index = (third lsl 11) lor (name lsl 3) lor dot_row in
+        ( table t ~base:(pattern_base t) ~bits:13 index,
+          table t ~base:(colour_base t) ~bits:13 index )
+      end
+      else
+        ( table t ~base:(pattern_base t) ~bits:11 ((name lsl 3) lor dot_row),
+          table t ~base:(colour_base t) ~bits:6 (name lsr 3) )
+    in
+    let fg = pal.((colour lsr 4) land 0xf) and bg = pal.(colour land 0xf) in
+    for px = 0 to 7 do
+      set ((col * 8) + px) (if (pattern lsr (7 - px)) land 1 = 1 then fg else bg)
+    done
+  done
+
+(* The VRAM line a bitmap display line shows (openMSX
+   SDLRasterizer::drawDisplay). R#2 times 8 masks the scrolled line, so
+   bits 6-5 pick the page and bits 4-0 must be set to show every line.
+   Planar modes have two pages and drop bit 6. Page bit 0 survives only
+   while the odd page shows: always, unless R#9 bit 2 alternates pages and
+   this is an even field, or R#13 blinking is in its ON period (openMSX
+   VDP::getEvenOddMask). *)
+let bitmap_vram_line t ~planar dy =
+  let r = t.regs in
+  let odd_page = (r.(9) land 0x04 = 0 || t.even_odd) && not t.blink_on in
+  let page_mask = (if planar then 0 else 0x200) lor (if odd_page then 0x100 else 0) in
+  (((r.(2) land 0x7f) lsl 3) lor 7) land (page_mask lor dy)
+
 let render_line t y =
   assert (y >= 0 && y < max_lines);
   let width = line_width t in
@@ -855,24 +1004,20 @@ let render_line t y =
   let character_mode = not (mode_s5 t || mode_bitmap_hi t) in
   let raw = Array.map (fun v -> packed (grb_to_rgb v)) t.palette in
   if blanked t then for x = 0 to width - 1 do set x (border_rgb t raw x) done
-  else if character_mode && y >= 192 then Bytes.fill t.raster base (width * 3) '\000'
   else begin
     (* [tp]: the palette index colour 0 shows. GRAPHIC5 takes bits 3-2 of
        it for even dots and 1-0 for odd ones. *)
     let tp = if colour0_transparent t then t.regs.(7) land 0x0f else 0 in
     let pal = Array.copy raw in
     pal.(0) <- raw.(tp);
-    let vr addr = Char.code (Bytes.get t.vram (addr land 0x1ffff)) in
-    let r = t.regs in
+    let dy = (y + t.regs.(23)) land 0xff in
     if not character_mode then begin
       let layout = bitmap_layout t in
-      let page = if layout.planar then ((r.(2) lsr 6) land 1) * 256
-        else ((r.(2) lsr 5) land 3) * 256 in
       let bytes_per_line = layout.width / layout.pixels_per_byte in
-      let row = (page + ((y + r.(23)) land 255)) * bytes_per_line in
+      let row = bitmap_vram_line t ~planar:layout.planar dy * bytes_per_line in
       let byte_at i =
         let a = (row + i) land 0x1ffff in
-        vr (if layout.planar then ((a land 1) lsl 16) lor (a lsr 1) else a)
+        Char.code (Bytes.get t.vram (if layout.planar then ((a land 1) lsl 16) lor (a lsr 1) else a))
       in
       match display_mode t with
       | Graphic7 -> for x = 0 to 255 do set x graphic7_rgb.(byte_at x) done
@@ -897,53 +1042,17 @@ let render_line t y =
           done
         done
     end
-    else if mode_text t then begin
-      (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. 패턴 테이블은
-         다른 문자 모드처럼 R#4 << 11 이다 (openMSX VDP::updatePatternBase). *)
-      let nt = (r.(2) land 0x7f) lsl 10 in
-      let pt = (r.(4) land 0x3f) lsl 11 in
-      let fg = pal.((r.(7) lsr 4) land 0xf) and bg = pal.(r.(7) land 0xf) in
-      for x = 0 to 7 do set x bg; set (255 - x) bg done;
-      let row = y / 8 and py = y land 7 in
-      for col = 0 to 39 do
-        let pat = vr (pt + (vr (nt + (row * 40) + col) * 8) + py) in
-        for px = 0 to 5 do
-          set (8 + (col * 6) + px) (if (pat lsr (7 - px)) land 1 = 1 then fg else bg)
-        done
-      done
-    end
     else begin
-      (* GRAPHIC 3 (SCREEN4) is GRAPHIC 2 tiles under sprite mode 2. *)
-      let g2 = mode_g2 t || display_mode t = Graphic3 in
-      let nt = (r.(2) land 0x7f) lsl 10 in
-      (* 패턴/컬러 주소 = base land index (openMSX VRAMWindow::readNP).
-         base 는 레지스터를 제자리에 두고 안 쓰는 하위 비트를 1 로 채운 값,
-         index 는 안 쓰는 상위 비트를 1 로 채운 값이다. G2 의 index 는
-         13비트(third<<11 | name<<3 | 행) 라 R#3 bits0-6 과 R#4 bits0-1 이
-         index 상위 비트의 AND 마스크가 된다 — TMS 시절 미러 트릭이 여기서
-         나온다. G2 는 컬러도 패턴처럼 행마다 한 바이트다. G1 은 패턴
-         11비트(name<<3 | 행), 컬러 5비트(name>>3). *)
-      let pt_base = ((r.(4) land 0x3f) lsl 11) lor 0x7ff in
-      let ct_base = ((r.(10) land 0x07) lsl 14) lor (r.(3) lsl 6) lor 0x3f in
-      let row = y / 8 and py = y land 7 in
-      let third = row lsr 3 in
-      for col = 0 to 31 do
-        let name = vr (nt + (row * 32) + col) in
-        let pat_addr, col_addr =
-          if g2 then begin
-            let index = (lnot 0 lsl 13) lor (third lsl 11) lor (name lsl 3) lor py in
-            (pt_base land index, ct_base land index)
-          end
-          else
-            ( pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor py),
-              ct_base land ((lnot 0 lsl 6) lor (name lsr 3)) )
-        in
-        let bits = vr pat_addr and col_byte = vr col_addr in
-        let fg = pal.((col_byte lsr 4) land 0xf) and bg = pal.(col_byte land 0xf) in
-        for px = 0 to 7 do
-          set ((col * 8) + px) (if (bits lsr (7 - px)) land 1 = 1 then fg else bg)
-        done
-      done
+      match display_mode t with
+      | Text1 -> draw_text1 t set pal y
+      | Text2 -> draw_text2 t set pal raw y
+      | Multicolor -> draw_multicolor t set pal dy
+      | Graphic1 -> draw_tiles t set pal ~g2:false dy
+      | Graphic2 | Graphic3 -> draw_tiles t set pal ~g2:true dy
+      | Graphic4 | Graphic5 | Graphic6 | Graphic7 -> ()
+      | Undefined _ ->
+        if mode_text t then draw_text1 t set pal y
+        else draw_tiles t set pal ~g2:(mode_g2 t) dy
     end;
     (* Sprite dots sit on the 256-dot grid. In the 512-wide GRAPHIC 5 a dot
        covers two native pixels and its colour splits into two 2-bit palette
@@ -1021,7 +1130,10 @@ let advance t ~cycles =
       t.line <- 0;
       t.pal <- t.regs.(9) land 0x02 <> 0
     end;
-    if t.line = frame_start_line t then t.even_odd <- not t.even_odd;
+    if t.line = frame_start_line t then begin
+      t.even_odd <- not t.even_odd;
+      step_blink t
+    end;
     if t.line < visible_lines t then check_sprites t ~display_line:t.line
   done;
   !hit
@@ -1096,6 +1208,16 @@ let write_state w t =
   State_codec.put_bool w t.even_odd;
   State_codec.put_bool w t.pal;
   ()
+
+(* v10: R#13 blinking. Msx appends it after the sound chips, so older
+   payloads stay prefixes of newer ones. *)
+let write_blink w t =
+  State_codec.put_bool w t.blink_on;
+  State_codec.put_int w t.blink_count
+
+let read_blink r t =
+  t.blink_on <- State_codec.get_bool r;
+  t.blink_count <- State_codec.get_int r ~min:0 ~max:150
 
 let read_state r t =
   State_codec.fill_int_array r ~min:0 ~max:255 t.regs;
