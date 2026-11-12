@@ -450,7 +450,8 @@ let () =
        (List.filter (fun (p, _, _) -> p = 0x99 || p = 0x98 || p = 0x9B)
           (Msx.vdp_write_log t)));
   let oc = open_out_bin (!out_prefix ^ ".ppm") in
-  Printf.fprintf oc "P6\n256 192\n255\n%s" rgb;
+  let width, height = Msx.frame_dims t in
+  Printf.fprintf oc "P6\n%d %d\n255\n%s" width height rgb;
   close_out oc;
   Printf.printf "wrote %s.ppm\n" !out_prefix;
   if !wav <> "" then begin
