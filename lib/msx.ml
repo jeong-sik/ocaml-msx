@@ -795,7 +795,10 @@ let create ~machine =
   let pout p v = match !m_ref with Some m -> port_write m p v | None -> () in
   let m =
     {
-      cpu = Z80.create ~read ~write ~port_in:pin ~port_out:pout;
+      cpu =
+        (* MSX 는 M1 마다 대기 1 사이클을 넣는다 (openMSX Z80.hh
+           WAIT_CYCLES = 1). 없으면 CPU 가 실기보다 빨리 돈다. *)
+        Z80.create ~m1_wait:1 ~read ~write ~port_in:pin ~port_out:pout;
       vdp = Vdp.create ();
       main_rom = rom_or_empty main;
       logo_rom = rom_or_empty logo;
@@ -1931,7 +1934,7 @@ let step t ~frames =
          를 올리고 그 intr 가 재진입을 부르는 자기유지 폭풍의 연료가 됐다
          (실측 09-11: 64명령 안에 KEYINT 2.5바퀴, PUSH12/POP12 가 FDC 창을
          유린). fdc.intr 는 0x7FFF 폴링 비트용 상태로만 남는다. *)
-      if Vdp.int_active t.vdp then ignore (Z80.interrupt t.cpu);
+      let irq_used = if Vdp.int_active t.vdp then Z80.interrupt t.cpu else 0 in
       let pc0 = Z80.dump_pc t.cpu in
       (match !trace_from with
        | Some (target, n) when pc0 = target && !trace_remaining = 0 ->
@@ -1967,7 +1970,7 @@ let step t ~frames =
           :: !ldirvm_calls;
       (* A disk BIOS entry is served in OCaml (HLE), not by fetching the ROM's
          opcode there; the trap moves PC on, so charge a nominal call's cycles. *)
-      let used = if disk_trap t pc then 18 else Z80.step t.cpu in
+      let used = irq_used + if disk_trap t pc then 18 else Z80.step t.cpu in
       incr instr_count;
       ignore (Vdp.advance t.vdp ~cycles:used);
       budget := !budget - used

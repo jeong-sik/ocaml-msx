@@ -24,13 +24,13 @@ let () =
   poke 0x1234 "\xc9";
   (* 0x0100: ld a,0xC7 / ld i,a / im 2 / ei / halt. *)
   poke 0x0100 "\x3e\xc7\xed\x47\xed\x5e\xfb\x76";
-  let z = Z80.create ~read ~write ~port_in:pin ~port_out:pout in
+  let z = Z80.create ~m1_wait:0 ~read ~write ~port_in:pin ~port_out:pout in
   Z80.set_pc z 0x0100;
   (* 설정 코드 5명령 + halt. *)
   for _ = 1 to 6 do ignore (Z80.step z) done;
   check "halted at ei+halt" (Z80.dump_pc z = 0x0107 || Z80.dump_pc z = 0x0108);
   let sp0 = Z80.dump_sp z in
-  check "interrupt accepted" (Z80.interrupt z);
+  check "interrupt accepted in 19 T-states" (Z80.interrupt z = 19);
   check "vector read from table" (Z80.dump_pc z = 0x1234);
   check "return address pushed" (Z80.dump_sp z = sp0 - 2);
   (* 핸들러 ret 는 중단된 위치로 돌린다. *)
