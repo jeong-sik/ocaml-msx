@@ -6,6 +6,10 @@
    팔레트 쓰기: 0x9A 인덱스, 0x9B 두 번 — 첫 (R<<4|B), 둘째 (G<<4).
    VBlank: 라인 192 진입에서 status0 bit7 과 INT. IE = R1 bit5. *)
 
+(* A CPU-synchronised transfer: LMMC/HMMC take one dot or byte per R#44
+   write, LMCM hands one dot per S#7 read. *)
+type transfer = Lmmc | Hmmc | Lmcm
+
 type t = {
   regs : int array;
   vram : Bytes.t;
@@ -27,10 +31,9 @@ type t = {
   mutable cycle_in_line : int;
   mutable int_pending : bool;
   mutable cmd_ce : bool;
-  (* LMMC/HMMC 전송 상태 — CMR 를 쓰면 진입, R#44(CLR) 쓰기마다
-     1바이트가 흘러간다 (openMSX setCmdReg case 0x0C). *)
-  mutable tx_active : bool;
-  mutable tx_hm : bool;
+  (* 전송 상태 — CMR 를 쓰면 진입한다. tx_* 는 걷는 모서리다: LMMC/HMMC 는
+     DX/DY 에서, LMCM 은 SX/SY 에서 출발한다 (openMSX setCmdReg case 0x0C). *)
+  mutable tx : transfer option;
   mutable tx_dx : int;
   mutable tx_adx : int;
   mutable tx_anx : int;
@@ -38,9 +41,15 @@ type t = {
   mutable tx_dy : int;
   mutable tx_ny : int;
   mutable cmd_tr : bool;
-  (* CMR 발행 전 R#44 쓰기 — 명령 시작 시 첫 픽셀로 소비된다
-     (openMSX transfer 플래그는 명령 밖에서도 세운다). *)
+  (* 명령 밖에서 들어온 전송 요청(R#44 쓰기, S#7 읽기) — 다음 LMMC/HMMC
+     시작 시 첫 점으로 소비된다 (openMSX transfer 플래그는 명령 밖에서도
+     세운다). *)
   mutable tx_pending : bool;
+  (* S#2 BD: SRCH found its border colour; reading S#9 clears it. *)
+  mutable cmd_bd : bool;
+  (* ASX, the engine's source-X counter, shown as S#8/S#9 (openMSX
+     getBorderX: the hardware returns ASX whatever command ran). *)
+  mutable cmd_asx : int;
   (* 포트 쓰기 로그 — 부트 디버깅용 링버퍼. *)
   mutable wlog : (int * int * int) array;
   mutable wlog_i : int;
@@ -96,8 +105,7 @@ let create () =
     cycle_in_line = 0;
     int_pending = false;
     cmd_ce = false;
-    tx_active = false;
-    tx_hm = false;
+    tx = None;
     tx_dx = 0;
     tx_adx = 0;
     tx_anx = 0;
@@ -106,6 +114,8 @@ let create () =
     tx_ny = 0;
     cmd_tr = false;
     tx_pending = false;
+    cmd_bd = false;
+    cmd_asx = 0;
     wlog = Array.make 65536 (0, 0, 0);
     wlog_i = 0;
     cmd_log = [];
@@ -234,21 +244,137 @@ let clip_y ~reverse ~y ~ny =
   let n = if ny = 0 then 1024 else ny in
   if reverse then min n (y + 1) else n
 
-(* 블록 명령 실행 — 즉시 완료 (CE 는 관찰되지 않는다). CPU 동기 전송
-   (LMMC/HMMC) 은 R#44 쓰기 구동 transfer_byte 로, POINT/SRCH/LINE/
-   LMCM 은 아직 없다. *)
-let exec_command t =
-  let cmd = t.regs.(46) lsr 4 and op = t.regs.(46) land 15 in
+(* CMR bits 7-4 (openMSX VDPCmdEngine::executeCommand). 0-3 stop the
+   engine: 0 is STOP and 1-3 abort the same way. The CPU-synchronised
+   transfers are {!transfer}. *)
+type block = Lmmv | Lmmm | Hmmv | Hmmm | Ymmm
+
+type command =
+  | Stop
+  | Point
+  | Pset
+  | Srch
+  | Line
+  | Block of block
+  | Transfer of transfer
+
+let command_of_cmr v =
+  match (v lsr 4) land 0x0f with
+  | 0 | 1 | 2 | 3 -> Stop
+  | 4 -> Point
+  | 5 -> Pset
+  | 6 -> Srch
+  | 7 -> Line
+  | 8 -> Block Lmmv
+  | 9 -> Block Lmmm
+  | 0xa -> Transfer Lmcm
+  | 0xb -> Transfer Lmmc
+  | 0xc -> Block Hmmv
+  | 0xd -> Block Hmmm
+  | 0xe -> Block Ymmm
+  | _ -> Transfer Hmmc (* 0xF; a 4-bit field has no other value *)
+
+(* The V9938 engine runs only in GRAPHIC 4-7; elsewhere a CMR write ends
+   at once (openMSX VDPCmdEngine::executeCommand, scrMode < 0). *)
+let commands_enabled t =
+  match display_mode t with
+  | Graphic4 | Graphic5 | Graphic6 | Graphic7 -> true
+  | Text1 | Text2 | Multicolor | Graphic1 | Graphic2 | Graphic3 | Undefined _ ->
+    false
+
+(* NX and NY are 10 bits, as the Y registers (openMSX setCmdReg 0x09/0x0B). *)
+let reg_nx t = reg_y t 40 41
+let reg_ny t = reg_y t 42 43
+
+(* ARG (R#45) bits. *)
+let arg_maj = 0x01
+let arg_eq = 0x02
+let arg_dix = 0x04
+let arg_diy = 0x08
+let arg_mxs = 0x10
+let arg_mxd = 0x20
+
+(* POINT, SRCH and LMCM read absent expansion VRAM as 0xFF, unmasked
+   (openMSX executePoint: COL = 0xFF when !hasExtendedVRAM). *)
+let cmd_point t extended x y = if extended then 0xff else point t false x y
+
+(* SRCH walks SX along SY until a dot matches CL (EQ=0) or differs from it
+   (EQ=1), and sets BD. Leaving the line ends the walk without touching BD.
+   ASX keeps the last X either way (openMSX executeSrch). *)
+let search t =
   let arg = t.regs.(45) in
-  let reverse_x = arg land 4 <> 0 and reverse_y = arg land 8 <> 0 in
-  let mxs = arg land 0x10 <> 0 and mxd = arg land 0x20 <> 0 in
+  let cl = t.regs.(44) land pixel_mask t and ppl = (bitmap_layout t).width in
+  let tx = if arg land arg_dix <> 0 then -1 else 1 in
+  let eq = arg land arg_eq <> 0 and mxs = arg land arg_mxs <> 0 in
+  let sy = reg_y t 34 35 in
+  let rec walk asx =
+    if (cmd_point t mxs asx sy = cl) <> eq then begin
+      t.cmd_bd <- true;
+      asx
+    end else
+      let asx = asx + tx in
+      if asx land ppl <> 0 then asx else walk asx
+  in
+  t.cmd_asx <- walk (reg16 t 32 33) land 0x3ff
+
+(* LINE draws NX + 1 dots from (DX, DY): NX along the major axis (ARG MAJ),
+   NY along the minor one. ASX is the Bresenham accumulator and keeps its
+   last value for S#8/S#9. The order of the end tests follows openMSX
+   executeLine ("confirmed on real HW"): leaving the line ends after the
+   dot is drawn, and leaving the top edge ends the command while the bottom
+   edge wraps. *)
+let draw_line t =
+  let arg = t.regs.(45) and op = t.regs.(46) land 0x0f in
+  let cl = t.regs.(44) and ppl = (bitmap_layout t).width in
+  let tx = if arg land arg_dix <> 0 then -1 else 1 in
+  let ty = if arg land arg_diy <> 0 then -1 else 1 in
+  let mxd = arg land arg_mxd <> 0 and x_major = arg land arg_maj = 0 in
+  let nx = reg_nx t and ny = reg_ny t in
+  let next asx = (asx - ny) land 0x3ff in
+  let rec dot ~asx ~adx ~dy ~anx =
+    pset t mxd adx dy op cl;
+    if x_major then begin
+      let adx = adx + tx in
+      if anx = nx || adx land ppl <> 0 then asx
+      else if asx < ny then begin
+        let asx = asx + nx and dy = dy + ty in
+        if ty < 0 && dy < 0 then asx
+        else dot ~asx:(next asx) ~adx ~dy ~anx:(anx + 1)
+      end
+      else dot ~asx:(next asx) ~adx ~dy ~anx:(anx + 1)
+    end else begin
+      let dy = dy + ty in
+      if ty < 0 && dy < 0 then asx
+      else
+        let asx, adx = if asx < ny then (asx + nx, adx + tx) else (asx, adx) in
+        let asx = next asx in
+        if anx = nx || adx land ppl <> 0 then asx
+        else dot ~asx ~adx ~dy ~anx:(anx + 1)
+    end
+  in
+  (* openMSX computes (NX - 1) >> 1 unsigned: NX = 0 starts at 0x7FFFFFFF. *)
+  let asx = ((nx - 1) land 0xffff_ffff) lsr 1 in
+  t.cmd_asx <- dot ~asx ~adx:(reg16 t 36 37) ~dy:(reg_y t 38 39) ~anx:0 land 0x3ff
+
+(* 블록 명령 실행 — 즉시 완료 (CE 는 관찰되지 않는다). *)
+let block_command t block =
+  let op = t.regs.(46) land 15 in
+  let arg = t.regs.(45) in
+  let reverse_x = arg land arg_dix <> 0 and reverse_y = arg land arg_diy <> 0 in
+  let mxs = arg land arg_mxs <> 0 and mxd = arg land arg_mxd <> 0 in
   let sx = reg16 t 32 33 and sy = reg_y t 34 35 in
   let dx = reg16 t 36 37 and dy = reg_y t 38 39 in
-  let byte = cmd >= 0xc in
-  let nx = if cmd = 0xe then 512 else reg16 t 40 41 in
-  let ny = reg_y t 42 43 in
-  let src_x = if cmd = 0xe then dx else sx in
-  let copy = cmd = 9 || cmd = 0xd || cmd = 0xe in
+  let byte, copy =
+    match block with
+    | Lmmv -> (false, false)
+    | Lmmm -> (false, true)
+    | Hmmv -> (true, false)
+    | Hmmm | Ymmm -> (true, true)
+  in
+  let ymmm = block = Ymmm in
+  let nx = if ymmm then 512 else reg_nx t in
+  let ny = reg_ny t in
+  let src_x = if ymmm then dx else sx in
   let nx =
     let dest = clip_x t ~byte ~reverse:reverse_x ~x:dx ~nx in
     if copy then min dest (clip_x t ~byte ~reverse:reverse_x ~x:src_x ~nx)
@@ -258,39 +384,55 @@ let exec_command t =
     if copy then min dest (clip_y ~reverse:reverse_y ~y:sy ~ny) else dest in
   let step_x n = (if reverse_x then -n else n) * (if byte then pixels_per_byte t else 1) in
   let step_y n = if reverse_y then -n else n in
-  if cmd = 5 then pset t mxd dx dy op t.regs.(44)
-  else if cmd = 8 || cmd = 9 || cmd = 0xc || cmd = 0xd || cmd = 0xe then
-    for row = 0 to ny - 1 do
-      for col = 0 to nx - 1 do
-        let x = dx + step_x col and y = dy + step_y row in
-        if byte then begin
-          let value = if copy then
-              read_vram t (vram_addr t (if cmd = 0xe then mxd else mxs)
-                (src_x + step_x col) (sy + step_y row))
-            else t.regs.(44) in
-          write_vram t (vram_addr t mxd x y) value
-        end else begin
-          let value = if copy then point t mxs (sx + step_x col) (sy + step_y row)
-            else t.regs.(44) in
-          pset t mxd x y op value
-        end
-      done
+  for row = 0 to ny - 1 do
+    for col = 0 to nx - 1 do
+      let x = dx + step_x col and y = dy + step_y row in
+      if byte then begin
+        let value = if copy then
+            read_vram t (vram_addr t (if ymmm then mxd else mxs)
+              (src_x + step_x col) (sy + step_y row))
+          else t.regs.(44) in
+        write_vram t (vram_addr t mxd x y) value
+      end else begin
+        let value = if copy then point t mxs (sx + step_x col) (sy + step_y row)
+          else t.regs.(44) in
+        pset t mxd x y op value
+      end
     done
+  done;
+  (* LMMM and HMMM leave ASX back at SX (openMSX executeLmmm/executeHmmm
+     reset it at each row end); the other block commands do not use it. *)
+  match block with
+  | Lmmm | Hmmm -> t.cmd_asx <- sx
+  | Lmmv | Hmmv | Ymmm -> ()
 
 (* LMMC/HMMC 전송 한 바이트 — 전송 모드에서 R#44(CLR) 쓰기가 곧
    데이터다 (openMSX setCmdReg case 0x0C → executeLmmc/executeHmmc).
    HMMC 는 바이트 단위, LMMC 는 픽셀 단위 pset. *)
 let tx_count = ref 0
 
-let transfer_byte t v =
+(* The walking corner reached the end of a row: go to the next row, and
+   end the command after the last one. *)
+let next_tx_row t ~diy =
+  t.tx_dy <- t.tx_dy + (if diy then 1 else -1);
+  t.tx_adx <- t.tx_dx;
+  t.tx_anx <- t.tx_nx;
+  t.tx_ny <- t.tx_ny - 1;
+  if t.tx_ny = 0 then begin
+    t.tx <- None;
+    t.cmd_ce <- false
+    (* TR 은 다음 S#2 읽기에서 해제된다 — openMSX commandDone. *)
+  end
+
+let transfer_byte t ~hm v =
   incr tx_count;
   t.cmd_tr <- true; (* 다음 바이트 즉시 준비 *)
   let arg = t.regs.(45) in
-  let dix = arg land 0x04 = 0 and diy = arg land 0x08 = 0 in
-  let mxd = arg land 0x20 <> 0 in
+  let dix = arg land arg_dix = 0 and diy = arg land arg_diy = 0 in
+  let mxd = arg land arg_mxd <> 0 in
   let op = t.regs.(46) land 0x0f in
   let ppb = pixels_per_byte t in
-  if t.tx_hm then begin
+  if hm then begin
     write_vram t (vram_addr t mxd t.tx_adx t.tx_dy) v;
     t.tx_adx <- t.tx_adx + ((if dix then 1 else -1) * ppb)
   end else begin
@@ -298,55 +440,92 @@ let transfer_byte t v =
     t.tx_adx <- t.tx_adx + (if dix then 1 else -1)
   end;
   t.tx_anx <- t.tx_anx - 1;
-  if t.tx_anx = 0 then begin
-    t.tx_dy <- t.tx_dy + (if diy then 1 else -1);
-    t.tx_adx <- t.tx_dx;
-    t.tx_anx <- t.tx_nx;
-    t.tx_ny <- t.tx_ny - 1;
-    if t.tx_ny = 0 then begin
-      t.tx_active <- false;
-      t.cmd_ce <- false
-      (* TR 은 다음 S#2 읽기에서 해제된다 — openMSX commandDone. *)
-    end
-  end
+  if t.tx_anx = 0 then next_tx_row t ~diy
+
+(* LMCM: read the dot under the corner into COL (R#44, seen as S#7) and
+   step on. The CPU takes it with an S#7 read, which asks for the next one;
+   the last read ends the command with TR still set (openMSX executeLmcm,
+   resetColor). *)
+let fetch_dot t =
+  let arg = t.regs.(45) in
+  let dix = arg land arg_dix = 0 and diy = arg land arg_diy = 0 in
+  t.regs.(44) <- cmd_point t (arg land arg_mxs <> 0) t.tx_adx t.tx_dy;
+  t.tx_adx <- t.tx_adx + (if dix then 1 else -1);
+  t.tx_anx <- t.tx_anx - 1;
+  if t.tx_anx = 0 then next_tx_row t ~diy;
+  t.cmd_asx <- t.tx_adx land 0x3ff
+
+(* One transfer step: COL (R#44) goes out as a dot or byte for LMMC/HMMC,
+   or LMCM fetches its next dot into COL. *)
+let transfer_step t kind =
+  match kind with
+  | Lmmc -> transfer_byte t ~hm:false t.regs.(44)
+  | Hmmc -> transfer_byte t ~hm:true t.regs.(44)
+  | Lmcm -> fetch_dot t
+
+(* Set up the walking corner for LMMC/HMMC (from DX, DY) or LMCM (from SX,
+   SY). openMSX clipNX_1_byte / clipNX_1_pixel: 한 줄 폭을 넘는 NX 는
+   잘린다 — HMMC 는 바이트 단위, LMMC·LMCM 은 픽셀 단위. *)
+let start_transfer t kind ~x ~y =
+  let arg = t.regs.(45) in
+  t.tx <- Some kind;
+  t.tx_dx <- x;
+  t.tx_adx <- x;
+  t.tx_nx <- clip_x t ~byte:(kind = Hmmc) ~reverse:(arg land arg_dix <> 0) ~x
+      ~nx:(reg_nx t);
+  t.tx_anx <- t.tx_nx;
+  t.tx_dy <- y;
+  t.tx_ny <- clip_y ~reverse:(arg land arg_diy <> 0) ~y ~ny:(reg_ny t);
+  t.cmd_ce <- true;
+  t.cmd_tr <- true
+
+(* An R#44 write and an S#7 read both ask the engine for a transfer
+   (openMSX setCmdReg 0x0C and resetColor: "if (!CMD) status &= ~TR;
+   transfer = true"). A running transfer takes it at once; with none, the
+   request waits and becomes the first dot of the next LMMC/HMMC. *)
+let request_transfer t =
+  match t.tx with
+  | Some kind -> transfer_step t kind
+  | None ->
+    t.cmd_tr <- false;
+    t.tx_pending <- true
 
 let start_command t =
   let cmr_v = t.regs.(46) in
   t.cmd_log <- (cmr_v, reg16 t 36 37, reg16 t 38 39, reg16 t 42 43) :: List.filteri (fun i _ -> i < 31) t.cmd_log;
-  let cmd = t.regs.(46) lsr 4 in
-  if cmd = 0xB || cmd = 0xF then begin
-    t.tx_active <- true;
-    t.tx_hm <- cmd = 0xF;
-    t.tx_dx <- reg16 t 36 37;
-    t.tx_adx <- t.tx_dx;
-    (* openMSX clipNX_1_byte / clipNX_1_pixel: 한 줄 폭을 넘는 NX 는
-       잘린다 — HMMC 는 바이트 단위, LMMC 는 픽셀 단위. *)
-    t.tx_nx <- clip_x t ~byte:t.tx_hm ~reverse:(t.regs.(45) land 4 <> 0)
-        ~x:t.tx_dx ~nx:(reg16 t 40 41);
-    t.tx_anx <- t.tx_nx;
-    t.tx_dy <- reg_y t 38 39;
-    t.tx_ny <- clip_y ~reverse:(t.regs.(45) land 8 <> 0)
-        ~y:t.tx_dy ~ny:(reg_y t 42 43);
-    t.cmd_ce <- true;
-    t.cmd_tr <- true;
-    (* 발행 전 R#44 에 쓰인 첫 픽셀이 큐에 있으면 즉시 소비. *)
-    if t.tx_pending then begin
+  (* A new CMR ends whatever ran before; only a transfer raises TR again. *)
+  t.tx <- None;
+  t.cmd_ce <- false;
+  t.cmd_tr <- false;
+  if commands_enabled t then
+    match command_of_cmr cmr_v with
+    | Stop -> ()
+    | Point ->
+      t.regs.(44) <-
+        cmd_point t (t.regs.(45) land arg_mxs <> 0) (reg16 t 32 33) (reg_y t 34 35)
+    | Pset ->
+      pset t (t.regs.(45) land arg_mxd <> 0) (reg16 t 36 37) (reg_y t 38 39)
+        (t.regs.(46) land 0x0f) t.regs.(44)
+    | Srch -> search t
+    | Line -> draw_line t
+    | Block block -> block_command t block
+    | Transfer ((Lmmc | Hmmc) as kind) ->
+      start_transfer t kind ~x:(reg16 t 36 37) ~y:(reg_y t 38 39);
+      (* 발행 전 R#44 에 쓰인 첫 픽셀이 큐에 있으면 즉시 소비. *)
+      if t.tx_pending then begin
+        t.tx_pending <- false;
+        transfer_step t kind
+      end
+    | Transfer Lmcm ->
+      (* startLmcm raises its own request for the first dot; an earlier
+         R#44 write is not one. *)
       t.tx_pending <- false;
-      transfer_byte t t.regs.(44)
-    end
-  end
-  else begin
-    t.tx_active <- false;
-    t.cmd_ce <- false;
-    t.cmd_tr <- false;
-    exec_command t
-  end
+      start_transfer t Lmcm ~x:(reg16 t 32 33) ~y:(reg_y t 34 35);
+      fetch_dot t
 
 let set_reg t r v =
   t.regs.(r) <- v land 0xff;
-  if r = 44 then begin
-    if t.tx_active then transfer_byte t v else t.tx_pending <- true
-  end
+  if r = 44 then request_transfer t
   else if r = 46 then start_command t
   else if r = 16 then begin
     (* R#16 이 팔레트 인덱스를 다시 고르면 진행 중이던 첫 바이트는 버린다.
@@ -449,12 +628,14 @@ let io_read t ~port =
            있다 — 읽어도 유지. 완료 직후에는 한 번 1을 보여주고
            해제한다 (openMSX commandDone: "TR is reset when S#2 is
            read next") — 완료 감지는 그다음 읽기부터 TR=0 && CE=0. *)
+        let transferring = Option.is_some t.tx in
         let v =
           ((if t.cmd_ce then 1 else 0)
-           lor (if t.cmd_tr || t.tx_active then 0x80 else 0))
-          lor 0x7e
+           lor (if t.cmd_tr || transferring then 0x80 else 0)
+           lor (if t.cmd_bd then 0x10 else 0))
+          lor 0x6e
         in
-        if not t.tx_active then t.cmd_tr <- false;
+        if not transferring then t.cmd_tr <- false;
         v
       | 3 -> t.collision_x land 0xff
       | 4 -> (t.collision_x lsr 8) lor 0xfe
@@ -465,6 +646,17 @@ let io_read t ~port =
         t.collision_y <- 0;
         v
       | 6 -> (t.collision_y lsr 8) lor 0xfc
+      | 7 ->
+        (* COL: the POINT/LMCM dot. Reading it requests the next transfer
+           step: LMCM fetches its next dot (openMSX resetColor). *)
+        let v = t.regs.(44) in
+        request_transfer t;
+        v
+      | 8 -> t.cmd_asx land 0xff
+      | 9 ->
+        let v = ((t.cmd_asx lsr 8) land 1) lor 0xfe in
+        t.cmd_bd <- false;
+        v
       | _ -> 0xff
     in
     t.latch_first <- true;
@@ -739,7 +931,7 @@ let int_active t =
   (t.status0 land 0x80 <> 0 && ie0) || (t.status1 land 1 <> 0 && ie1)
 
 let vram t = t.vram
-let tx_state t = (t.tx_active, !tx_count, t.tx_ny, t.tx_anx, t.tx_dy)
+let tx_state t = (Option.is_some t.tx, !tx_count, t.tx_ny, t.tx_anx, t.tx_dy)
 let cmd_history t = List.rev t.cmd_log
 let regs t = t.regs
 let status0 t = t.status0
@@ -782,8 +974,8 @@ let write_state w t =
   State_codec.put_bool w t.latch_first;
   State_codec.put_bool w t.int_pending;
   State_codec.put_bool w t.cmd_ce;
-  State_codec.put_bool w t.tx_active;
-  State_codec.put_bool w t.tx_hm;
+  State_codec.put_bool w (Option.is_some t.tx);
+  State_codec.put_bool w (t.tx = Some Hmmc);
   State_codec.put_bool w t.cmd_tr;
   State_codec.put_bool w t.tx_pending;
   (* v4: sprite collision coordinates (S#3-S#6). *)
@@ -796,6 +988,10 @@ let write_state w t =
   State_codec.put_int w t.shown_w;
   State_codec.put_int w t.shown_h;
   State_codec.put_bytes w (Bytes.sub t.shown 0 (t.shown_w * t.shown_h * 3));
+  (* v6: LMCM (the v1-v5 pair above cannot name it), BD and ASX. *)
+  State_codec.put_bool w (t.tx = Some Lmcm);
+  State_codec.put_bool w t.cmd_bd;
+  State_codec.put_int w t.cmd_asx;
   ()
 
 let read_state r t =
@@ -825,8 +1021,9 @@ let read_state r t =
   t.latch_first <- State_codec.get_bool r;
   t.int_pending <- State_codec.get_bool r;
   t.cmd_ce <- State_codec.get_bool r;
-  t.tx_active <- State_codec.get_bool r;
-  t.tx_hm <- State_codec.get_bool r;
+  let active = State_codec.get_bool r in
+  let hm = State_codec.get_bool r in
+  t.tx <- (if not active then None else if hm then Some Hmmc else Some Lmmc);
   t.cmd_tr <- State_codec.get_bool r;
   t.tx_pending <- State_codec.get_bool r;
   if State_codec.version r >= 4 then begin
@@ -853,5 +1050,14 @@ let read_state r t =
     t.shown_w <- w;
     t.shown_h <- h
   end;
-  if t.tx_active && (t.tx_nx = 0 || t.tx_anx = 0 || t.tx_anx > t.tx_nx || t.tx_ny = 0) then
+  if State_codec.version r >= 6 then begin
+    let lmcm = State_codec.get_bool r in
+    (match t.tx, lmcm with
+     | (None | Some (Lmmc | Hmmc | Lmcm)), false -> ()
+     | Some Lmmc, true -> t.tx <- Some Lmcm
+     | (None | Some (Hmmc | Lmcm)), true -> State_codec.fail "invalid VDP LMCM state");
+    t.cmd_bd <- State_codec.get_bool r;
+    t.cmd_asx <- State_codec.get_int r ~min:0 ~max:0x3ff
+  end;
+  if Option.is_some t.tx && (t.tx_nx = 0 || t.tx_anx = 0 || t.tx_anx > t.tx_nx || t.tx_ny = 0) then
     State_codec.fail "invalid active VDP transfer"
