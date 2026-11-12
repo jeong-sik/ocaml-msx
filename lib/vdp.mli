@@ -1,4 +1,5 @@
-(** V9938 — TMS9918 호환 표면(텍스트/G1/G2/G3) + SCREEN5-8 비트맵 렌더,
+(** V9938 — TMS9918 호환 표면(TEXT1/TEXT2/MULTICOLOR/G1/G2/G3) + SCREEN5-8
+    비트맵 렌더,
     레지스터·VRAM 래치, 팔레트, VBlank·라인 인터럽트.
     명령 엔진은 SCREEN5-8 에서만 돈다: STOP, POINT, PSET, SRCH, LINE, 블록
     명령(LMMV/HMMV/HMMM/YMMM/LMMM), CPU 동기 전송(LMMC/HMMC 는 R#44 쓰기,
@@ -36,9 +37,9 @@ val int_active : t -> bool
 (** 인터럽트 라인 상태 — IE 가 켜져 있고 status0 비트7 이 서 있는 동안. *)
 
 val frame_dims : t -> int * int
-(** Size of the frame the last VBlank published. Bitmap modes keep native
-    width (SCREEN6/7: 512, SCREEN5/8: 256) and R#9 LN height (192/212);
-    character modes are 256×192. A fresh VDP shows a black 256×192 frame. *)
+(** Size of the frame the last VBlank published: native width (TEXT2 and
+    SCREEN6/7: 512, the other modes 256) and R#9 LN height (192/212) in
+    every mode. A fresh VDP shows a black 256×192 frame. *)
 
 val frame_rgb : t -> string
 (** The frame the last VBlank published, {!frame_dims} RGB (row-major,
@@ -97,3 +98,8 @@ val vram_read : t -> int -> int
 val write_state : State_codec.writer -> t -> unit
 
 val read_state : State_codec.reader -> t -> unit
+
+val write_blink : State_codec.writer -> t -> unit
+(** R#13 blinking (save format v10), written after the sound chips. *)
+
+val read_blink : State_codec.reader -> t -> unit

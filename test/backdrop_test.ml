@@ -107,9 +107,9 @@ let () =
 
   (* TEXT1: the pattern table sits at R#4 << 11 (openMSX
      VDP::updatePatternBase), so R#4 = 1 puts it at 0x800. Character 0's
-     first row has its leftmost dot set; that dot is x = 8, after the
-     8-dot left border. TEXT1 ignores TP: a colour-0 foreground still shows
-     the backdrop. *)
+     first row has its leftmost dot set; that dot is x = 9, after the
+     9-dot left border of the V99x8 text modes (openMSX getLeftSprites).
+     TEXT1 ignores TP: a colour-0 foreground still shows the backdrop. *)
   let text ~r7 ?r8 () =
     let t = vdp ~r0:0x00 ~r1:0x50 ~r7 ?r8 () in
     reg t 2 0x00;
@@ -119,11 +119,11 @@ let () =
     t
   in
   let t = text ~r7:0x43 () in
-  check "TEXT1: pattern table at R#4 << 11" (px t 8 0 = rgb blue);
-  check "TEXT1: clear dots take R#7 bits 3-0" (px t 9 0 = rgb cyan);
-  check "TEXT1: left border is the backdrop" (px t 0 0 = rgb cyan);
+  check "TEXT1: pattern table at R#4 << 11" (px t 9 0 = rgb blue);
+  check "TEXT1: clear dots take R#7 bits 3-0" (px t 10 0 = rgb cyan);
+  check "TEXT1: left border is the backdrop" (px t 8 0 = rgb cyan);
   check "TEXT1 with TP: colour-0 foreground shows the backdrop"
-    (px (text ~r7:0x03 ~r8:0x20 ()) 8 0 = rgb cyan);
+    (px (text ~r7:0x03 ~r8:0x20 ()) 9 0 = rgb cyan);
 
   (* A blanked display fills the line with the border colour *)
   let t = vdp ~r0:screen5 ~r1:0x00 ~r7:4 () in
