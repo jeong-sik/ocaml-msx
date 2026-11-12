@@ -974,13 +974,6 @@ let advance t ~cycles =
       t.status0 <- t.status0 lor 0x80;
       t.int_pending <- true;
       hit := true;
-      (* 인터럽트 발생 시 상태 레지스터 선택(R#15)을 0 으로 되돌린다 —
-         V9938 계약. BIOS KEYINT 는 `in a,(0x99)` 후 `jp p,int_end` 로
-         VBlank 플래그(S#0 bit7)를 검사하는데, 게임이 S#1 선택(R#15=1)을
-         남긴 채 인터럽트가 걸리면 이 리셋이 없는 한 KEYINT 는 S#1 을
-         읽고 스캔 없이 종료한다 — 키가 영원히 KEYBUF 에 들어가지 않는다
-         (룬마스터 1 의 CONIN 이 비는 경로). *)
-      t.regs.(15) <- 0;
       present t
     end;
     if t.line >= lines_per_frame t then begin
