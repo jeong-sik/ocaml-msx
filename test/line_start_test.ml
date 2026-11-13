@@ -56,8 +56,15 @@ let black = (0, 0, 0)
 
 (* SCREEN5, every byte 0x11: colour 1 white on every dot. Border R#7 = 0,
    black. All 128KB is filled so the planar SCREEN8 sees 0x11 too. *)
+(* Vdp.create is a frame start, 42 lines above display line 0 (openMSX
+   VDP::reset calls frameStart); these checks count lines from display
+   line 0. *)
+let to_display_start t =
+  while Vdp.line_now t <> (0, 0) do ignore (Vdp.advance t ~cycles:1) done
+
 let screen5 () =
   let t = Vdp.create () in
+  to_display_start t;
   palette t 1 (7, 7, 7);
   reg t 0 0x06;
   reg t 1 0x40;
@@ -95,6 +102,7 @@ let () =
      100 only (sprite 0's last row, sprite 1's first). *)
   let sprites () =
     let t = Vdp.create () in
+    to_display_start t;
     List.iter (fun (r, v) -> reg t r v)
       [ (0, 0x06); (1, 0x40); (2, 0x1f); (5, 0xef); (11, 0x00); (6, 0x0f); (8, 0x08) ];
     poke t (0x7800 + 7) 0xff;
@@ -126,6 +134,7 @@ let () =
   (* The CPU's planar addressing follows the mode once it takes effect.
      SCREEN8 address 3 is physical 0x10001. *)
   let t = Vdp.create () in
+  to_display_start t;
   reg t 0 0x0e;
   reg t 1 0x40;
   poke t 3 0xaa;
@@ -155,6 +164,7 @@ let () =
      x = 9 on. R#7 = 0xF0: FG white, BG and border black. *)
   let text1 () =
     let t = Vdp.create () in
+    to_display_start t;
     palette t 15 (7, 7, 7);
     reg t 0 0x00;
     reg t 1 0x50;

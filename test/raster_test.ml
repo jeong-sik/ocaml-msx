@@ -57,8 +57,15 @@ let red = (255, 0, 0)
 (* SCREEN5 (R#0=0x06), display on, page 0 (R#2 = 0x1F: bits 4-0 set so
    every line shows). Rows [0, split) hold colour 1, the rest colour 2;
    colour 1 is white and 2 red. *)
+(* Vdp.create is a frame start, 42 lines above display line 0 (openMSX
+   VDP::reset calls frameStart); these checks count lines from display
+   line 0. *)
+let to_display_start t =
+  while Vdp.line_now t <> (0, 0) do ignore (Vdp.advance t ~cycles:1) done
+
 let screen5 ?(split = 256) () =
   let t = Vdp.create () in
+  to_display_start t;
   reg t 0 0x06;
   reg t 1 0x40;
   reg t 2 0x1f;
@@ -128,6 +135,7 @@ let () =
 let () =
   (* 5. frame_dims 는 VBlank 가 확정한 프레임을 따른다 *)
   let t = Vdp.create () in
+  to_display_start t;
   check "fresh frame is 256x192" (Vdp.frame_dims t = (256, 192));
   check "fresh frame is black"
     (String.for_all (fun c -> c = '\000') (Vdp.frame_rgb t));

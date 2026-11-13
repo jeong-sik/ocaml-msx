@@ -10,6 +10,23 @@
    write, LMCM hands one dot per S#7 read. *)
 type transfer = Lmmc | Hmmc | Lmcm
 
+(* The vertical timing between two display starts, in the display line
+   counter's own lines (openMSX master, VDP::scheduleLineCountReset and
+   execLineCountReset, measured on FS-A1GT and FS-A1ST). The counter is not
+   told about the frame start: it counts on from display line 0 until the
+   reset in the next top border. Each constructor names the event still
+   ahead and carries the line where it happens. *)
+type vertical =
+  | Before_frame_start
+      (** Counting the display and the borders; the frame starts at
+          [frame_start]. *)
+  | Before_reset of int
+      (** The frame has started (EO flipped, 50/60 Hz latched); the counter
+          resets on this line. *)
+  | Before_display of int
+      (** The counter has reset; it reads 0 again, at display line 0, on this
+          line. *)
+
 type t = {
   regs : int array;
   vram : Bytes.t;
@@ -31,9 +48,13 @@ type t = {
   mutable cycle_in_line : int;
   (* S#2 EO: the field parity, flipped once a frame (openMSX frameStart). *)
   mutable even_odd : bool;
-  (* R#9 bit 1 as latched when the line counter wraps: 313 lines a frame
-     (PAL, 50 Hz) or 262 (NTSC, 60 Hz). openMSX fixes it at frameStart. *)
+  (* R#9 bit 1 as latched at the frame start: 313 lines a frame (PAL,
+     50 Hz) or 262 (NTSC, 60 Hz), openMSX frameStart. *)
   mutable pal : bool;
+  (* The line where the current frame starts, counted like [line]; frame
+     starts are [lines_per_frame] lines apart whatever the display does. *)
+  mutable frame_start : int;
+  mutable vertical : vertical;
   (* R#13 blinking (openMSX blinkState / blinkCount): [blink_on] is the
      ON period, which shows the R#12 colours in TEXT2 and the even page in
      the bitmap modes; [blink_count] is the frames left in this period, 0
@@ -103,8 +124,64 @@ type t = {
 }
 
 let cycles_per_line = 228
+let ticks_per_cycle = 6
+let ticks_per_line = cycles_per_line * ticks_per_cycle
+
+(* This model's line starts at the right border, 1282 ticks after the sync
+   of openMSX's line in the bitmap modes. The command slots and the
+   power-on point count from it; R#18 horizontal adjust, which moves the
+   border, is not applied to them. *)
+let right_border_tick = 1282
 let lines_per_frame t = if t.pal then 313 else 262
 let visible_lines t = if t.regs.(9) land 0x80 = 0 then 192 else 212
+
+(* R#18 set-adjust: bits 3-0 move the display right and bits 7-4 move it
+   down, each by (nibble xor 7) - 7, from -7 to 8; 0 is neutral (openMSX
+   execHorAdjust and getVerticalAdjust keep nibble xor 7, neutral 7). *)
+let adjust nibble = (nibble lxor 7) - 7
+let horizontal_adjust t = adjust (t.regs.(18) land 0x0f)
+let vertical_adjust t = adjust (t.regs.(18) lsr 4)
+
+(* The display line counter resets 8 + getVerticalAdjust() lines after the
+   frame start, 15 at the neutral R#18 (openMSX scheduleLineCountReset). *)
+let reset_delay t = 15 + vertical_adjust t
+
+(* From the reset to display line 0, by R#9 as it is at the reset: 17 or 27
+   lines at 60 Hz, 44 or 54 at 50 Hz, for 212 or 192 lines (openMSX
+   execLineCountReset). *)
+let lines_to_display t =
+  (if t.regs.(9) land 0x02 <> 0 then 44 else 17)
+  + if t.regs.(9) land 0x80 <> 0 then 0 else 10
+
+(* Restore bounds. The counter runs at most 8 + 15 lines from a frame start
+   to its reset and 54 from there to display line 0, and a frame start
+   falls at most on counter line 313 - 8 - 17. *)
+let max_reset_delay = 23
+let max_lines_to_display = 54
+let max_counter_line = 313 - 8 - 17 + max_reset_delay + max_lines_to_display
+
+(* The line where display line 0 comes back, once the reset has fixed it. *)
+let next_display_line t =
+  match t.vertical with
+  | Before_display at -> Some at
+  | Before_frame_start | Before_reset _ -> None
+
+(* Whether the counter, on the line just finished, still counted up from
+   display line 0 rather than up to it from the reset: only those lines can
+   match R#19 (openMSX scheduleHScan: after the reset, "never"). *)
+let counting_display t =
+  match t.vertical with
+  | Before_frame_start | Before_reset _ -> true
+  | Before_display _ -> false
+
+(* An R#18 write moves a reset still ahead of the beam; one already behind
+   it keeps its place (openMSX scheduleLineCountReset). *)
+let move_line_count_reset t =
+  match t.vertical with
+  | Before_reset _ ->
+    let at = t.frame_start + reset_delay t in
+    if at > t.line then t.vertical <- Before_reset at
+  | Before_frame_start | Before_display _ -> ()
 
 (* Frame timing in this model's coordinates. Line 0 is display line 0, and a
    line runs from one right border to the next: the line interrupt fires at
@@ -137,10 +214,24 @@ let grb_to_rgb v =
   let g = (v lsr 8) land 7 and r = (v lsr 4) land 7 and b = v land 7 in
   ((r * 255) / 7, (g * 255) / 7, (b * 255) / 7)
 
+(* Power-on is a frame start: openMSX VDP::reset calls frameStart, which
+   flips EO out of statusReg2's 0x0C and schedules the counter reset. The
+   frame start is placed as far above display line 0 as the reset and the
+   top border reach (42 lines with R#9 and R#18 at 0), so the first frame
+   is as long as any other. Its tick 0 is 86 ticks into this model's line,
+   which begins at the right border. *)
+let power_on t =
+  let delay = reset_delay t in
+  t.frame_start <- lines_per_frame t - delay - lines_to_display t;
+  t.line <- t.frame_start;
+  t.cycle_in_line <- (ticks_per_line - right_border_tick) / ticks_per_cycle;
+  t.even_odd <- true;
+  t.vertical <- Before_reset (t.frame_start + delay)
+
 let create () =
   let pal = Array.make 16 0 in
   Array.iteri (fun i v -> pal.(i) <- v) default_palette;
-  {
+  let t = {
     regs = Array.make 47 0;
     vram = Bytes.make 0x20000 '\000';
     addr = 0;
@@ -159,6 +250,8 @@ let create () =
     cycle_in_line = 0;
     even_odd = false;
     pal = false;
+    frame_start = 0;
+    vertical = Before_frame_start;
     blink_on = false;
     blink_count = 0;
     v_shift = 0;
@@ -193,7 +286,9 @@ let create () =
     shown = Bytes.make (stride * max_lines) '\000';
     shown_w = 256;
     shown_h = 192;
-  }
+  } in
+  power_on t;
+  t
 
 (* V9938 화면 모드표 (application manual 표 "screen mode register bits";
    openMSX DisplayMode 의 base 코드와 같은 비트 배치 M1=bit0 … M5=bit4).
@@ -243,29 +338,6 @@ let text_timing t =
   | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4 | Graphic5
   | Graphic6 | Graphic7 | Undefined _ -> false
 
-(* openMSX frameStart (where EO flips) lies 8 + 17/27 lines above display
-   line 0 at 60 Hz and 8 + 44/54 at 50 Hz, for 212/192 lines: the line
-   counter resets on line 8 (scheduleLineCountReset) and display starts that
-   many lines later (execLineCountReset). R#18 vertical adjust is not
-   modelled. If R#9 bit 7 changes inside the top border the flip can be
-   skipped or doubled for that one frame. *)
-let frame_start_line t =
-  let to_display =
-    (if t.pal then 44 else 17) + if t.regs.(9) land 0x80 <> 0 then 0 else 10
-  in
-  lines_per_frame t - 8 - to_display
-
-(* The line where the display line counter resets: 8 lines below the frame
-   start (openMSX scheduleLineCountReset). *)
-let line_count_reset t = frame_start_line t + 8
-
-(* R#18 set-adjust: bits 3-0 move the display right and bits 7-4 move it
-   down, each by (nibble xor 7) - 7, from -7 to 8; 0 is neutral (openMSX
-   execHorAdjust and getVerticalAdjust keep nibble xor 7, neutral 7). *)
-let adjust nibble = (nibble lxor 7) - 7
-let horizontal_adjust t = adjust (t.regs.(18) land 0x0f)
-let vertical_adjust t = adjust (t.regs.(18) lsr 4)
-
 let horizontal_retrace t =
   t.cycle_in_line < (if text_timing t then hr_cycles_text else hr_cycles_graphic)
 
@@ -279,9 +351,10 @@ let horizontal_retrace t =
 let line_start_cycle t = if text_timing t then 43 else 39
 
 let vertical_retrace t =
-  let last = lines_per_frame t - 1 in
   t.line >= visible_lines t
-  && not (t.line = last && t.cycle_in_line >= vr_fall_cycle)
+  && not
+       (next_display_line t = Some (t.line + 1)
+        && t.cycle_in_line >= vr_fall_cycle)
 
 let display_mode_to_string = function
   | Text1 -> "TEXT1"
@@ -451,14 +524,6 @@ let cmd_point t extended x y = if extended then 0xff else point t false x y
    bitmap modes (openMSX VDPAccessSlots, documented at
    openmsx.org/vdp-vram-timing/vdp-timing.html), as ticks after the line's
    sync; the waits are openMSX VDPCmdEngine's. *)
-let ticks_per_cycle = 6
-let ticks_per_line = cycles_per_line * ticks_per_cycle
-
-(* This model's line starts at the right border, 1282 ticks after the sync
-   of openMSX's line in the bitmap modes (the only modes that run
-   commands). R#18 horizontal adjust, which moves the border, is not
-   applied to the slots. *)
-let right_border_tick = 1282
 
 (* Screen off (BL clear, or the vertical border). *)
 let slots_screen_off =
@@ -960,6 +1025,7 @@ let set_reg t r v =
   if r = 44 then request_transfer t
   else if r = 13 then restart_blink t (v land 0xff)
   else if r = 46 then start_command t
+  else if r = 18 then move_line_count_reset t
   else if r = 16 then begin
     (* R#16 이 팔레트 인덱스를 다시 고르면 진행 중이던 첫 바이트는 버린다.
        흘러들면 다음 색의 채널이 한 칸 어긋난다. *)
@@ -1494,6 +1560,30 @@ let take_deferred t =
     end_command t
   end
 
+(* The vertical event, if any, on the line the beam has just entered. They
+   act on line boundaries; openMSX starts the frame 14 cycles and resets
+   the counter 39 cycles into these lines. *)
+let next_vertical t =
+  match t.vertical with
+  | Before_frame_start ->
+    if t.line = t.frame_start then begin
+      t.even_odd <- not t.even_odd;
+      t.pal <- t.regs.(9) land 0x02 <> 0;
+      step_blink t;
+      t.vertical <- Before_reset (t.line + reset_delay t)
+    end
+  | Before_reset at ->
+    if t.line = at then begin
+      t.v_shift <- vertical_adjust t;
+      t.vertical <- Before_display (t.line + lines_to_display t)
+    end
+  | Before_display at ->
+    if t.line = at then begin
+      t.frame_start <- t.frame_start + lines_per_frame t - at;
+      t.line <- 0;
+      t.vertical <- Before_frame_start
+    end
+
 let advance t ~cycles =
   let hit = ref false in
   let remaining = ref cycles in
@@ -1520,13 +1610,13 @@ let advance t ~cycles =
       (* 라인 인터럽트: 빔이 줄 (R#19 - R#23) mod 256 의 오른쪽 끝을 지날 때
          S#1 bit0 — openMSX scheduleHScan. R#23 으로 스크롤해도 분할 위치는
          화면에 고정된다. 줄 카운터는 표시 줄 0 부터 다음 카운터 리셋
-         (frame_start_line + 8) 직전까지 세므로 아래·위 테두리 줄도 맞으면
+         직전까지 세므로 아래·위 테두리 줄도 맞으면
          걸린다 (scheduleHScan: 리셋 뒤의 일치는 "never"). FH 는 IE1(R#0
          bit4) 이 켜져 있을 때만 래치된다(openMSX execHScan: "if
          (controlRegs[0] & 0x10)"). IE1 없이 세우면 IE1=0 인 게임이 매
          프레임 S#1 읽기에서 1 을 본다. *)
       if t.regs.(0) land 0x10 <> 0
-         && finished < line_count_reset t
+         && counting_display t
          && finished = (t.regs.(19) - t.regs.(23)) land 0xff
       then begin
         t.status1 <- t.status1 lor 1;
@@ -1540,15 +1630,7 @@ let advance t ~cycles =
         hit := true;
         present t
       end;
-      if t.line >= lines_per_frame t then begin
-        t.line <- 0;
-        t.pal <- t.regs.(9) land 0x02 <> 0
-      end;
-      if t.line = frame_start_line t then begin
-        t.even_odd <- not t.even_odd;
-        step_blink t
-      end;
-      if t.line = line_count_reset t then t.v_shift <- vertical_adjust t;
+      next_vertical t;
       if t.line < visible_lines t then check_sprites t ~display_line:t.line
     end
   done;
@@ -1638,7 +1720,35 @@ let write_appended w t =
   (* v13: a running command's progress. *)
   List.iter (State_codec.put_int w)
     [ t.cmd_wait; t.cmd_phase; t.cmd_adx; t.cmd_anx; t.cmd_src; t.cmd_dst;
-      Option.value t.cmd_steal ~default:(-1) ]
+      Option.value t.cmd_steal ~default:(-1) ];
+  (* v14: the frame start and the event ahead of the line counter. *)
+  State_codec.put_int w t.frame_start;
+  (match t.vertical with
+   | Before_frame_start -> State_codec.put_int w 0; State_codec.put_int w 0
+   | Before_reset at -> State_codec.put_int w 1; State_codec.put_int w at
+   | Before_display at -> State_codec.put_int w 2; State_codec.put_int w at)
+
+(* States before v14 kept display line 0 [lines_per_frame] lines apart and
+   flipped EO 7 lines late. Their line counts the same way, so the frame
+   start and reset follow from the registers; display line 0 stays at the
+   wrap those states expected. *)
+let derive_vertical t =
+  let delay = reset_delay t in
+  t.frame_start <- lines_per_frame t - delay - lines_to_display t;
+  t.vertical <-
+    (if t.line < t.frame_start then Before_frame_start
+     else if t.line < t.frame_start + delay then Before_reset (t.frame_start + delay)
+     else Before_display (lines_per_frame t))
+
+(* reset_delay is 8 to 23 lines and lines_to_display 17 to 54. *)
+let vertical_consistent t =
+  match t.vertical with
+  | Before_frame_start -> t.line < t.frame_start
+  | Before_reset at ->
+    t.frame_start <= t.line && t.line < at && at <= t.frame_start + max_reset_delay
+  | Before_display at ->
+    t.frame_start < t.line && t.line < at
+    && at <= t.frame_start + max_reset_delay + max_lines_to_display
 
 (* Older states keep blinking off, take the vertical adjust from R#18,
    which read_state has restored, and have no deferred bits waiting. *)
@@ -1672,7 +1782,21 @@ let read_appended r t =
     t.cmd_steal <- (if steal < 0 then None else Some steal)
   end
   (* Before v13 every command but a transfer ended as it started. *)
-  else if engine_running t then State_codec.fail "invalid VDP command state"
+  else if engine_running t then State_codec.fail "invalid VDP command state";
+  if State_codec.version r >= 14 then begin
+    t.frame_start <- State_codec.get_int r ~min:0 ~max:max_counter_line;
+    let tag = State_codec.get_int r ~min:0 ~max:2 in
+    let at = State_codec.get_int r ~min:0 ~max:max_counter_line in
+    t.vertical <-
+      (match tag with
+       | 0 -> Before_frame_start
+       | 1 -> Before_reset at
+       | 2 -> Before_display at
+       | _ -> State_codec.fail "invalid VDP vertical state")
+  end
+  else if t.line < lines_per_frame t then derive_vertical t
+  else State_codec.fail "invalid VDP line";
+  if not (vertical_consistent t) then State_codec.fail "invalid VDP vertical state"
 
 let read_state r t =
   State_codec.fill_int_array r ~min:0 ~max:255 t.regs;
@@ -1687,7 +1811,7 @@ let read_state r t =
   t.pal_idx <- State_codec.get_int r ~min:(0) ~max:15;
   t.status0 <- State_codec.get_int r ~min:(0) ~max:255;
   t.status1 <- State_codec.get_int r ~min:(0) ~max:255;
-  t.line <- State_codec.get_int r ~min:(0) ~max:312;
+  t.line <- State_codec.get_int r ~min:(0) ~max:max_counter_line;
   t.cycle_in_line <- State_codec.get_int r ~min:(0) ~max:227;
   t.tx_dx <- State_codec.get_int r ~min:(0) ~max:511;
   (* ARG and mode can change during a transfer: permit every coordinate
@@ -1742,7 +1866,12 @@ let read_state r t =
   if State_codec.version r >= 7 then begin
     t.even_odd <- State_codec.get_bool r;
     t.pal <- State_codec.get_bool r
+  end
+  else begin
+    (* States before v7 did not keep EO or the 50 Hz latch: they read as
+       EO = 0 at 60 Hz, as they always have, not as a power-on. *)
+    t.even_odd <- false;
+    t.pal <- false
   end;
-  if t.line >= lines_per_frame t then State_codec.fail "invalid VDP line";
   if Option.is_some t.tx && (t.tx_nx = 0 || t.tx_anx = 0 || t.tx_anx > t.tx_nx || t.tx_ny = 0) then
     State_codec.fail "invalid active VDP transfer"

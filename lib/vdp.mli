@@ -14,6 +14,9 @@
 type t
 
 val create : unit -> t
+(** A VDP at power-on, which is a frame start (openMSX VDP::reset): the beam
+    is on line 220, 14 cycles in, 42 lines above display line 0, and S#2 EO
+    reads 1. *)
 
 val io_write : t -> port:int -> int -> unit
 (** 0x98 VRAM 데이터 쓰기 / 0x99 주소·레지스터 래치 / 0x9A 팔레트
@@ -78,7 +81,9 @@ val status0 : t -> int
 (** S#0 현재값 — 인터럽트 디버깅용. *)
 
 val line_now : t -> int * int
-(** (현재 라인, 라인 내 사이클) — 인터럽트 미발사 진단용. *)
+(** (현재 라인, 라인 내 사이클) — 인터럽트 미발사 진단용. 라인은 표시 줄 0
+    에서 0 이고, 표시 줄 0 이 다시 올 때까지 센다. R#9 와 R#18 이 그
+    자리를 옮기면 한 프레임이 262/313줄보다 짧거나 길다. *)
 
 val write_log : t -> (int * int * int) list
 (** 최근 4096 포트 쓰기 (port, 래치주소, 값) — 부트 디버깅용. *)

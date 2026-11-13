@@ -65,8 +65,15 @@ type screen = Off | Sprites_off | Sprites_on
 
 (* SCREEN5 at [line] cycle [cycle], past the line start that takes the
    mode, blank and sprite bits. *)
+(* Vdp.create is a frame start, 42 lines above display line 0 (openMSX
+   VDP::reset calls frameStart); these checks count lines from display
+   line 0. *)
+let to_display_start t =
+  while Vdp.line_now t <> (0, 0) do ignore (Vdp.advance t ~cycles:1) done
+
 let screen5 ?(line = 10) ?(cycle = 60) screen =
   let t = Vdp.create () in
+  to_display_start t;
   reg t 0 0x06;
   reg t 1 (match screen with Off -> 0x00 | Sprites_off | Sprites_on -> 0x40);
   reg t 8 (match screen with Sprites_off -> 0x0a | Off | Sprites_on -> 0x08);
