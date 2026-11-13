@@ -69,8 +69,24 @@ type t = {
   (* S#2 BD: SRCH found its border colour; reading S#9 clears it. *)
   mutable cmd_bd : bool;
   (* ASX, the engine's source-X counter, shown as S#8/S#9 (openMSX
-     getBorderX: the hardware returns ASX whatever command ran). *)
+     getBorderX: the hardware returns ASX whatever command ran). LINE keeps
+     its Bresenham sum here while it runs. *)
   mutable cmd_asx : int;
+  (* A running command other than a transfer (CE set, [tx] None) takes one
+     VRAM access at a time ({!engine_step}). [cmd_wait] is the ticks from
+     now to its next access; [cmd_phase] is which access of a dot or byte
+     comes next; [cmd_adx]/[cmd_anx] are the destination X and the units
+     left in this row (LINE counts its dots up); [cmd_src]/[cmd_dst] hold
+     the byte read for a later write (openMSX tmpSrc/tmpDst). *)
+  mutable cmd_wait : int;
+  mutable cmd_phase : int;
+  mutable cmd_adx : int;
+  mutable cmd_anx : int;
+  mutable cmd_src : int;
+  mutable cmd_dst : int;
+  (* The slot a CPU VRAM access has claimed, in ticks from now: an engine
+     access due there moves to the next slot (openMSX stealAccessSlot). *)
+  mutable cmd_steal : int option;
   (* 포트 쓰기 로그 — 부트 디버깅용 링버퍼. *)
   mutable wlog : (int * int * int) array;
   mutable wlog_i : int;
@@ -162,6 +178,13 @@ let create () =
     tx_pending = false;
     cmd_bd = false;
     cmd_asx = 0;
+    cmd_wait = 0;
+    cmd_phase = 0;
+    cmd_adx = 0;
+    cmd_anx = 0;
+    cmd_src = 0;
+    cmd_dst = 0;
+    cmd_steal = None;
     wlog = Array.make 65536 (0, 0, 0);
     wlog_i = 0;
     cmd_log = [];
@@ -322,11 +345,16 @@ let pixel_shift t x =
 let pixel_mask t = (1 lsl (8 / pixels_per_byte t)) - 1
 let point t extended x y =
   (read_vram t (vram_addr t extended x y) lsr pixel_shift t x) land pixel_mask t
-let pset t extended x y op color =
-  let a = vram_addr t extended x y in
-  let old = read_vram t a and mask = pixel_mask t and shift = pixel_shift t x in
+(* Dot [x] of byte [a], whose value was read as [old], becomes [color]
+   through the logical operation. *)
+let pset_byte t a ~old x op color =
+  let mask = pixel_mask t and shift = pixel_shift t x in
   let color = logical op ((old lsr shift) land mask) (color land mask) land mask in
   write_vram t a ((old land (lnot (mask lsl shift))) lor (color lsl shift))
+
+let pset t extended x y op color =
+  let a = vram_addr t extended x y in
+  pset_byte t a ~old:(read_vram t a) x op color
 
 let clip_x t ~byte ~reverse ~x ~nx =
   let unit_size = if byte then pixels_per_byte t else 1 in
@@ -415,117 +443,368 @@ let arg_mxd = 0x20
    (openMSX executePoint: COL = 0xFF when !hasExtendedVRAM). *)
 let cmd_point t extended x y = if extended then 0xff else point t false x y
 
-(* SRCH walks SX along SY until a dot matches CL (EQ=0) or differs from it
-   (EQ=1), and sets BD. Leaving the line ends the walk without touching BD.
-   ASX keeps the last X either way (openMSX executeSrch). *)
-let search t =
-  let arg = t.regs.(45) in
-  let cl = t.regs.(44) land pixel_mask t and ppl = (bitmap_layout t).width in
-  let tx = if arg land arg_dix <> 0 then -1 else 1 in
-  let eq = arg land arg_eq <> 0 and mxs = arg land arg_mxs <> 0 in
-  let sy = reg_y t 34 35 in
-  let rec walk asx =
-    if (cmd_point t mxs asx sy = cl) <> eq then begin
-      t.cmd_bd <- true;
-      asx
-    end else
-      let asx = asx + tx in
-      if asx land ppl <> 0 then asx else walk asx
+(* Command timing. The engine reaches VRAM only in the access slots the
+   display fetch leaves free, and each step of a command waits at least a
+   fixed number of VDP ticks after the previous access. A block command
+   therefore runs for many lines with CE set, and the CPU sees VRAM half
+   done in between. The slot positions are measured on a real V9938 in
+   bitmap modes (openMSX VDPAccessSlots, documented at
+   openmsx.org/vdp-vram-timing/vdp-timing.html), as ticks after the line's
+   sync; the waits are openMSX VDPCmdEngine's. *)
+let ticks_per_cycle = 6
+let ticks_per_line = cycles_per_line * ticks_per_cycle
+
+(* This model's line starts at the right border, 1282 ticks after the sync
+   of openMSX's line in the bitmap modes (the only modes that run
+   commands). R#18 horizontal adjust, which moves the border, is not
+   applied to the slots. *)
+let right_border_tick = 1282
+
+(* Screen off (BL clear, or the vertical border). *)
+let slots_screen_off =
+  [| 0; 8; 16; 24; 32; 40; 48; 56; 64; 72; 80; 88; 96; 104; 112; 120;
+     164; 172; 180; 188; 196; 204; 212; 220; 228; 236; 244; 252; 260; 268;
+     276; 292; 300; 308; 316; 324; 332; 340; 348; 356; 364; 372; 380; 388;
+     396; 404; 420; 428; 436; 444; 452; 460; 468; 476; 484; 492; 500; 508;
+     516; 524; 532; 548; 556; 564; 572; 580; 588; 596; 604; 612; 620; 628;
+     636; 644; 652; 660; 676; 684; 692; 700; 708; 716; 724; 732; 740; 748;
+     756; 764; 772; 780; 788; 804; 812; 820; 828; 836; 844; 852; 860; 868;
+     876; 884; 892; 900; 908; 916; 932; 940; 948; 956; 964; 972; 980; 988;
+     996; 1004; 1012; 1020; 1028; 1036; 1044; 1060; 1068; 1076; 1084; 1092;
+     1100; 1108; 1116; 1124; 1132; 1140; 1148; 1156; 1164; 1172; 1188; 1196;
+     1204; 1212; 1220; 1228; 1268; 1276; 1284; 1292; 1300; 1308; 1316; 1324;
+     1334; 1344; 1352; 1360 |]
+
+(* Display on, sprites off (R#8 SPD set). *)
+let slots_sprites_off =
+  [| 6; 14; 22; 30; 38; 46; 54; 62; 70; 78; 86; 94; 102; 110; 118; 162;
+     170; 182; 188; 214; 220; 246; 252; 278; 310; 316; 342; 348; 374; 380;
+     406; 438; 444; 470; 476; 502; 508; 534; 566; 572; 598; 604; 630; 636;
+     662; 694; 700; 726; 732; 758; 764; 790; 822; 828; 854; 860; 886; 892;
+     918; 950; 956; 982; 988; 1014; 1020; 1046; 1078; 1084; 1110; 1116;
+     1142; 1148; 1174; 1206; 1212; 1266; 1274; 1282; 1290; 1298; 1306; 1314;
+     1322; 1332; 1342; 1350; 1358; 1366 |]
+
+(* Display on, sprites on: the sprite fetch takes most of the line. *)
+let slots_sprites_on =
+  [| 28; 92; 162; 170; 188; 220; 252; 316; 348; 380; 444; 476; 508; 572;
+     604; 636; 700; 732; 764; 828; 860; 892; 956; 988; 1020; 1084; 1116;
+     1148; 1212; 1264; 1330 |]
+
+(* openMSX isDisplayArea runs from the left border of display line 0
+   (tick 202, cycle 48 here, where VR falls) to the same point below the
+   last display line. *)
+let display_edge_cycle = vr_fall_cycle
+
+let display_area t =
+  let visible = visible_lines t in
+  if t.cycle_in_line < display_edge_cycle then t.line > 0 && t.line <= visible
+  else t.line < visible
+
+(* openMSX VDPAccessSlots::getTab for the bitmap modes. *)
+let slot_table t =
+  if t.regs.(1) land 0x40 = 0 || not (display_area t) then slots_screen_off
+  else if t.regs.(8) land 0x02 <> 0 then slots_sprites_off
+  else slots_sprites_on
+
+(* The first slot at least [delta] ticks after [at] (ticks into this
+   model's line; the answer may lie in a later line). *)
+let slot_after slots ~at ~delta =
+  let base = (at + right_border_tick) mod ticks_per_line in
+  let want = base + delta in
+  let n = Array.length slots in
+  let value k = slots.(k mod n) + ((k / n) * ticks_per_line) in
+  (* Smallest k with value k >= want; want < 2 lines, so k < 3n. *)
+  let rec search lo hi =
+    if lo >= hi then lo
+    else
+      let mid = (lo + hi) / 2 in
+      if value mid >= want then search lo mid else search (mid + 1) hi
   in
-  t.cmd_asx <- walk (reg16 t 32 33) land 0x3ff
+  at + (value (search 0 (3 * n)) - base)
+
+(* Ticks from one engine access to the earliest next one (openMSX
+   VDPCmdEngine, the execute functions). A dot command reads the destination byte, then
+   writes it [read_to_write] later; a copy reads its source first. The row
+   delays include the turn to the next row. *)
+let read_to_write = 24
+let lmmm_src_to_dst = 32
+let hmmv_byte = 48
+let hmmv_row = 104
+let hmmm_byte = 64
+let hmmm_row = 128
+let ymmm_byte = 40
+let lmmv_dot = 72
+let lmmv_row = 136
+let lmmm_dot = 64
+let lmmm_row = 128
+let line_dot = 88
+let line_minor_step = 120
+let srch_dot = 88
+
+(* A CPU VRAM access waits 16 ticks for its slot (openMSX
+   scheduleCpuVramAccess, V99x8), and an engine access due in that slot
+   takes the next one. *)
+let cpu_access_delay = 16
+let steal_delay = 1
+
+type step = Next of int | Done
+
+let dir_x t = if t.regs.(45) land arg_dix <> 0 then -1 else 1
+let dir_y t = if t.regs.(45) land arg_diy <> 0 then -1 else 1
+let ext_src t = t.regs.(45) land arg_mxs <> 0
+let ext_dst t = t.regs.(45) land arg_mxd <> 0
+let byte_block = function Hmmv | Hmmm | Ymmm -> true | Lmmv | Lmmm -> false
+let x_step t block =
+  dir_x t * (if byte_block block then pixels_per_byte t else 1)
+
+(* openMSX tmpNX and tmpNY, from the live registers: the units in a row and
+   the rows left, clipped to the screen for the destination and, in a
+   copy, the source. YMMM moves whole rows from DX. *)
+let row_units t block =
+  let reverse = t.regs.(45) land arg_dix <> 0 in
+  let clip x nx = clip_x t ~byte:(byte_block block) ~reverse ~x ~nx in
+  let sx = reg16 t 32 33 and dx = reg16 t 36 37 and nx = reg_nx t in
+  match block with
+  | Lmmv | Hmmv -> clip dx nx
+  | Lmmm | Hmmm -> min (clip sx nx) (clip dx nx)
+  | Ymmm -> clip dx 512
+
+let rows_left t block =
+  let reverse = t.regs.(45) land arg_diy <> 0 and ny = reg_ny t in
+  let dest = clip_y ~reverse ~y:(reg_y t 38 39) ~ny in
+  match block with
+  | Lmmv | Hmmv -> dest
+  | Lmmm | Hmmm | Ymmm -> min dest (clip_y ~reverse ~y:(reg_y t 34 35) ~ny)
+
+(* LMMM and HMMM walk a source X; the others do not touch ASX. *)
+let walks_source = function Lmmm | Hmmm -> true | Lmmv | Hmmv | Ymmm -> false
+
+(* After a unit is written: step along the row, or at its end go to the
+   next row (DY, and SY for a copy, move one line and NY counts down;
+   openMSX "SY += TY; DY += TY; --NY") and end after the last one. *)
+let next_unit t block ~unit_delay ~row_delay =
+  let tx = x_step t block in
+  t.cmd_adx <- t.cmd_adx + tx;
+  if walks_source block then t.cmd_asx <- t.cmd_asx + tx;
+  t.cmd_anx <- t.cmd_anx - 1;
+  if t.cmd_anx > 0 then Next unit_delay
+  else begin
+    let last = rows_left t block = 1 in
+    let regs = match block with Lmmv | Hmmv -> Dst | Lmmm | Hmmm | Ymmm -> Src_and_dst in
+    finish_rows t regs ~rows:1 ~step:(dir_y t);
+    t.cmd_adx <- reg16 t 36 37;
+    if walks_source block then t.cmd_asx <- reg16 t 32 33;
+    t.cmd_anx <- row_units t block;
+    if last then Done else Next row_delay
+  end
+
+let block_step t block =
+  let op = t.regs.(46) land 0x0f and col = t.regs.(44) in
+  let sy = reg_y t 34 35 and dy = reg_y t 38 39 in
+  let dst () = vram_addr t (ext_dst t) t.cmd_adx dy in
+  match block, t.cmd_phase with
+  | Hmmv, _ ->
+    write_vram t (dst ()) col;
+    next_unit t block ~unit_delay:hmmv_byte ~row_delay:hmmv_row
+  | Hmmm, 0 ->
+    t.cmd_src <- read_vram t (vram_addr t (ext_src t) t.cmd_asx sy);
+    t.cmd_phase <- 1;
+    Next read_to_write
+  | Hmmm, _ ->
+    write_vram t (dst ()) t.cmd_src;
+    t.cmd_phase <- 0;
+    next_unit t block ~unit_delay:hmmm_byte ~row_delay:hmmm_row
+  | Ymmm, 0 ->
+    (* YMMM reads and writes with MXD (openMSX executeYmmm). *)
+    t.cmd_src <- read_vram t (vram_addr t (ext_dst t) t.cmd_adx sy);
+    t.cmd_phase <- 1;
+    Next read_to_write
+  | Ymmm, _ ->
+    write_vram t (dst ()) t.cmd_src;
+    t.cmd_phase <- 0;
+    next_unit t block ~unit_delay:ymmm_byte ~row_delay:ymmm_byte
+  | Lmmv, 0 ->
+    t.cmd_dst <- read_vram t (dst ());
+    t.cmd_phase <- 1;
+    Next read_to_write
+  | Lmmv, _ ->
+    pset_byte t (dst ()) ~old:t.cmd_dst t.cmd_adx op col;
+    t.cmd_phase <- 0;
+    next_unit t block ~unit_delay:lmmv_dot ~row_delay:lmmv_row
+  | Lmmm, 0 ->
+    t.cmd_src <- cmd_point t (ext_src t) t.cmd_asx sy;
+    t.cmd_phase <- 1;
+    Next lmmm_src_to_dst
+  | Lmmm, 1 ->
+    t.cmd_dst <- read_vram t (dst ());
+    t.cmd_phase <- 2;
+    Next read_to_write
+  | Lmmm, _ ->
+    pset_byte t (dst ()) ~old:t.cmd_dst t.cmd_adx op t.cmd_src;
+    t.cmd_phase <- 0;
+    next_unit t block ~unit_delay:lmmm_dot ~row_delay:lmmm_row
+
+(* SRCH walks ASX from SX along SY until a dot matches CL (EQ=0) or
+   differs from it (EQ=1), and sets BD. Leaving the line ends the walk
+   without touching BD (openMSX executeSrch). *)
+let srch_step t =
+  let cl = t.regs.(44) land pixel_mask t and ppl = (bitmap_layout t).width in
+  let eq = t.regs.(45) land arg_eq <> 0 in
+  if (cmd_point t (ext_src t) t.cmd_asx (reg_y t 34 35) = cl) <> eq then begin
+    t.cmd_bd <- true;
+    Done
+  end
+  else begin
+    t.cmd_asx <- t.cmd_asx + dir_x t;
+    if t.cmd_asx land ppl <> 0 then Done else Next srch_dot
+  end
 
 (* LINE draws NX + 1 dots from (DX, DY): NX along the major axis (ARG MAJ),
-   NY along the minor one. ASX is the Bresenham accumulator and keeps its
-   last value for S#8/S#9. The order of the end tests follows openMSX
-   executeLine ("confirmed on real HW"): leaving the line ends after the
-   dot is drawn, and leaving the top edge ends the command while the bottom
-   edge wraps. DY is left at the last minor step, -1 (0x3FF) when the line
-   left the top edge; DX, NX and NY stay. *)
-let draw_line t =
-  let arg = t.regs.(45) and op = t.regs.(46) land 0x0f in
-  let cl = t.regs.(44) and ppl = (bitmap_layout t).width in
-  let tx = if arg land arg_dix <> 0 then -1 else 1 in
-  let ty = if arg land arg_diy <> 0 then -1 else 1 in
-  let mxd = arg land arg_mxd <> 0 and x_major = arg land arg_maj = 0 in
-  let nx = reg_nx t and ny = reg_ny t in
-  let next asx = (asx - ny) land 0x3ff in
-  let rec dot ~asx ~adx ~dy ~anx =
-    pset t mxd adx dy op cl;
-    if x_major then begin
-      let adx = adx + tx in
-      if anx = nx || adx land ppl <> 0 then (asx, dy)
-      else if asx < ny then begin
-        let asx = asx + nx and dy = dy + ty in
-        if ty < 0 && dy < 0 then (asx, dy)
-        else dot ~asx:(next asx) ~adx ~dy ~anx:(anx + 1)
-      end
-      else dot ~asx:(next asx) ~adx ~dy ~anx:(anx + 1)
-    end else begin
+   NY along the minor one, with ASX as the Bresenham sum. Each dot reads
+   its byte, then writes it; a minor step costs 32 ticks more. The order
+   of the end tests follows openMSX executeLine ("confirmed on real HW"):
+   leaving the line ends after the dot is drawn, and leaving the top edge
+   ends the command while the bottom edge wraps. DY moves as it goes and
+   is left at -1 (0x3FF) when the line left the top edge. *)
+let line_step t =
+  let dy = reg_y t 38 39 in
+  let a = vram_addr t (ext_dst t) t.cmd_adx dy in
+  match t.cmd_phase with
+  | 0 ->
+    t.cmd_dst <- read_vram t a;
+    t.cmd_phase <- 1;
+    Next read_to_write
+  | _ ->
+    pset_byte t a ~old:t.cmd_dst t.cmd_adx (t.regs.(46) land 0x0f) t.regs.(44);
+    t.cmd_phase <- 0;
+    let tx = dir_x t and ty = dir_y t in
+    let nx = reg_nx t and ny = reg_ny t and ppl = (bitmap_layout t).width in
+    let reduce () = t.cmd_asx <- (t.cmd_asx - ny) land 0x3ff in
+    let count () =
+      let anx = t.cmd_anx in
+      t.cmd_anx <- anx + 1;
+      anx = nx || t.cmd_adx land ppl <> 0
+    in
+    let step_y () =
       let dy = dy + ty in
-      if ty < 0 && dy < 0 then (asx, dy)
-      else
-        let asx, adx = if asx < ny then (asx + nx, adx + tx) else (asx, adx) in
-        let asx = next asx in
-        if anx = nx || adx land ppl <> 0 then (asx, dy)
-        else dot ~asx ~adx ~dy ~anx:(anx + 1)
-    end
-  in
-  (* openMSX computes (NX - 1) >> 1 unsigned: NX = 0 starts at 0x7FFFFFFF. *)
-  let asx = ((nx - 1) land 0xffff_ffff) lsr 1 in
-  let asx, dy = dot ~asx ~adx:(reg16 t 36 37) ~dy:(reg_y t 38 39) ~anx:0 in
-  t.cmd_asx <- asx land 0x3ff;
-  set_reg_y t 38 39 dy
-
-(* 블록 명령 실행 — 즉시 완료 (CE 는 관찰되지 않는다). *)
-let block_command t block =
-  let op = t.regs.(46) land 15 in
-  let arg = t.regs.(45) in
-  let reverse_x = arg land arg_dix <> 0 and reverse_y = arg land arg_diy <> 0 in
-  let mxs = arg land arg_mxs <> 0 and mxd = arg land arg_mxd <> 0 in
-  let sx = reg16 t 32 33 and sy = reg_y t 34 35 in
-  let dx = reg16 t 36 37 and dy = reg_y t 38 39 in
-  let byte, copy =
-    match block with
-    | Lmmv -> (false, false)
-    | Lmmm -> (false, true)
-    | Hmmv -> (true, false)
-    | Hmmm | Ymmm -> (true, true)
-  in
-  let ymmm = block = Ymmm in
-  let nx = if ymmm then 512 else reg_nx t in
-  let ny = reg_ny t in
-  let src_x = if ymmm then dx else sx in
-  let nx =
-    let dest = clip_x t ~byte ~reverse:reverse_x ~x:dx ~nx in
-    if copy then min dest (clip_x t ~byte ~reverse:reverse_x ~x:src_x ~nx)
-    else dest in
-  let ny =
-    let dest = clip_y ~reverse:reverse_y ~y:dy ~ny in
-    if copy then min dest (clip_y ~reverse:reverse_y ~y:sy ~ny) else dest in
-  let step_x n = (if reverse_x then -n else n) * (if byte then pixels_per_byte t else 1) in
-  let step_y n = if reverse_y then -n else n in
-  for row = 0 to ny - 1 do
-    for col = 0 to nx - 1 do
-      let x = dx + step_x col and y = dy + step_y row in
-      if byte then begin
-        let value = if copy then
-            read_vram t (vram_addr t (if ymmm then mxd else mxs)
-              (src_x + step_x col) (sy + step_y row))
-          else t.regs.(44) in
-        write_vram t (vram_addr t mxd x y) value
-      end else begin
-        let value = if copy then point t mxs (sx + step_x col) (sy + step_y row)
-          else t.regs.(44) in
-        pset t mxd x y op value
+      set_reg_y t 38 39 dy;
+      ty < 0 && dy < 0
+    in
+    if t.regs.(45) land arg_maj = 0 then begin
+      t.cmd_adx <- t.cmd_adx + tx;
+      if count () then Done
+      else if t.cmd_asx < ny then begin
+        t.cmd_asx <- t.cmd_asx + nx;
+        if step_y () then Done else (reduce (); Next line_minor_step)
       end
-    done
-  done;
-  finish_rows t (if copy then Src_and_dst else Dst) ~rows:ny ~step:(step_y 1);
-  (* LMMM and HMMM leave ASX back at SX (openMSX executeLmmm/executeHmmm
-     reset it at each row end); the other block commands do not use it. *)
-  match block with
-  | Lmmm | Hmmm -> t.cmd_asx <- sx
-  | Lmmv | Hmmv | Ymmm -> ()
+      else (reduce (); Next line_dot)
+    end
+    else if step_y () then Done
+    else begin
+      let delay =
+        if t.cmd_asx < ny then begin
+          t.cmd_asx <- t.cmd_asx + nx;
+          t.cmd_adx <- t.cmd_adx + tx;
+          line_minor_step
+        end
+        else line_dot
+      in
+      reduce ();
+      if count () then Done else Next delay
+    end
+
+(* PSET reads the byte, then writes the dot. *)
+let pset_step t =
+  let a = vram_addr t (ext_dst t) (reg16 t 36 37) (reg_y t 38 39) in
+  match t.cmd_phase with
+  | 0 ->
+    t.cmd_dst <- read_vram t a;
+    t.cmd_phase <- 1;
+    Next read_to_write
+  | _ ->
+    pset_byte t a ~old:t.cmd_dst (reg16 t 36 37) (t.regs.(46) land 0x0f) t.regs.(44);
+    Done
+
+(* One VRAM access of the running command. Only POINT, PSET, SRCH, LINE
+   and the block commands run here; STOP ends at once and the transfers
+   move with the CPU. *)
+let engine_step t =
+  match command_of_cmr t.regs.(46) with
+  | Point ->
+    t.regs.(44) <- cmd_point t (ext_src t) (reg16 t 32 33) (reg_y t 34 35);
+    Done
+  | Pset -> pset_step t
+  | Srch -> srch_step t
+  | Line -> line_step t
+  | Block block -> block_step t block
+  | Stop | Transfer _ -> Done
+
+let engine_running t = t.cmd_ce && Option.is_none t.tx
+
+(* openMSX commandDone: CE drops; TR waits for the next S#2 read. *)
+let end_command t =
+  t.cmd_ce <- false;
+  t.cmd_asx <- t.cmd_asx land 0x3ff;
+  t.cmd_steal <- None
+
+(* The clock has moved [ticks] on to [t.cycle_in_line] under one slot
+   table: the engine makes every access due before now. *)
+let run_engine t slots ~ticks =
+  if engine_running t then begin
+    let now = t.cycle_in_line * ticks_per_cycle in
+    t.cmd_wait <- t.cmd_wait - ticks;
+    t.cmd_steal <- Option.map (fun s -> s - ticks) t.cmd_steal;
+    while engine_running t && t.cmd_wait < 0 do
+      let at = now + t.cmd_wait in
+      match engine_step t with
+      | Done -> end_command t
+      | Next delta ->
+        let next = slot_after slots ~at ~delta - now in
+        t.cmd_wait <-
+          (match t.cmd_steal with
+           | Some s when s = next ->
+             t.cmd_steal <- None;
+             slot_after slots ~at:(now + s) ~delta:steal_delay - now
+           | Some _ | None -> next)
+    done;
+    match t.cmd_steal with
+    | Some s when s < t.cmd_wait -> t.cmd_steal <- None
+    | Some _ | None -> ()
+  end
+
+(* A CPU VRAM access now: it claims the first slot 16 ticks on. *)
+let steal_slot t =
+  if engine_running t then begin
+    let slots = slot_table t and now = t.cycle_in_line * ticks_per_cycle in
+    let s = slot_after slots ~at:now ~delta:cpu_access_delay - now in
+    if s = t.cmd_wait then
+      t.cmd_wait <- slot_after slots ~at:(now + s) ~delta:steal_delay - now
+    else if s > t.cmd_wait then t.cmd_steal <- Some s
+  end
+
+(* A command starts at the first free slot from now. *)
+let start_timed t command =
+  (match command with
+   | Srch -> t.cmd_asx <- reg16 t 32 33
+   | Line ->
+     (* openMSX computes (NX - 1) >> 1 unsigned, so NX = 0 starts the sum at
+        0x7FFFFFFF. Only its low 10 bits can show: with NX = 0 the first
+        dot ends the line, the sum never reaches a minor step (NY < 1024)
+        and the reduction keeps 10 bits. *)
+     t.cmd_asx <- (((reg_nx t - 1) land 0xffff_ffff) lsr 1) land 0x3ff;
+     t.cmd_adx <- reg16 t 36 37;
+     t.cmd_anx <- 0
+   | Block block ->
+     t.cmd_adx <- reg16 t 36 37;
+     t.cmd_anx <- row_units t block;
+     if walks_source block then t.cmd_asx <- reg16 t 32 33
+   | Point | Pset | Stop | Transfer _ -> ());
+  t.cmd_phase <- 0;
+  t.cmd_steal <- None;
+  t.cmd_ce <- true;
+  let now = t.cycle_in_line * ticks_per_cycle in
+  t.cmd_wait <- slot_after (slot_table t) ~at:now ~delta:0 - now
 
 (* LMMC/HMMC 전송 한 바이트 — 전송 모드에서 R#44(CLR) 쓰기가 곧
    데이터다 (openMSX setCmdReg case 0x0C → executeLmmc/executeHmmc).
@@ -620,18 +899,11 @@ let start_command t =
   t.tx <- None;
   t.cmd_ce <- false;
   t.cmd_tr <- false;
+  t.cmd_steal <- None;
   if commands_enabled t then
     match command_of_cmr cmr_v with
     | Stop -> ()
-    | Point ->
-      t.regs.(44) <-
-        cmd_point t (t.regs.(45) land arg_mxs <> 0) (reg16 t 32 33) (reg_y t 34 35)
-    | Pset ->
-      pset t (t.regs.(45) land arg_mxd <> 0) (reg16 t 36 37) (reg_y t 38 39)
-        (t.regs.(46) land 0x0f) t.regs.(44)
-    | Srch -> search t
-    | Line -> draw_line t
-    | Block block -> block_command t block
+    | (Point | Pset | Srch | Line | Block _) as command -> start_timed t command
     | Transfer ((Lmmc | Hmmc) as kind) ->
       start_transfer t kind ~x:(reg16 t 36 37) ~y:(reg_y t 38 39);
       (* 발행 전 R#44 에 쓰인 첫 픽셀이 큐에 있으면 즉시 소비. *)
@@ -719,6 +991,7 @@ let increment_addr t =
   if t.addr = 0 && t.regs.(0) land 0x0c <> 0 then
     t.regs.(14) <- (t.regs.(14) + 1) land 7
 let prefetch t =
+  steal_slot t;
   t.read_buf <- read_vram t (cpu_addr t);
   increment_addr t
 
@@ -726,6 +999,7 @@ let io_write t ~port v =
   log_w t (port land 0xff) t.addr v;
   match port with
   | 0x98 ->
+    steal_slot t;
     write_vram t (cpu_addr t) v;
     t.read_buf <- v land 0xff;
     increment_addr t
@@ -1205,7 +1479,8 @@ let present t =
   t.shown_w <- w;
   t.shown_h <- h
 
-(* The deferred bits written so far take effect. *)
+(* The deferred bits written so far take effect. A mode outside GRAPHIC
+   4-7 ends a running command (openMSX updateDisplayMode aborts it). *)
 let take_deferred t =
   let take r written =
     let m = deferred_bits r in
@@ -1213,7 +1488,11 @@ let take_deferred t =
   in
   take 0 t.written_r0;
   take 1 t.written_r1;
-  take 8 t.written_r8
+  take 8 t.written_r8;
+  if t.cmd_ce && not (commands_enabled t) then begin
+    t.tx <- None;
+    end_command t
+  end
 
 let advance t ~cycles =
   let hit = ref false in
@@ -1221,10 +1500,19 @@ let advance t ~cycles =
   while !remaining > 0 do
     let c = t.cycle_in_line in
     let start = line_start_cycle t in
-    let step = min !remaining (cycles_per_line - c) in
-    if c < start && c + step >= start then take_deferred t;
+    (* The slot table holds between the line start, the display edge and
+       the line end. *)
+    let until =
+      if c < start then start
+      else if c < display_edge_cycle then display_edge_cycle
+      else cycles_per_line
+    in
+    let step = min !remaining (until - c) in
+    let slots = slot_table t in
     t.cycle_in_line <- c + step;
     remaining := !remaining - step;
+    run_engine t slots ~ticks:(step * ticks_per_cycle);
+    if t.cycle_in_line = start then take_deferred t;
     if t.cycle_in_line = cycles_per_line then begin
       t.cycle_in_line <- 0;
       let finished = t.line in
@@ -1346,7 +1634,11 @@ let write_appended w t =
   State_codec.put_int w t.v_shift;
   State_codec.put_int w t.written_r0;
   State_codec.put_int w t.written_r1;
-  State_codec.put_int w t.written_r8
+  State_codec.put_int w t.written_r8;
+  (* v13: a running command's progress. *)
+  List.iter (State_codec.put_int w)
+    [ t.cmd_wait; t.cmd_phase; t.cmd_adx; t.cmd_anx; t.cmd_src; t.cmd_dst;
+      Option.value t.cmd_steal ~default:(-1) ]
 
 (* Older states keep blinking off, take the vertical adjust from R#18,
    which read_state has restored, and have no deferred bits waiting. *)
@@ -1367,7 +1659,20 @@ let read_appended r t =
     t.written_r0 <- t.regs.(0);
     t.written_r1 <- t.regs.(1);
     t.written_r8 <- t.regs.(8)
+  end;
+  if State_codec.version r >= 13 then begin
+    let int ~min ~max = State_codec.get_int r ~min ~max in
+    t.cmd_wait <- int ~min:0 ~max:(2 * ticks_per_line);
+    t.cmd_phase <- int ~min:0 ~max:2;
+    t.cmd_adx <- int ~min:(-2048) ~max:2559;
+    t.cmd_anx <- int ~min:0 ~max:1024;
+    t.cmd_src <- int ~min:0 ~max:255;
+    t.cmd_dst <- int ~min:0 ~max:255;
+    let steal = int ~min:(-1) ~max:(2 * ticks_per_line) in
+    t.cmd_steal <- (if steal < 0 then None else Some steal)
   end
+  (* Before v13 every command but a transfer ended as it started. *)
+  else if engine_running t then State_codec.fail "invalid VDP command state"
 
 let read_state r t =
   State_codec.fill_int_array r ~min:0 ~max:255 t.regs;

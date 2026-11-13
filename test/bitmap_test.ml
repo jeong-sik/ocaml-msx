@@ -23,9 +23,21 @@ let fresh mode =
   ignore (Vdp.advance t ~cycles:line_start);
   t
 let xy t r x = reg t r (x land 255); reg t (r + 1) (x lsr 8)
+(* Every command but STOP and the CPU transfers runs in VRAM access slots
+   (openMSX VDPCmdEngine timing): run the clock until S#2 CE drops. *)
+let ce t =
+  reg t 15 2;
+  let v = Vdp.io_read t ~port:0x99 in
+  reg t 15 0;
+  v land 1 <> 0
+let timed cmd =
+  match cmd lsr 4 with
+  | 4 | 5 | 6 | 7 | 8 | 9 | 0xc | 0xd | 0xe -> true
+  | _ -> false
 let command t ~cmd ~dx ~dy ~nx ~ny ~arg ~color =
   xy t 36 dx; xy t 38 dy; xy t 40 nx; xy t 42 ny;
-  reg t 45 arg; reg t 44 color; reg t 46 cmd
+  reg t 45 arg; reg t 44 color; reg t 46 cmd;
+  if timed cmd then while ce t do ignore (Vdp.advance t ~cycles:1) done
 (* Two frames: the second VBlank publishes lines all scanned after the
    first, so every line reflects the state written before. *)
 let show t = ignore (Vdp.advance t ~cycles:(2 * 262 * 228))

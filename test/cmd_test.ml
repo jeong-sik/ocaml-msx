@@ -63,15 +63,38 @@ let set5 t x y c =
   let b = raw t a in
   poke t a (if x land 1 = 0 then (b land 0x0f) lor (c lsl 4) else (b land 0xf0) lor c)
 
-(* R#32-R#46 through the R#17 auto-increment port, CMR last. *)
-let command t ?(sx = 0) ?(sy = 0) ?(dx = 0) ?(dy = 0) ?(nx = 0) ?(ny = 0)
-    ?(col = 0) ?(arg = 0) cmr =
+(* POINT, PSET, SRCH, LINE and the block commands run in VRAM access slots
+   (openMSX VDPCmdEngine timing), so CE stays set for a while; STOP ends at
+   once and the transfers wait for the CPU. [finish] runs the clock until
+   CE drops and keeps the cycles that took in [waited]. *)
+let waited = ref 0
+let longest_command = 10 * 262 * 228
+
+let timed cmr =
+  match cmr lsr 4 with
+  | 4 | 5 | 6 | 7 | 8 | 9 | 0xc | 0xd | 0xe -> true
+  | _ -> false
+
+let finish t =
+  waited := 0;
+  while ce t && !waited < longest_command do
+    ignore (Vdp.advance t ~cycles:1);
+    incr waited
+  done;
+  if !waited >= longest_command then
+    failwith (Printf.sprintf "command never ended (line %d)" (fst (Vdp.line_now t)))
+
+(* R#32-R#46 through the R#17 auto-increment port, CMR last; a timed
+   command is run to its end unless [~wait:false]. *)
+let command t ?(wait = true) ?(sx = 0) ?(sy = 0) ?(dx = 0) ?(dy = 0) ?(nx = 0)
+    ?(ny = 0) ?(col = 0) ?(arg = 0) cmr =
   reg t 17 32;
   List.iter (Vdp.io_write t ~port:0x9b)
     [ sx land 0xff; sx lsr 8; sy land 0xff; sy lsr 8;
       dx land 0xff; dx lsr 8; dy land 0xff; dy lsr 8;
       nx land 0xff; nx lsr 8; ny land 0xff; ny lsr 8;
-      col; arg; cmr ]
+      col; arg; cmr ];
+  if wait && timed cmr then finish t
 
 let point_cmd = 0x40
 let srch = 0x60
@@ -93,7 +116,8 @@ let () =
   check "POINT SCREEN5 even dot is the high nibble" (status t 7 = 0x0a);
   command t ~sx:11 ~sy:5 point_cmd;
   check "POINT SCREEN5 odd dot is the low nibble" (status t 7 = 0x03);
-  check "POINT ends at once: CE and TR clear" (not (ce t) && not (tr t));
+  (* The first free slot is at most 66 ticks (11 cycles) away. *)
+  check "POINT ends at its first access slot" (!waited <= 11 && not (tr t));
   command t ~sx:11 ~sy:5 ~arg:arg_mxs point_cmd;
   check "POINT from absent expansion VRAM reads 0xFF unmasked" (status t 7 = 0xff);
   let t = fresh 0x0e in
@@ -148,7 +172,8 @@ let () =
   check "LINE X-major draws the Bresenham dots"
     (List.sort compare !drawn = List.sort compare expected);
   check "LINE X-major leaves ASX for S#8" (border_x t = 4);
-  check "LINE ends at once" (not (ce t));
+  (* 11 dots of 88 ticks or more, three minor steps 32 more: over 1000 ticks. *)
+  check "LINE takes its dots' time" (!waited * 6 >= (11 * 88) + (3 * 32));
   let t = fresh 0x06 in
   command t ~dx:50 ~dy:50 ~nx:4 ~ny:2 ~col:0x0f ~arg:arg_maj line;
   let expected = [ (50, 50); (51, 51); (51, 52); (52, 53); (52, 54) ] in
@@ -301,7 +326,9 @@ let () =
    --NY" per finished row, DY moved by LINE). The CPU cannot read them
    back, so each case starts a second command by writing only some of
    R#32-R#46 and looks at where it draws. *)
-let only t r v = reg t r v
+let only t r v =
+  reg t r v;
+  if r = 46 && timed v then finish t
 let row_filled t y v = raw t (y * 128) = v && raw t ((y * 128) + 3) = v
 let hmmm = 0xd0
 let ymmm = 0xe0
@@ -347,6 +374,7 @@ let () =
   let t = fresh 0x06 in
   List.iter (fun y -> poke t (y * 128) (0x50 + y)) [ 0; 1; 2 ];
   command t ~sy:0 ~dx:0 ~dy:50 ~ny:1 ymmm;
+  only t 42 1;
   only t 46 ymmm;
   check "YMMM leaves SY and DY on the next row" (raw t (51 * 128) = 0x51);
   (* LINE, Y major: dots on rows 10-13, then DY = 14 (DY steps before the
