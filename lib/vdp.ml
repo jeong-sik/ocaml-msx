@@ -57,11 +57,16 @@ let grb_to_rgb v =
   let g = (v lsr 8) land 7 and r = (v lsr 4) land 7 and b = v land 7 in
   ((r * 255) / 7, (g * 255) / 7, (b * 255) / 7)
 
+(* The V9938 has R#0-R#46 (R#32-R#46 drive the command engine). openMSX
+   VDP::changeRegister drops a write to R#47-R#63, which the indirect port
+   0x9B can name through R#17. *)
+let reg_count = 47
+
 let create () =
   let pal = Array.make 16 0 in
   Array.iteri (fun i v -> pal.(i) <- v) default_palette;
   {
-    regs = Array.make 47 0;
+    regs = Array.make reg_count 0;
     vram = Bytes.make 0x20000 '\000';
     addr = 0;
     write_mode = false;
@@ -318,7 +323,7 @@ let start_command t =
     exec_command t
   end
 
-let set_reg t r v =
+let write_reg t r v =
   t.regs.(r) <- v land 0xff;
   if r = 44 then begin
     if t.tx_active then transfer_byte t v else t.tx_pending <- true
@@ -335,6 +340,8 @@ let set_reg t r v =
        없으면 IE1=0 인 게임이 매 프레임 FH=1 을 읽는다 (룬마스터 II 의
        갤러리 핸들러가 5109 증가 경로를 영원히 건너뛰어 프리즈). *)
     t.status1 <- t.status1 land 0xfe
+
+let set_reg t r v = if r < reg_count then write_reg t r v
 
 let palette_rgb t i =
   if i land 0x10 = 0 then grb_to_rgb t.palette.(i land 15)
@@ -372,9 +379,10 @@ let io_write t ~port v =
     end else begin
       let b2 = v land 0xff in
       if b2 land 0x80 <> 0 then begin
-        (* 레지스터 쓰기: 첫 바이트가 값, 둘째가 0x80|번호. *)
-        let r = b2 land 0x3f in
-        if r < 47 then set_reg t r (t.latch_lo land 0xff)
+        (* 레지스터 쓰기: 첫 바이트가 값, 둘째가 0x80|번호. bit 6 도 서
+           있으면(0xC0-0xFF) 레지스터 쓰기가 아니다 — openMSX VDP::writeIO
+           는 V9938 에서 이 경우를 아무것도 하지 않는다(SNOW26 데모). *)
+        if b2 land 0x40 = 0 then set_reg t (b2 land 0x3f) (t.latch_lo land 0xff)
       end else begin
         t.addr <- ((b2 land 0x3f) lsl 8) lor t.latch_lo;
         t.write_mode <- b2 land 0x40 <> 0;

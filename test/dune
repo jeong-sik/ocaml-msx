@@ -92,3 +92,8 @@
  (name state_fdc_test)
  (modules state_fdc_test)
  (libraries msx))
+
+(test
+ (name vdp_reg_test)
+ (modules vdp_reg_test)
+ (libraries vdpcore))
