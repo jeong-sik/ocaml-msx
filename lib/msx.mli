@@ -39,8 +39,8 @@ type t
 (** MegaROM cartridge mapper. [Flat] is a plain 16/32KB cart; the others bank
     8KB/16KB windows the way the named hardware does (openMSX RomKonami /
     RomKonamiSCC / RomAscii8 / RomAscii16 / RomGeneric8kB / RomGeneric16kB,
-    and RomAscii8_8 / RomAscii16_2 for the carts with battery RAM). SCC sound
-    is not modelled. *)
+    RomAscii8_8 / RomAscii16_2 for the carts with battery RAM, RomRType and
+    RomHarryFox). SCC sound is not modelled. *)
 
 (** ASCII8 carts with battery RAM, by openMSX database name. A bank value
     with the SRAM bit set (the ROM's block count; 0x80 for Wizardry) shows
@@ -70,6 +70,12 @@ type cart_mapper =
   | Ascii16_sram of ascii16_sram
   | Generic8
   | Generic16
+  | R_type
+      (** R-Type: block 0x17 fixed at 0x4000; a write to 0x4000-0x7FFF picks
+          the block at 0x8000 *)
+  | Harry_fox
+      (** Harry Fox Yuki no Maoh: bit 0 of a write to 0x6xxx picks block 0 or
+          2 for 0x4000, to 0x7xxx block 1 or 3 for 0x8000 *)
 
 val create : machine:machine -> t
 
