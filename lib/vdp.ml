@@ -160,10 +160,36 @@ let pixels_per_byte t = (bitmap_layout t).pixels_per_byte
 let reg16 t lo hi = ((t.regs.(hi) land 1) lsl 8) lor t.regs.(lo)
 let reg_y t lo hi = ((t.regs.(hi) land 3) lsl 8) lor t.regs.(lo)
 
+(* R#8 VR (bit 3) tells the VDP how its DRAM is wired. With VR = 1 (64K
+   chips) every address reaches the 128K; with VR = 0 (16K chips) the VDP
+   drives only 15 address bits, so each access lands in 0x0000-0x7FFF
+   (openMSX VDPVRAM::setSizeMask). R#8 is 0 at power-on. *)
+let vr_bit = 0x08
+let vr0_space = 0x7fff
+let vram_space = 0x1ffff
+let address_mask t = if t.regs.(8) land vr_bit <> 0 then vram_space else vr0_space
+
+(* The 128K that VR = 1 addresses and the 32K that VR = 0 addresses are the
+   same cells wired differently: VR = 0 address x is the cell VR = 1 calls
+   [vr0_cell x] (bit 0 set, bits 0-6 moved up one, bits 6-14 moved up two).
+   When VR changes, openMSX VDPVRAM::updateVRMode carries the contents over
+   with this run of swaps, so what was written under one wiring is found
+   under the other where the DRAM holds it. *)
+let vr0_cell x = 1 lor ((x land 0x7f) lsl 1) lor ((x land 0x7fc0) lsl 2)
+
+let swap_cells t i j =
+  let c = Bytes.get t.vram i in
+  Bytes.set t.vram i (Bytes.get t.vram j);
+  Bytes.set t.vram j c
+
+let rewire_vram t ~vr =
+  if vr then for x = vr0_space downto 0 do swap_cells t x (vr0_cell x) done
+  else for x = 0 to vr0_space do swap_cells t x (vr0_cell x) done
+
 let physical_addr t a =
-  let a = a land 0x1ffff in
-  if (bitmap_layout t).planar then ((a land 1) lsl 16) lor (a lsr 1)
-  else a
+  let a = a land vram_space in
+  let a = if (bitmap_layout t).planar then ((a land 1) lsl 16) lor (a lsr 1) else a in
+  a land address_mask t
 
 let vram_addr t extended x y =
   let l = bitmap_layout t in
@@ -319,7 +345,9 @@ let start_command t =
   end
 
 let set_reg t r v =
+  let old = t.regs.(r) in
   t.regs.(r) <- v land 0xff;
+  if r = 8 && (old lxor v) land vr_bit <> 0 then rewire_vram t ~vr:(v land vr_bit <> 0);
   if r = 44 then begin
     if t.tx_active then transfer_byte t v else t.tx_pending <- true
   end
@@ -507,7 +535,7 @@ let mode_s5 t =
    공통 비트(GRAPHIC 4 는 bit3=0 이라 mode_s5 가 먼저 잡는다). *)
 let mode_bitmap_hi t = not (mode_text t) && t.regs.(0) land 0x08 <> 0
 
-let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
+let vram_read t addr = Char.code (Bytes.get t.vram (addr land vram_space))
 
 (* 스프라이트 모드 1 — SCREEN1-3. SAT = R#5<<7 (32엔트리 × 4바이트:
    Y, X, 패턴번호, 컬러), PT = R#6<<11. R#1 bit0 = MAG(2배), bit1 =
@@ -588,7 +616,7 @@ let frame_rgb t =
   in
   if blanked t then Bytes.to_string img
   else begin
-    let vr addr = Char.code (Bytes.get t.vram (addr land 0x1ffff)) in
+    let vr addr = Char.code (Bytes.get t.vram (addr land address_mask t)) in
     let r = t.regs in
     if mode_s5 t || mode_bitmap_hi t then begin
       let layout = bitmap_layout t in

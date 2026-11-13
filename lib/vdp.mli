@@ -74,7 +74,8 @@ val display_mode : t -> display_mode
 val display_mode_to_string : display_mode -> string
 
 val vram_read : t -> int -> int
-(** VRAM 한 바이트 (주소는 17비트로 감싼다) — 관측자용. *)
+(** VRAM 셀 한 바이트 (주소는 17비트로 감싼다) — 관측자용. R#8 VR=0 의
+    주소 마스크와 G6/G7 평면 배치를 거치지 않은 물리 셀이다. *)
 
 (** Internal state codec; read only into a fresh unpublished VDP.
     Debug write history and global diagnostic counters are not execution state. *)
