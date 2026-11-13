@@ -77,7 +77,7 @@ let () =
         "  실 디스크 ROM 코드를 cart 에 (DISK_ROM env 로 경로, 기본 cbios_disk)" );
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
-        "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
+        "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc|koei|generic8|generic16" );
       ( "--tap-key",
         Arg.String (fun spec -> tap_key_spec := spec),
         "F:KEY[,F:KEY..]  해당 프레임에 키 탭 (space/return/up/.../shift/a)" );
@@ -110,6 +110,8 @@ let () =
       | "konami" -> Some Msx.Konami
       | "konami-scc" -> Some Msx.Konami_scc
       | "koei" -> Some Msx.Ascii8_sram
+      | "generic8" -> Some Msx.Generic8
+      | "generic16" -> Some Msx.Generic16
       | "" -> None
       | other -> Printf.ksprintf failwith "unknown --cart-mapper %s" other
     in

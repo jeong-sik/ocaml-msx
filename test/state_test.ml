@@ -138,6 +138,17 @@ let () =
   check "Koei SRAM content and selected bank restored" (Msx.mem_read copy 0x8000 = 0x5a);
   Msx.mem_write copy 0x8000 0x33;
   check "SRAM does not alias original" (Msx.mem_read t 0x8000 = 0x5a);
+  (* The two generic mappers keep their own state codes. *)
+  List.iter
+    (fun mapper ->
+      let t = fresh () in
+      Msx.load_cartridge ~mapper t (String.init 0x20000 (fun i -> Char.chr (i lsr 13)));
+      Msx.port_out t 0xa8 0xe8;
+      Msx.mem_write t 0x8000 3;
+      let copy = restored t in
+      check "generic mapper restored" (Msx.cart_mapper copy = mapper);
+      check "generic bank restored" (Msx.mem_read copy 0x8000 = Msx.mem_read t 0x8000))
+    [ Msx.Generic8; Msx.Generic16 ];
   let t = fresh () in
   Msx.load_disk ~interface_rom:false t (String.init 737280 (fun i -> Char.chr (i land 255)));
   same "mounted disk bytes restored" t (restored t);
