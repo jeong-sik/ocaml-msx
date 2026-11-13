@@ -713,10 +713,15 @@ let rtc_write_reg m v =
     let bank = m.rtc_mode land 3 in
     m.rtc_regs.((bank * 13) + r) <- (v land 0x0f) land rtc_masks.(bank).(r)
 
+(* The RP5C01 drives only the low four data lines, so a read of port 0xB5
+   shows the register in the low nibble and 1s above it (openMSX
+   MSXRTC::readIO ORs 0xF0). Port 0xB4 is write-only: the machine maps only
+   0xB5 for input, so a read of 0xB4 finds no device and gets 0xFF. *)
+let rtc_data_high = 0xf0
+
 let port_read m port =
   match port land 0xff with
-  | 0xB4 -> m.rtc_reg land 0x0f
-  | 0xB5 -> rtc_read_reg m
+  | 0xB5 -> rtc_read_reg m lor rtc_data_high
   | 0xD0 | 0xD1 | 0xD2 | 0xD3 -> fdc_read m port
   | 0x98 -> Vdp.io_read m.vdp ~port:0x98
   | 0x99 -> Vdp.io_read m.vdp ~port:0x99
