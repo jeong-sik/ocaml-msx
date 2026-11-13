@@ -88,9 +88,10 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    [Generic16] (openMSX RomGeneric8kB / RomGeneric16kB, the database's "8kB"
    or "GenericKonami" and "16kB") take a bank from a write anywhere in the
    window it selects. [Ascii8_sram] and [Ascii16_sram] add battery RAM to the
-   ASCII mappers (openMSX RomAscii8_8 / RomAscii16_2). [R_type] and
-   [Harry_fox] are the 16KB mappers of those games (openMSX RomRType /
-   RomHarryFox). *)
+   ASCII mappers (openMSX RomAscii8_8 / RomAscii16_2). [R_type],
+   [Harry_fox], [Cross_blaim], [Wonder_kid] and [Super_lode_runner] are the
+   16KB mappers of those games (openMSX RomRType / RomHarryFox /
+   RomCrossBlaim / RomWonderKid / RomSuperLodeRunner). *)
 
 (* The ASCII8 carts with battery RAM, by the openMSX database name. A bank
    value with the SRAM bit set shows the SRAM instead of ROM. *)
@@ -118,6 +119,9 @@ type cart_mapper =
   | Generic16
   | R_type
   | Harry_fox
+  | Cross_blaim
+  | Wonder_kid
+  | Super_lode_runner
 
 (* WD279x 근사 상태. 즉시-완료 모델: 명령을 받으면 상태 읽기 한 번 안에
    seek/read 준비를 끝낸다 — 실기 타이밍의 근사이고, 로더가 상태 비트를
@@ -228,7 +232,8 @@ let rom_or_empty = function "" -> Bytes.make 0x4000 '\000' | s -> Bytes.of_strin
    Rom8kBBlocks / Rom16kBBlocks). load_cartridge pads the image with 0xFF
    to whole blocks, as RomBlocks does. *)
 let cart_block_size = function
-  | Ascii16 | Ascii16_sram _ | Generic16 | R_type | Harry_fox -> 0x4000
+  | Ascii16 | Ascii16_sram _ | Generic16 | R_type | Harry_fox | Cross_blaim | Wonder_kid
+  | Super_lode_runner -> 0x4000
   | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram _ | Generic8 -> 0x2000
 
 (* What a block number past the end of the ROM wraps with: openMSX
@@ -238,33 +243,72 @@ let cart_block_size = function
 let konami_block_mask = 31
 let unmapped_read = 0xff
 
-(* The ROM byte at [off] (0..0x1FFF) of window [w] (0..3, one per 8KB of
-   0x4000-0xBFFF). A 16KB mapper shows one bank across two windows. *)
-let cart_rom_read m w off =
+(* The byte at [within] of block [bank], the block wrapped as above. *)
+let cart_block_read m bank within =
   let size = cart_block_size m.cart_mapper in
   let blocks = Bytes.length m.cart / size in
-  let bank, within =
-    match m.cart_mapper with
-    | Ascii16 | Ascii16_sram _ | Generic16 | R_type | Harry_fox ->
-      (m.cart_banks.(w lsr 1), ((w land 1) * 0x2000) + off)
-    | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram _ | Generic8 -> (m.cart_banks.(w), off)
-  in
   let mask =
     match m.cart_mapper with
     | Konami -> konami_block_mask
     | Flat | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram _ | Ascii16_sram _ | Generic8
-    | Generic16 | R_type | Harry_fox -> blocks - 1
+    | Generic16 | R_type | Harry_fox | Cross_blaim | Wonder_kid | Super_lode_runner ->
+      blocks - 1
   in
   let block = if bank < blocks then bank else bank land mask in
   if block < blocks then Char.code (Bytes.get m.cart ((block * size) + within))
   else unmapped_read
+
+(* Whether window [w] shows a block at all. Super Lode Runner leaves
+   0x4000-0x7FFF unmapped (openMSX RomSuperLodeRunner reset). *)
+let cart_window_mapped m w =
+  match m.cart_mapper with
+  | Super_lode_runner -> w >= 2
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram _ | Ascii16_sram _ | Generic8
+  | Generic16 | R_type | Harry_fox | Cross_blaim | Wonder_kid -> true
+
+(* The ROM byte at [off] (0..0x1FFF) of window [w] (0..3, one per 8KB of
+   0x4000-0xBFFF). A 16KB mapper shows one bank across two windows. *)
+let cart_rom_read m w off =
+  if not (cart_window_mapped m w) then unmapped_read
+  else
+    match m.cart_mapper with
+    | Ascii16 | Ascii16_sram _ | Generic16 | R_type | Harry_fox | Cross_blaim | Wonder_kid
+    | Super_lode_runner ->
+      cart_block_read m m.cart_banks.(w lsr 1) (((w land 1) * 0x2000) + off)
+    | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram _ | Generic8 ->
+      cart_block_read m m.cart_banks.(w) off
+
+(* Cross Blaim's modes 0 and 1 show block 1 at 0x8000 and mirror it into
+   pages 0 and 3 of the slot (openMSX RomCrossBlaim). *)
+let cross_blaim_mirrored_block = 1
+
+(* The block that page 0 or page 3 of the cart slot shows. The other
+   mappers leave both pages unmapped; Wonder Kid shows block 0 at 0x0000
+   (openMSX RomWonderKid). *)
+let cart_outer_block m page =
+  match m.cart_mapper with
+  | Cross_blaim ->
+    if m.cart_banks.(1) = cross_blaim_mirrored_block then Some cross_blaim_mirrored_block
+    else None
+  | Wonder_kid -> if page = 0 then Some 0 else None
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram _ | Ascii16_sram _ | Generic8
+  | Generic16 | R_type | Harry_fox | Super_lode_runner -> None
+
+(* Whether a write to page 0 or 3 of the cart slot reaches the mapper. Only
+   Cross Blaim decodes no address (openMSX RomCrossBlaim has no write cache
+   line); the others drop writes outside 0x4000-0xBFFF. *)
+let cart_outer_write_selects = function
+  | Cross_blaim -> true
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram _ | Ascii16_sram _ | Generic8
+  | Generic16 | R_type | Harry_fox | Wonder_kid | Super_lode_runner -> false
 
 (* Battery RAM size per cart, as openMSX sizes each SRAM sub-type. *)
 let cart_sram_size = function
   | Ascii8_sram Ascii8_2kb | Ascii16_sram Ascii16_2kb -> 0x800
   | Ascii8_sram (Ascii8_8kb | Wizardry) | Ascii16_sram Ascii16_8kb -> 0x2000
   | Ascii8_sram Koei -> 0x8000
-  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Generic8 | Generic16 | R_type | Harry_fox -> 0
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Generic8 | Generic16 | R_type | Harry_fox
+  | Cross_blaim | Wonder_kid | Super_lode_runner -> 0
 
 (* openMSX Ram::clear: an SRAM with no saved file reads 0xFF. *)
 let sram_blank = '\xff'
@@ -293,7 +337,8 @@ let cart_sram_offset m w off =
   | Ascii16_sram _ ->
     if m.cart_banks.(w lsr 1) <> ascii16_sram_select then None
     else Some ((((w land 1) * 0x2000) + off) land (size - 1))
-  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Generic8 | Generic16 | R_type | Harry_fox ->
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Generic8 | Generic16 | R_type | Harry_fox
+  | Cross_blaim | Wonder_kid | Super_lode_runner ->
     None
 
 (* Whether a store into window [w] reaches the SRAM mapped there (openMSX
@@ -305,7 +350,8 @@ let cart_sram_writable m w =
   match m.cart_mapper with
   | Ascii8_sram Koei -> w <> 1
   | Ascii8_sram (Ascii8_2kb | Ascii8_8kb | Wizardry) | Ascii16_sram _ -> w >= 2
-  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Generic8 | Generic16 | R_type | Harry_fox ->
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Generic8 | Generic16 | R_type | Harry_fox
+  | Cross_blaim | Wonder_kid | Super_lode_runner ->
     false
 
 (* R-Type's 0x4000 page stays on block 0x17, the last of the 384KB ROM
@@ -357,6 +403,18 @@ let cart_bank_write m a v =
      | 0x6000 -> m.cart_banks.(0) <- 2 * (v land 1)
      | 0x7000 -> m.cart_banks.(1) <- (2 * (v land 1)) + 1
      | _ -> ())
+  | Cross_blaim ->
+    (* Any write in the slot switches: the low two bits pick block 1 (values
+       0 and 1), 2 or 3 for 0x8000 (openMSX RomCrossBlaim). *)
+    m.cart_banks.(1) <- max cross_blaim_mirrored_block (v land 3)
+  | Wonder_kid ->
+    (* A write to 0x8000-0xBFFF picks the block there; 0x4000 stays on
+       block 0 (openMSX RomWonderKid). *)
+    if a >= 0x8000 then m.cart_banks.(1) <- v
+  | Super_lode_runner ->
+    (* Writes to its own window do nothing; the cart switches on a write to
+       0x0000 in any slot ([mem_write]). *)
+    ()
 
 (* Guess a mapper from the ROM by looking at where its code writes bank
    registers ([ld (nn),a]). Only for ROMs over 32KB; smaller carts sit flat.
@@ -637,7 +695,13 @@ let mem_read m addr =
     | Some off -> Char.code (Bytes.get m.cart_sram off)
     | None -> cart_rom_read m w (a land 0x1fff)
   end
-  else begin
+  else
+    (* Pages 0 and 3 of the cart slot show a block only for the mappers that
+       put one there ([cart_outer_block]); otherwise the plain slot view. *)
+    match if slot = 2 && (page = 0 || page = 3) then cart_outer_block m page else None with
+    | Some b -> cart_block_read m b (a land 0x3fff)
+    | None ->
+  begin
     let off = a land 0x3fff in
     match slot with
     | 0 | 1 | 2 ->
@@ -719,8 +783,15 @@ let mem_read m addr =
         else 0xff
   end
 
+(* Super Lode Runner listens to the whole bus: a write to 0x0000, whichever
+   slot page 0 shows, picks the block at 0x8000 (openMSX RomSuperLodeRunner
+   globalWrite). The write still goes where it was headed. *)
+let super_lode_runner_select = 0x0000
+
 let mem_write m addr v =
   let a = addr land 0xffff in
+  if a = super_lode_runner_select && m.cart_mapper = Super_lode_runner then
+    m.cart_banks.(1) <- v land 0xff;
   let page = a lsr 14 in
   let slot =
     match page with
@@ -778,6 +849,8 @@ let mem_write m addr v =
       (* Otherwise a write into the cart window is a bank select, not a store. *)
       cart_bank_write m a (v land 0xff)
   end
+  else if slot = 2 && (page = 0 || page = 3) && cart_outer_write_selects m.cart_mapper then
+    cart_bank_write m a (v land 0xff)
   else if slot = 3 && slot3_sub m page = 2 then begin
     (* 슬롯3 의 쓰기 면은 정본 배치에서 서브2(RAM 매퍼)뿐 — sub ROM(서브0)
        과 디스크 인터페이스(서브3)는 ROM/버스라 쓰기가 무시된다. *)
@@ -961,7 +1034,7 @@ let load_cartridge ?mapper t rom =
     (match t.cart_mapper with
      | Flat -> Bytes.of_string rom
      | Konami | Konami_scc | Ascii8 | Ascii8_sram _ | Ascii16 | Ascii16_sram _ | Generic8
-     | Generic16 | R_type | Harry_fox ->
+     | Generic16 | R_type | Harry_fox | Cross_blaim | Wonder_kid | Super_lode_runner ->
        let size = cart_block_size t.cart_mapper in
        let len = String.length rom in
        let padded = Bytes.make ((len + size - 1) / size * size) '\xff' in
@@ -971,14 +1044,17 @@ let load_cartridge ?mapper t rom =
      and Generic 8kB show blocks 0-3 (bankSwitch(i, i - 2) / setRom(i,
      i - 2)), Generic 16kB and Harry Fox blocks 0 and 1, ASCII8 and ASCII16
      block 0 in every window (setRom(i, 0)), their SRAM variants too.
-     R-Type shows its fixed block at 0x4000 and block 0 at 0x8000. The block
-     at 0x4000 holds the "AB" header. *)
+     R-Type shows its fixed block at 0x4000 and block 0 at 0x8000. Cross
+     Blaim resets through a write of 0 (blocks 0 and 1), Wonder Kid shows
+     blocks 0 and 2, Super Lode Runner only block 0 at 0x8000. The block at
+     0x4000 holds the "AB" header (Super Lode Runner's sits at 0x8000). *)
   Array.blit
     (match t.cart_mapper with
      | Flat | Konami | Konami_scc | Generic8 -> [| 0; 1; 2; 3 |]
-     | Generic16 | Harry_fox -> [| 0; 1; 0; 0 |]
+     | Generic16 | Harry_fox | Cross_blaim -> [| 0; 1; 0; 0 |]
+     | Wonder_kid -> [| 0; 2; 0; 0 |]
      | R_type -> [| r_type_fixed_block; 0; 0; 0 |]
-     | Ascii8 | Ascii8_sram _ | Ascii16 | Ascii16_sram _ -> [| 0; 0; 0; 0 |])
+     | Ascii8 | Ascii8_sram _ | Ascii16 | Ascii16_sram _ | Super_lode_runner -> [| 0; 0; 0; 0 |])
     0 t.cart_banks 0 4;
   t.cart_sram <- Bytes.make (cart_sram_size t.cart_mapper) sram_blank;
   t.cart_sram_bit <-
@@ -987,7 +1063,7 @@ let load_cartridge ?mapper t rom =
      | Ascii8_sram (Ascii8_2kb | Ascii8_8kb | Koei) ->
        Bytes.length t.cart / cart_block_size t.cart_mapper
      | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii16_sram _ | Generic8 | Generic16
-     | R_type | Harry_fox -> 0);
+     | R_type | Harry_fox | Cross_blaim | Wonder_kid | Super_lode_runner -> 0);
   (* mem_read 은 카트리지를 슬롯2 페이지0·1 에 둔다. 페이지0 을 슬롯2 로
      돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
@@ -2208,13 +2284,15 @@ let mapper_code = function
   | Ascii8_sram Ascii8_2kb -> 8 | Ascii8_sram Ascii8_8kb -> 9 | Ascii8_sram Wizardry -> 10
   | Ascii16_sram Ascii16_2kb -> 11 | Ascii16_sram Ascii16_8kb -> 12
   | R_type -> 13 | Harry_fox -> 14
-let last_mapper_code = 14
+  | Cross_blaim -> 15 | Wonder_kid -> 16 | Super_lode_runner -> 17
+let last_mapper_code = 17
 let mapper_of_code = function
   | 0 -> Flat | 1 -> Konami | 2 -> Konami_scc | 3 -> Ascii8 | 4 -> Ascii16
   | 5 -> Ascii8_sram Koei | 6 -> Generic8 | 7 -> Generic16
   | 8 -> Ascii8_sram Ascii8_2kb | 9 -> Ascii8_sram Ascii8_8kb | 10 -> Ascii8_sram Wizardry
   | 11 -> Ascii16_sram Ascii16_2kb | 12 -> Ascii16_sram Ascii16_8kb
   | 13 -> R_type | 14 -> Harry_fox
+  | 15 -> Cross_blaim | 16 -> Wonder_kid | 17 -> Super_lode_runner
   | _ -> State_codec.fail "invalid cartridge mapper"
 
 let serialize t =

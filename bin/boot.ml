@@ -78,7 +78,8 @@ let () =
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
         "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc|generic8|generic16|\
-         ascii8sram2|ascii8sram8|koeisram32|wizardry|ascii16sram2|ascii16sram8|r-type|harryfox" );
+         ascii8sram2|ascii8sram8|koeisram32|wizardry|ascii16sram2|ascii16sram8|r-type|harryfox|\
+         crossblaim|wonderkid|superloderunner" );
       ( "--tap-key",
         Arg.String (fun spec -> tap_key_spec := spec),
         "F:KEY[,F:KEY..]  해당 프레임에 키 탭 (space/return/up/.../shift/a)" );
@@ -120,6 +121,9 @@ let () =
       | "generic16" -> Some Msx.Generic16
       | "r-type" -> Some Msx.R_type
       | "harryfox" -> Some Msx.Harry_fox
+      | "crossblaim" -> Some Msx.Cross_blaim
+      | "wonderkid" -> Some Msx.Wonder_kid
+      | "superloderunner" -> Some Msx.Super_lode_runner
       | "" -> None
       | other -> Printf.ksprintf failwith "unknown --cart-mapper %s" other
     in
