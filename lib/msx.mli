@@ -76,6 +76,16 @@ type cart_mapper =
   | Harry_fox
       (** Harry Fox Yuki no Maoh: bit 0 of a write to 0x6xxx picks block 0 or
           2 for 0x4000, to 0x7xxx block 1 or 3 for 0x8000 *)
+  | Cross_blaim
+      (** Cross Blaim: any write in the slot picks block 1, 2 or 3 for 0x8000
+          with its low two bits (0 and 1 both give 1); block 0 stays at
+          0x4000, and block 1 also shows in pages 0 and 3 while selected *)
+  | Wonder_kid
+      (** Wonder Kid: a write to 0x8000-0xBFFF picks the block there; block 0
+          shows at 0x0000 and 0x4000, nothing at 0xC000 *)
+  | Super_lode_runner
+      (** Super Lode Runner: only 0x8000-0xBFFF holds ROM, and a write to
+          0x0000 in any slot picks its block *)
 
 val create : machine:machine -> t
 

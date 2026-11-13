@@ -331,6 +331,71 @@ let harry_fox () =
   Msx.mem_write t 0x8000 1;
   check "harry fox ignores other writes" (win t 0x4000 = 0 && win t 0x8000 = 2)
 
+(* Slot 2 in all four pages: PPI port A = 0b10101010. *)
+let cart_everywhere t = Msx.port_out t 0xA8 0xAA
+
+(* openMSX RomCrossBlaim: any write in the slot switches, wherever it lands.
+   Values 0 and 1 show block 1 at 0x8000 and mirror it into pages 0 and 3;
+   2 and 3 show blocks 2 and 3 and leave pages 0 and 3 unmapped. Block 0
+   stays at 0x4000. The ROM has 4 blocks. *)
+let cross_blaim () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Cross_blaim t (synth 8);
+  cart_everywhere t;
+  check "cross blaim starts at blocks 0 and 1" (win t 0x4000 = 0 && win t 0x8000 = 2);
+  check "cross blaim mirrors block 1 into pages 0 and 3"
+    (win t 0x0000 = 2 && win t 0x2000 = 3 && win t 0xc000 = 2 && win t 0xe000 = 3);
+  Msx.mem_write t 0x4045 2;
+  check "cross blaim 2 picks block 2" (win t 0x8000 = 4 && win t 0xa000 = 5);
+  check "cross blaim 2 unmaps pages 0 and 3" (win t 0x0000 = 0xff && win t 0xc000 = 0xff);
+  Msx.mem_write t 0xa123 7;
+  check "cross blaim keeps the low two bits" (win t 0x8000 = 6);
+  Msx.mem_write t 0x0000 0;
+  check "cross blaim page 0 write, 0 picks block 1" (win t 0x8000 = 2 && win t 0x0000 = 2);
+  Msx.mem_write t 0xc000 2;
+  check "cross blaim page 3 write selects" (win t 0x8000 = 4);
+  check "cross blaim 0x4000 stays block 0" (win t 0x4000 = 0 && win t 0x6000 = 1)
+
+(* openMSX RomWonderKid: block 0 at 0x0000 and 0x4000, a write to
+   0x8000-0xBFFF picks the block there (reset: block 2), nothing at 0xC000.
+   The ROM has 8 blocks, so block 9 wraps to 1. *)
+let wonder_kid () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Wonder_kid t (synth 16);
+  cart_everywhere t;
+  check "wonder kid starts at blocks 0 and 2" (win t 0x4000 = 0 && win t 0x8000 = 4);
+  check "wonder kid shows block 0 at 0x0000" (win t 0x2000 = 1);
+  check "wonder kid leaves 0xC000 unmapped" (win t 0xc000 = 0xff);
+  Msx.mem_write t 0x8000 5;
+  check "wonder kid 0x8000 picks block 5" (win t 0x8000 = 10 && win t 0xa000 = 11);
+  Msx.mem_write t 0xbfff 3;
+  check "wonder kid 0xBFFF picks block 3" (win t 0x8000 = 6);
+  Msx.mem_write t 0x4000 1;
+  Msx.mem_write t 0x7fff 1;
+  Msx.mem_write t 0xc000 1;
+  Msx.mem_write t 0x0000 1;
+  check "wonder kid ignores writes outside 0x8000-0xBFFF" (win t 0x8000 = 6 && win t 0x4000 = 0);
+  Msx.mem_write t 0x9000 9;
+  check "wonder kid block 9 of 8 wraps to 1" (win t 0x8000 = 2)
+
+(* openMSX RomSuperLodeRunner: ROM only at 0x8000-0xBFFF, block 0 at reset.
+   The cart switches on a write to 0x0000 whatever slot page 0 shows (here
+   slot 0), not on writes to its own window. *)
+let super_lode_runner () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Super_lode_runner t (synth 8);
+  show_cart t;
+  check "super lode runner 0x4000-0x7FFF unmapped" (win t 0x4000 = 0xff && win t 0x6000 = 0xff);
+  check "super lode runner starts at block 0" (win t 0x8000 = 0 && win t 0xa000 = 1);
+  Msx.mem_write t 0x8000 2;
+  Msx.mem_write t 0x4000 2;
+  Msx.mem_write t 0x0001 2;
+  check "super lode runner ignores other writes" (win t 0x8000 = 0);
+  Msx.mem_write t 0x0000 3;
+  check "super lode runner 0x0000 in slot 0 picks block 3" (win t 0x8000 = 6 && win t 0xa000 = 7);
+  cart_everywhere t;
+  check "super lode runner pages 0 and 3 unmapped" (win t 0x0000 = 0xff && win t 0xc000 = 0xff)
+
 (* openMSX RomGeneric8kB / RomGeneric16kB: a write anywhere in a window
    selects that window's bank; the banks start at 0-3 (8kB) and 0,1
    (16kB). *)
@@ -363,6 +428,9 @@ let generic () =
 let () =
   r_type ();
   harry_fox ();
+  cross_blaim ();
+  wonder_kid ();
+  super_lode_runner ();
   ascii8_sram ();
   ascii16_sram ();
   generic ();

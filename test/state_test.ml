@@ -149,19 +149,20 @@ let () =
       check "generic mapper restored" (Msx.cart_mapper copy = mapper);
       check "generic bank restored" (Msx.mem_read copy 0x8000 = Msx.mem_read t 0x8000))
     [ Msx.Generic8; Msx.Generic16 ];
-  (* So do R-Type and Harry Fox, with the block a 0x7000 write picked. *)
+  (* So do the other 16KB mappers, with the block a select write picked. *)
   List.iter
-    (fun mapper ->
+    (fun (mapper, select, value) ->
       let t = fresh () in
       Msx.load_cartridge ~mapper t (String.init 0x20000 (fun i -> Char.chr (i lsr 13)));
       Msx.port_out t 0xa8 0xe8;
       let before = Msx.mem_read t 0x8000 in
-      Msx.mem_write t 0x7000 1;
+      Msx.mem_write t select value;
       let copy = restored t in
       check "16KB mapper restored" (Msx.cart_mapper copy = mapper);
       check "16KB bank switched" (Msx.mem_read t 0x8000 <> before);
       check "16KB bank restored" (Msx.mem_read copy 0x8000 = Msx.mem_read t 0x8000))
-    [ Msx.R_type; Msx.Harry_fox ];
+    [ (Msx.R_type, 0x7000, 1); (Msx.Harry_fox, 0x7000, 1); (Msx.Cross_blaim, 0x7000, 2);
+      (Msx.Wonder_kid, 0x8000, 5); (Msx.Super_lode_runner, 0x0000, 3) ];
   (* Every cart with battery RAM keeps its mapper and its SRAM bytes. A 128KB
      ROM has 16 8KB blocks, so 0x10 is the ASCII8 SRAM bit; Wizardry's is 0x80
      and ASCII16 selects SRAM with the value 0x10. *)
