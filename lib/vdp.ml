@@ -127,11 +127,13 @@ let cycles_per_line = 228
 let ticks_per_cycle = 6
 let ticks_per_line = cycles_per_line * ticks_per_cycle
 
-(* This model's line starts at the right border, 1282 ticks after the sync
-   of openMSX's line in the bitmap modes. The command slots and the
-   power-on point count from it; R#18 horizontal adjust, which moves the
-   border, is not applied to them. *)
-let right_border_tick = 1282
+(* The tick of openMSX's line where this model's line starts. The right
+   border is 1282 ticks after the sync in the bitmap modes, but this clock
+   moves in whole CPU cycles of 6 ticks from power-on, which is tick 0 of
+   openMSX's line, so the line starts at 1284, the first cycle edge past
+   the border. The command slots and the power-on point count from it;
+   R#18 horizontal adjust, which moves the border, is not applied to them. *)
+let line_phase_tick = 1284
 let lines_per_frame t = if t.pal then 313 else 262
 let visible_lines t = if t.regs.(9) land 0x80 = 0 then 192 else 212
 
@@ -191,8 +193,9 @@ let move_line_count_reset t =
    HR (openMSX getHR) is 1 for 312 ticks after the right border, 404 in the
    text modes: 52 and 67.3 cycles.
    VR (openMSX readStatusReg case 2) drops one line before display start, at
-   tick 202 of the line above display line 0. That is 1368 - 1282 + 202 =
-   288 ticks, 48 cycles, into our last line. It rises with S#0 F at the
+   tick 202 of the line above display line 0. That is 1368 - 1284 + 202 =
+   286 ticks into our last line, so a read sees it from cycle 48 (tick
+   288). It rises with S#0 F at the
    display end, tick 202 of the line below the last display line (openMSX
    scheduleVScan, displayStart + lines * TICKS_PER_LINE): 48 cycles into
    our line [visible_lines]. *)
@@ -218,13 +221,13 @@ let grb_to_rgb v =
    flips EO out of statusReg2's 0x0C and schedules the counter reset. The
    frame start is placed as far above display line 0 as the reset and the
    top border reach (42 lines with R#9 and R#18 at 0), so the first frame
-   is as long as any other. Its tick 0 is 86 ticks into this model's line,
-   which begins at the right border. *)
+   is as long as any other. Its tick 0 is 84 ticks (14 cycles) into this
+   model's line. *)
 let power_on t =
   let delay = reset_delay t in
   t.frame_start <- lines_per_frame t - delay - lines_to_display t;
   t.line <- t.frame_start;
-  t.cycle_in_line <- (ticks_per_line - right_border_tick) / ticks_per_cycle;
+  t.cycle_in_line <- (ticks_per_line - line_phase_tick) / ticks_per_cycle;
   t.even_odd <- true;
   t.vertical <- Before_reset (t.frame_start + delay)
 
@@ -343,11 +346,11 @@ let horizontal_retrace t =
 
 (* Where a line's processing starts: 144 ticks after its sync, in the left
    erase (openMSX syncAtNextLine; R#18 moves it with the border, so it
-   stays put relative to the right border). This model's line starts at
-   the right border of the line above, 1282 ticks into it in the graphic
-   modes and 1254 in the text modes, so the point is 230 or 258 ticks in:
-   a write before tick 230 (cycle 38) is taken for this line, a later one
-   for the next. *)
+   stays put relative to the right border). In the graphic modes this
+   model's line starts 1284 ticks into the line above ([line_phase_tick]),
+   so the point is 228 ticks in, cycle 38 itself: a write up to cycle 38 is
+   taken for this line, a later one for the next. The text modes count from
+   their right border, 1254, which puts the point 258 ticks in. *)
 let line_start_cycle t = if text_timing t then 43 else 39
 
 let vertical_retrace t =
@@ -576,7 +579,7 @@ let slot_table t =
 (* The first slot at least [delta] ticks after [at] (ticks into this
    model's line; the answer may lie in a later line). *)
 let slot_after slots ~at ~delta =
-  let base = (at + right_border_tick) mod ticks_per_line in
+  let base = (at + line_phase_tick) mod ticks_per_line in
   let want = base + delta in
   let n = Array.length slots in
   let value k = slots.(k mod n) + ((k / n) * ticks_per_line) in

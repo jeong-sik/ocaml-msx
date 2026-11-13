@@ -6,8 +6,8 @@
    later by R#9 as it is at the reset (execLineCountReset). These checks
    drive the VDP through port 0x99 and advance only.
 
-   This model's line starts at the right border, openMSX tick 1282, and one
-   Z80 cycle is 6 VDP ticks. *)
+   This model's line starts at openMSX tick 1284, the first cycle edge past
+   the right border (1282), and one Z80 cycle is 6 VDP ticks. *)
 
 let failures = ref 0
 
