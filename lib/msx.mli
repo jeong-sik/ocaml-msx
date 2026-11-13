@@ -6,7 +6,8 @@
 
     Sound output remains unimplemented. Versioned save states include CPU,
     VDP, memory, mounted media, the WD2793 drive state (format v3,
-    ocaml-msx #46) and device state; file IO belongs to callers. *)
+    ocaml-msx #46), the i8255 PPI control word and latches (format v4) and
+    device state; file IO belongs to callers. *)
 
 type key =
   | Up

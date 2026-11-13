@@ -169,6 +169,62 @@ let () =
   check "second machine sees no keys" (row_read u 8 = 0xff);
   check "second machine PSG idle" (psg_read u 14 = 0x3f);
 
+  (* i8255 제어 포트 0xAB. 기대값의 정본: openMSX 21.0 I8255.cc
+     (writeControlPort·readPortA/B/C) 와 MSXPPI.cc (peekA = 0, 입력 C 니블 =
+     0xF). 머신은 BIOS 가 쓰는 모드 0x82 로 시작한다. *)
+  let p = machine () in
+  ignore (Msx.set_key p Space ~pressed:true);
+  check "starts in mode 0x82" (Msx.port_in p 0xAB = 0x82);
+  check "mode 0x82: port B is the keyboard" (row_read p 8 = 0xfe);
+  (* 모드 0x80: 포트 B 도 출력 — 키보드 대신 래치(전원 투입 0)를 읽는다.
+     Hole In One Special 이 이 모드를 쓰고 행 8 을 0x00 으로 읽는다. *)
+  Msx.port_out p 0xAB 0x80;
+  check "mode 0x80: port B reads its latch, not the keys" (row_read p 8 = 0x00);
+  Msx.port_out p 0xA9 0x5a;
+  check "mode 0x80: a port B write is read back" (Msx.port_in p 0xA9 = 0x5a);
+  Msx.port_out p 0xAB 0x82;
+  check "back to 0x82: the keyboard again" (row_read p 8 = 0xfe);
+  (* 비트 set/reset: bit 0 이 값, bit 3-1 이 포트 C 비트 번호. *)
+  Msx.port_out p 0xAA 0x00;
+  Msx.port_out p 0xAB 0x0f;
+  check "set C bit 7" (Msx.port_in p 0xAA = 0x80);
+  Msx.port_out p 0xAB 0x07;
+  check "set C bit 3 selects row 8" (Msx.port_in p 0xAA = 0x88 && Msx.port_in p 0xA9 = 0xfe);
+  Msx.port_out p 0xAB 0x0e;
+  check "reset C bit 7" (Msx.port_in p 0xAA = 0x08);
+  (* 포트 C 하위가 입력(모드 0x83): 0xF 로 읽히고, 키보드 행은 마지막으로
+     내보낸 값(8)에 머문다. 그 사이 C 쓰기는 래치만 바꾼다. *)
+  Msx.port_out p 0xAB 0x83;
+  check "C low input reads 0xF" (Msx.port_in p 0xAA = 0x0f);
+  Msx.port_out p 0xAA 0x02;
+  check "C low input: the row stays 8" (Msx.port_in p 0xA9 = 0xfe);
+  Msx.port_out p 0xAB 0x82;
+  check "C low output again: the latch picks row 2" (Msx.port_in p 0xA9 = 0xff
+                                                    && Msx.port_in p 0xAA = 0x02);
+  (* 포트 A 가 입력(모드 0x92): 0 으로 읽히고, 쓰기는 래치에만 남아 슬롯이
+     그대로다. 다시 출력이 되면 래치가 슬롯을 고른다. *)
+  Msx.port_out p 0xA8 0xf0;
+  Msx.port_out p 0xAB 0x92;
+  check "A input reads 0" (Msx.port_in p 0xA8 = 0x00);
+  Msx.port_out p 0xA8 0x0f;
+  check "A input: the slots keep the last output" (Msx.ppi_a p = 0xf0);
+  Msx.port_out p 0xAB 0x82;
+  check "A output again: the latch drives the slots"
+    (Msx.ppi_a p = 0x0f && Msx.port_in p 0xA8 = 0x0f);
+  (* 모드 1·2 는 MSX 에 없다: openMSX 는 그 포트를 0xFF 로 읽는다. *)
+  Msx.port_out p 0xAB 0xa2;
+  check "group A mode 1 reads 0xFF" (Msx.port_in p 0xA8 = 0xff);
+  Msx.port_out p 0xAB 0x86;
+  check "group B mode 1 reads 0xFF" (Msx.port_in p 0xA9 = 0xff);
+  (* 세이브: 제어 워드와 B 래치가 살아남는다. *)
+  Msx.port_out p 0xAB 0x80;
+  Msx.port_out p 0xA9 0x3c;
+  (match Msx.restore ~state:(Msx.serialize p) with
+   | Error e -> check ("PPI state restores: " ^ e) false
+   | Ok q ->
+     check "restored control word" (Msx.port_in q 0xAB = 0x80);
+     check "restored port B latch" (Msx.port_in q 0xA9 = 0x3c));
+
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1
