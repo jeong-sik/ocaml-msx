@@ -86,6 +86,9 @@ type cart_mapper =
   | Super_lode_runner
       (** Super Lode Runner: only 0x8000-0xBFFF holds ROM, and a write to
           0x0000 in any slot picks its block *)
+  | Majutsushi
+      (** Hai no Majutsushi: banks as [Konami]; writes to 0x5000-0x5FFF feed
+          a DAC, which is not modelled *)
 
 val create : machine:machine -> t
 
