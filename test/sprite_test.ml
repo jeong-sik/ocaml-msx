@@ -63,8 +63,16 @@ let px t x y =
 
 let is_col t x y c = px t x y = Vdp.palette_rgb t c
 
-(* Run the VDP until display line [line] has been checked. *)
-let run_to_line t line = ignore (Vdp.advance t ~cycles:(228 * line))
+(* The sprite check of a line runs 14 cycles into it, at openMSX's line
+   edge (84 ticks into this model's line). *)
+let sprite_check_cycle = 14
+
+(* Run the VDP [line] lines on, then past that line's sprite check. *)
+let run_to_line t line =
+  ignore (Vdp.advance t ~cycles:(228 * line));
+  let _, cycle = Vdp.line_now t in
+  if cycle < sprite_check_cycle then
+    ignore (Vdp.advance t ~cycles:(sprite_check_cycle - cycle))
 
 (* Vdp.create is a frame start, 42 lines above display line 0 (openMSX
    VDP::reset calls frameStart); these checks count lines from display
@@ -264,6 +272,27 @@ let () =
   check "SPD: sprite hidden" (is_col t 50 101 0);
   run_to_line t 110;
   check "SPD: no collision" (Vdp.status0 t land 0x20 = 0)
+
+let () =
+  (* 14. 한 줄의 스프라이트 판정은 그 줄 14사이클째(openMSX 줄 경계)에 한다.
+     1942(실 BIOS)는 SAT 를 한 바이트씩 고치다 그 사이에 판정이 끼면 옛
+     자리와 새 자리가 겹친다 — 판정 전에 고친 바이트는 판정에 든다. *)
+  let overlap_then_move ~move_at =
+    let t = Vdp.create () in
+    to_display_start t;
+    screen1 t ();
+    pat8_w t 0 solid;
+    sat_w t 0 100 50 0 9;
+    sat_w t 1 103 54 0 10;
+    sat_w t 2 0xd0 0 0 0;
+    (* Display line 104 is the first where the two overlap. *)
+    ignore (Vdp.advance t ~cycles:((228 * 104) + move_at));
+    vram_w t sat 150;
+    ignore (Vdp.advance t ~cycles:(sprite_check_cycle + 6));
+    Vdp.status0 t land 0x20 <> 0
+  in
+  check "check time: a SAT write before cycle 14 counts" (not (overlap_then_move ~move_at:13));
+  check "check time: a SAT write after cycle 14 is too late" (overlap_then_move ~move_at:14)
 
 let () =
   if !failures > 0 then begin
