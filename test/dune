@@ -94,6 +94,11 @@
  (libraries msx))
 
 (test
+ (name fdc_write_test)
+ (modules fdc_write_test)
+ (libraries msx))
+
+(test
  (name core_purity_test)
  (modules core_purity_test)
  (deps
