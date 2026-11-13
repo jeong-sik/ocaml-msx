@@ -19,6 +19,13 @@
  (libraries state_codec))
 
 (library
+ (name fdccore)
+ (public_name ocaml-msx.fdccore)
+ (wrapped false)
+ (modules wd2793)
+ (libraries state_codec))
+
+(library
  (name msx)
  (public_name ocaml-msx.msx)
  (wrapped false)

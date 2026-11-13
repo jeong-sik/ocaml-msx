@@ -108,3 +108,8 @@
  (modules core_purity_test)
  (deps
   (glob_files %{project_root}/lib/*.ml)))
+
+(test
+ (name wd2793_test)
+ (modules wd2793_test)
+ (libraries fdccore state_codec))
