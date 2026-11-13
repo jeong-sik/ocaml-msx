@@ -147,3 +147,8 @@
  (name cmd_timing_test)
  (modules cmd_timing_test)
  (libraries vdpcore state_codec))
+
+(test
+ (name frame_phase_test)
+ (modules frame_phase_test)
+ (libraries vdpcore state_codec))

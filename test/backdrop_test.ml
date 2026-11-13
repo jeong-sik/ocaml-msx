@@ -43,8 +43,15 @@ let cyan = (0, 7, 7)
 let blue = (0, 0, 7)
 
 (* A VDP in the mode R#0/R#1 give, with the five palette colours above. *)
+(* Vdp.create is a frame start, 42 lines above display line 0 (openMSX
+   VDP::reset calls frameStart); these checks count lines from display
+   line 0. *)
+let to_display_start t =
+  while Vdp.line_now t <> (0, 0) do ignore (Vdp.advance t ~cycles:1) done
+
 let vdp ~r0 ~r1 ?(r7 = 0) ?(r8 = 0) () =
   let t = Vdp.create () in
+  to_display_start t;
   List.iteri (fun i c -> palette t i c) [ red; green; yellow; cyan; blue ];
   reg t 0 r0;
   reg t 1 r1;

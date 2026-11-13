@@ -14,7 +14,8 @@
     v9), the VDP R#13 blink state (format v10), the latched R#18 vertical
     adjust (format v11), the VDP mode, blank and sprite-disable bits waiting
     for the next line start (format v12), the progress of a running VDP
-    command (format v13) and device state; file IO
+    command (format v13), the VDP frame start and line counter reset
+    (format v14) and device state; file IO
     belongs to callers. *)
 
 type key =

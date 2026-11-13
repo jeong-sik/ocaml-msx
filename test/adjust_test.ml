@@ -52,8 +52,15 @@ let px t x y =
 (* SCREEN5 (or SCREEN7 for [r0] = 0x0A), page 0, border cyan, TP on.
    Line 0: dot 0 green, dot 1 yellow, dot 254 blue, dot 255 green. Line 1:
    dot 0 blue. Column 0 of lines 2-191 green. *)
+(* Vdp.create is a frame start, 42 lines above display line 0 (openMSX
+   VDP::reset calls frameStart); these checks count lines from display
+   line 0. *)
+let to_display_start t =
+  while Vdp.line_now t <> (0, 0) do ignore (Vdp.advance t ~cycles:1) done
+
 let screen ?(r0 = 0x06) r18 =
   let t = Vdp.create () in
+  to_display_start t;
   List.iteri (fun i c -> palette t i c)
     [ (7, 0, 0); (0, 7, 0); (7, 7, 0); (0, 7, 7); (0, 0, 7) ];
   List.iter (fun (r, v) -> reg t r v)
@@ -128,13 +135,16 @@ let () =
   check "and then moves the display" (px t 0 0 = cyan);
 
   (* The reset sits 27 lines above display line 0 in a 60 Hz, 192-line
-     frame (openMSX execLineCountReset), 8 lines after the frame start: a
-     write at line 230 of 262 is between the two and still counts. *)
+     frame (openMSX execLineCountReset), 8 + 7 lines after the frame start
+     at line 220: a write at line 230 is between the two and still counts.
+     It moves the reset, and with it display line 0, one line later
+     (openMSX master scheduleLineCountReset), so VBlank comes a line
+     later too. *)
   let t = screen 0x00 in
   first_frame t;
   lines t 18;
   reg t 18 0xf0;
-  lines t (262 - 230 + 192);
+  lines t (262 - 230 + 1 + 192);
   check "a write between frame start and the reset is taken" (px t 0 0 = cyan);
 
   (* Horizontal changes take effect per line: a write before line 100 is

@@ -17,8 +17,15 @@ let raw t a = Vdp.vram_read t a
    cycles to the first one, so its line count stays. *)
 let line_start = 39
 let settle t = ignore (Vdp.advance t ~cycles:228)
+(* Vdp.create is a frame start, 42 lines above display line 0 (openMSX
+   VDP::reset calls frameStart); these checks count lines from display
+   line 0. *)
+let to_display_start t =
+  while Vdp.line_now t <> (0, 0) do ignore (Vdp.advance t ~cycles:1) done
+
 let fresh mode =
   let t = Vdp.create () in
+  to_display_start t;
   reg t 0 mode; reg t 1 0x40; reg t 2 0x1f;
   ignore (Vdp.advance t ~cycles:line_start);
   t

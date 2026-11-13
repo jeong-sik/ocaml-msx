@@ -66,9 +66,16 @@ let is_col t x y c = px t x y = Vdp.palette_rgb t c
 (* Run the VDP until display line [line] has been checked. *)
 let run_to_line t line = ignore (Vdp.advance t ~cycles:(228 * line))
 
+(* Vdp.create is a frame start, 42 lines above display line 0 (openMSX
+   VDP::reset calls frameStart); these checks count lines from display
+   line 0. *)
+let to_display_start t =
+  while Vdp.line_now t <> (0, 0) do ignore (Vdp.advance t ~cycles:1) done
+
 let () =
   (* 1. 8×8 단색: Y 값 다음 줄부터 그린다 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ();
   pat8_w t 0 solid;
   sat_w t 0 100 50 0 9;
@@ -82,6 +89,7 @@ let () =
 let () =
   (* 2. Y=255 는 -1: 맨 윗줄부터 보인다 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ();
   pat8_w t 0 solid;
   sat_w t 0 0xff 10 0 9;
@@ -93,6 +101,7 @@ let () =
 let () =
   (* 3. SAT 0xD0 terminator: 그 엔트리부터 뒤는 없다 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ();
   pat8_w t 0 solid;
   pat8_w t 2 solid;
@@ -105,6 +114,7 @@ let () =
 let () =
   (* 4. 컬러 0 은 TP 가 꺼져 있으면 투명, 켜면 팔레트 0 으로 그린다 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ();
   set_reg t 3 0x80; (* G1 컬러 테이블 = 0x2000 *)
   vram_w t 0x2000 0xf4; (* 첫 칸: 배경 4 *)
@@ -119,6 +129,7 @@ let () =
   (* 5. 16×16: 패턴번호 하위 2비트는 버리고 번호×8 바이트에서 시작한다.
      오른쪽 반은 +16, 아래 반은 +8 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ~r1:0xe2 ();
   let base = pt + 4 * 8 in
   for i = 0 to 31 do vram_w t (base + i) 0x00 done;
@@ -138,6 +149,7 @@ let () =
 let () =
   (* 6. EC(컬러 bit7): X 를 32 도트 왼쪽으로 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ();
   pat8_w t 0 solid;
   sat_w t 0 100 50 0 (0x80 lor 9);
@@ -149,6 +161,7 @@ let () =
 let () =
   (* 7. MAG: 한 픽셀이 2×2 로 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ~r1:0xe1 ();
   pat8_w t 0 [ 0x80; 0x00; 0x00; 0x00; 0x00; 0x00; 0x00; 0x00 ];
   sat_w t 0 100 50 0 9;
@@ -162,6 +175,7 @@ let () =
 let () =
   (* 8. 우선순위: 번호가 낮은 쪽이 위 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ();
   pat8_w t 0 solid;
   pat8_w t 1 solid;
@@ -173,6 +187,7 @@ let () =
 let () =
   (* 9. 한 줄에 4개까지: 5번째는 그리지 않고 S#0 에 5S 와 번호 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ();
   pat8_w t 0 solid;
   for i = 0 to 4 do sat_w t i 100 (i * 20) 0 (9 + i) done;
@@ -192,6 +207,7 @@ let () =
 let () =
   (* 10. 5S 가 없으면 S#0 하위 5비트는 terminator 까지 훑은 수 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ();
   sat_w t 0 100 50 0 9;
   sat_w t 1 100 50 0 9;
@@ -203,6 +219,7 @@ let () =
 let () =
   (* 11. 충돌: 두 스프라이트가 겹치는 줄에서 C 와 좌표(+12, +8) *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ();
   pat8_w t 0 solid;
   sat_w t 0 100 50 0 9;
@@ -222,6 +239,7 @@ let () =
 let () =
   (* 12. 컬러 0 스프라이트는 TP 가 꺼져 있으면 충돌하지 않는다 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ();
   pat8_w t 0 solid;
   sat_w t 0 100 50 0 0;
@@ -236,6 +254,7 @@ let () =
 let () =
   (* 13. R#8 SPD 는 표시와 판정을 모두 끈다 *)
   let t = Vdp.create () in
+  to_display_start t;
   screen1 t ();
   pat8_w t 0 solid;
   sat_w t 0 100 50 0 9;
