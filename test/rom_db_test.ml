@@ -74,8 +74,8 @@ let () =
      check "skipped" (Rom_db.skipped db = 4);
      let is i want = check (Printf.sprintf "rom %d" i) (Rom_db.find db (rom i) = want) in
      is 1 (Some (Mapper Konami_scc));
-     is 2 (Some (Mapper Flat));
-     is 3 (Some (Mapper Flat));
+     is 2 (Some (Mapper (Plain (Mirrored Header))));
+     is 3 (Some (Mapper (Plain (Normal At_4000))));
      is 4 (Some (Mapper Konami));
      is 5 (Some (Not_emulated "R-Type"));
      is 6 (Some (Mapper Ascii8));
@@ -102,9 +102,12 @@ let () =
       ("KonamiSCC", Msx.Konami_scc); ("SCC", Msx.Konami_scc);
       ("KONAMI5", Msx.Konami_scc); ("2", Msx.Konami_scc);
       ("KoeiSRAM8", Msx.Ascii8_sram); ("KoeiSRAM32", Msx.Ascii8_sram);
-      ("Mirrored", Msx.Flat); ("MirroredC000", Msx.Flat); ("Normal8000", Msx.Flat);
-      ("page23", Msx.Flat); ("Page0123", Msx.Flat); ("64kB", Msx.Flat);
-      ("Plain", Msx.Flat); ("0xC000", Msx.Flat); ("ROMBAS", Msx.Flat) ];
+      ("Mirrored", Msx.Plain (Mirrored Header)); ("MirroredC000", Msx.Plain (Mirrored At_c000));
+      ("Normal", Msx.Plain (Normal Header)); ("Normal8000", Msx.Plain (Normal At_8000));
+      ("page2", Msx.Plain (Pages Page2)); ("page23", Msx.Plain (Pages Page23));
+      ("Page0123", Msx.Plain (Pages Page0123)); ("64kB", Msx.Plain (Mirrored Header));
+      ("Plain", Msx.Plain (Mirrored Header)); ("0xC000", Msx.Plain (Normal At_c000));
+      ("ROMBAS", Msx.Plain (Normal At_8000)) ];
   List.iter
     (fun name ->
       check ("not emulated " ^ name) (Rom_db.kind_of_name name = Rom_db.Not_emulated name))
@@ -114,7 +117,7 @@ let () =
     (fun m ->
       check ("name " ^ Rom_db.mapper_name m)
         (Rom_db.mapper_of_name (Rom_db.mapper_name m) = Some m))
-    [ Msx.Flat; Msx.Ascii8; Msx.Ascii16; Msx.Konami; Msx.Konami_scc; Msx.Ascii8_sram ];
+    Rom_db.all_mappers;
 
   if !failures > 0 then exit 1;
   print_endline "rom_db_test: all pass"

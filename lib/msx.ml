@@ -79,13 +79,34 @@ let key_target = function
 
 type machine = { ram_kb : int; vram_kb : int; roms : string list }
 
+(* Where a plain ROM starts: at the 16KB page its "AB" header points into
+   (openMSX RomPlain::guessLocation), or at a fixed address. *)
+type plain_start = Header | At_0000 | At_4000 | At_8000 | At_c000
+
+(* The 16KB pages openMSX RomPageNN fills, named as its ROM types are. *)
+type plain_pages =
+  | Page0 | Page1 | Page01 | Page2 | Page12 | Page012 | Page3 | Page23 | Page123
+  | Page0123
+
+(* How a plain ROM fills its slot. [Mirrored] places it from its start and
+   repeats it over the rest of the 64KB; [Normal] leaves the rest unmapped
+   (openMSX RomPlain). [Pages] fills the named pages, lowest first, with the
+   ROM's 8KB banks in order and leaves the other pages unmapped (openMSX
+   RomPageNN). An unmapped page reads 0xFF. *)
+type plain_layout = Mirrored of plain_start | Normal of plain_start | Pages of plain_pages
+
 (* MegaROM cartridge mappers. A cart larger than 32KB (or a 32KB one built for a
    mapper) can't sit flat in the 0x4000-0xBFFF window; it shows one of its
    segments per window and swaps them when the running code writes a bank
-   register. [Flat] is a plain ROM of up to 64KB with no banking. The four here are
-   the common ones (openMSX RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16);
-   the SCC sound chip is not modelled, only its banking. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
+   register. [Plain] is a ROM of up to 64KB with no banking, laid out as its
+   [plain_layout] says. The four here are the common ones (openMSX RomKonami /
+   RomKonamiSCC / RomAscii8 / RomAscii16); the SCC sound chip is not modelled,
+   only its banking. *)
+type cart_mapper = Plain of plain_layout | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
+
+let is_plain = function
+  | Plain _ -> true
+  | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram -> false
 
 (* WD279x 근사 상태. 즉시-완료 모델: 명령을 받으면 상태 읽기 한 번 안에
    seek/read 준비를 끝낸다 — 실기 타이밍의 근사이고, 로더가 상태 비트를
@@ -121,9 +142,10 @@ type t = {
   mutable logo_rom : Bytes.t;
   mutable sub_rom : Bytes.t;
   mutable cart : Bytes.t;
-  mutable cart_first_page : int;
-      (** 8KB page (0-7) where a [Flat] cart's first byte sits. Derived from
-      [cart] by [plain_rom_first_page]; [set_cart] keeps the two together. *)
+  mutable cart_pages : int option array;
+      (** For each 8KB page of the cart slot, the 8KB bank of a [Plain] cart
+      it shows, or [None] for an unmapped page. Derived from [cart] and
+      [cart_mapper] by [plain_banks]; [set_cart] keeps the three together. *)
   mutable cart_mapper : cart_mapper;
   cart_banks : int array;
       (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
@@ -201,14 +223,14 @@ let cart_seg8 m w =
   match m.cart_mapper with
   | Konami | Konami_scc | Ascii8 | Ascii8_sram -> m.cart_banks.(w)
   | Ascii16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
-  | Flat -> w
+  | Plain _ -> w
 
 (* A write into the cart window selects a bank. Each mapper decodes the target
    address differently; a write that hits no register is ignored (ROM is not
    RAM). Segment values are masked to the ROM size at read time. *)
 let cart_bank_write m a v =
   match m.cart_mapper with
-  | Flat -> ()
+  | Plain _ -> ()
   | Konami ->
     (* 0x4000-0x5FFF fixed to segment 0; the upper three windows select. *)
     (match a land 0xe000 with
@@ -242,11 +264,32 @@ let cart_bank_write m a v =
    0xB000 are Konami-SCC's alone, and 0x8000/0xA000 are Konami's alone. ASCII16
    owns no unique register, so it is the fallback when 0x6000/0x7000 are written
    with none of the above. Konami is the last-resort default. The guess can be
-   wrong; [load_cartridge ~mapper] overrides it. *)
+   wrong; [load_cartridge ~mapper] overrides it.
+
+   A plain ROM is [Mirrored Header], except a BASIC ROM (openMSX
+   RomFactory::guessRomType): at most 16KB with an "AB" header whose TEXT
+   points into 0x8000-0xBFFF and whose INIT is 0 or points at a RET there sits
+   in page 2 only. *)
+let basic_rom_max = 0x4000
+let opcode_ret = '\xc9'
+
+let guess_plain rom =
+  let len = String.length rom in
+  let word i = Char.code rom.[i] + (256 * Char.code rom.[i + 1]) in
+  let in_page2 addr = addr land 0xc000 = 0x8000 in
+  let header_end = 10 in
+  if len >= header_end && len <= basic_rom_max && rom.[0] = 'A' && rom.[1] = 'B' then
+    let init = word 2 and text = word 8 in
+    if in_page2 text && (init = 0 || (in_page2 init && rom.[init land (len - 1)] = opcode_ret))
+    then Pages Page2
+    else Mirrored Header
+  else Mirrored Header
+
 let guess_mapper rom =
   let len = String.length rom in
   let header_at_0 = len >= 2 && rom.[0] = 'A' && rom.[1] = 'B' in
-  if len < 0x10000 || (len = 0x10000 && not header_at_0) then Flat
+  if len < 0x10000 then Plain (guess_plain rom)
+  else if len = 0x10000 && not header_at_0 then Plain (Mirrored Header)
   else begin
     let a8 = ref 0 and scc = ref 0 and konami = ref 0 and a16 = ref 0 in
     for i = 0 to len - 3 do
@@ -459,19 +502,70 @@ let plain_rom_first_page rom =
   in
   base / 0x2000
 
-let set_cart m rom =
-  m.cart <- rom;
-  m.cart_first_page <- plain_rom_first_page rom
+let slot_pages = 8
+let bank_size = 0x2000
 
-(* The cart byte a plain ROM shows at CPU address [a] (openMSX RomPlain,
-   type Mirrored): the ROM's own 8KB pages from its first page on, and outside
-   them page (p - first) land (pages - 1), which mirrors a power-of-two ROM
-   over the whole 64KB. *)
-let plain_rom_offset m a =
-  let pages = max 1 (Bytes.length m.cart / 0x2000) in
-  let p = (a lsr 13) - m.cart_first_page in
-  let p = if p >= 0 && p < pages then p else p land (pages - 1) in
-  (p * 0x2000) + (a land 0x1fff)
+let first_page start rom =
+  match start with
+  | Header -> plain_rom_first_page rom
+  | At_0000 -> 0
+  | At_4000 -> 2
+  | At_8000 -> 4
+  | At_c000 -> 6
+
+(* openMSX RomPageNN's page masks, bit n for page n. openMSX 21.0 writes
+   Page01 as 0x0011, which maps page 0 only; this keeps the name's pages 0-1.
+   No softwaredb dump is Page01. *)
+let pages_mask = function
+  | Page0 -> 0b0001
+  | Page1 -> 0b0010
+  | Page01 -> 0b0011
+  | Page2 -> 0b0100
+  | Page12 -> 0b0110
+  | Page012 -> 0b0111
+  | Page3 -> 0b1000
+  | Page23 -> 0b1100
+  | Page123 -> 0b1110
+  | Page0123 -> 0b1111
+
+(* The 8KB bank each 8KB page of the slot shows. From a start page, the
+   ROM's banks in order, and outside them bank (p - first) land (banks - 1)
+   when mirrored, which repeats a power-of-two ROM over the 64KB (openMSX
+   RomPlain). Into a page mask, the banks in order, wrapped to the ROM like
+   openMSX RomBlocks::setRom. *)
+let plain_banks layout rom =
+  let banks = max 1 (Bytes.length rom / bank_size) in
+  let placed ~first ~mirrored =
+    Array.init slot_pages (fun p ->
+        let b = p - first in
+        if b >= 0 && b < banks then Some b
+        else if mirrored then Some (b land (banks - 1))
+        else None)
+  in
+  match layout with
+  | Mirrored start -> placed ~first:(first_page start rom) ~mirrored:true
+  | Normal start -> placed ~first:(first_page start rom) ~mirrored:false
+  | Pages pages ->
+    let mask = pages_mask pages in
+    let a = Array.make slot_pages None in
+    let next = ref 0 in
+    for p = 0 to slot_pages - 1 do
+      if mask land (1 lsl (p / 2)) <> 0 then begin
+        a.(p) <- Some (if !next < banks then !next else !next land (banks - 1));
+        incr next
+      end
+    done;
+    a
+
+let no_pages () = Array.make slot_pages None
+
+let set_cart m mapper rom =
+  m.cart <- rom;
+  m.cart_mapper <- mapper;
+  m.cart_pages <-
+    (match mapper with
+     | Plain layout -> plain_banks layout rom
+     | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram -> no_pages ())
 
 (* 0xFFFF 서브슬롯 레지스터의 페이지별 해석: 8비트가 4페이지 × 2비트로
    각 페이지가 볼 슬롯3 의 서브를 따로 고른다(bits0-1=page0 … bits6-7=page3).
@@ -546,7 +640,7 @@ let mem_read m addr =
        fdc_note m 0 0xd7 v;
        v)
   else if
-    a >= 0x4000 && a < 0xc000 && slot = 2 && m.cart_mapper <> Flat
+    a >= 0x4000 && a < 0xc000 && slot = 2 && not (is_plain m.cart_mapper)
     && Bytes.length m.cart > 0
   then begin
     (* MegaROM: 0x4000-0xBFFF is four 8KB windows, each showing the segment its
@@ -593,13 +687,15 @@ let mem_read m addr =
           (* 실ROM 부트의 디스크 인터페이스는 3-3 에만 있다. 카트리지 슬롯은
              실기처럼 비어 있다 — 전 페이지 빈 버스. *)
           (Bytes.make 0 '\000', 0)
-        | 2, _ when Bytes.length m.cart > 0 && m.cart_mapper = Flat ->
-          (m.cart, plain_rom_offset m a)
+        | 2, _ when Bytes.length m.cart > 0 && is_plain m.cart_mapper -> (
+          match m.cart_pages.(a lsr 13) with
+          | Some bank -> (m.cart, (bank * bank_size) + (a land (bank_size - 1)))
+          | None -> (Bytes.make 0 '\000', 0))
         | 2, _ when Bytes.length m.cart > 0 ->
           (* A MegaROM gets here only for addresses its mapper does not
              decode; they read as an empty bus (openMSX RomAscii8kB,
              RomAscii16kB and RomAscii8_8 leave 0x0000-0x3FFF and
-             0xC000-0xFFFF unmapped). The plain mirror is for [Flat] only. *)
+             0xC000-0xFFFF unmapped). The plain layouts are for [Plain] only. *)
           (Bytes.make 0 '\000', 0)
         | 2, 0 | 2, 1 ->
           (* 카트가 없는 C-BIOS 부트의 기존 폴백(main ROM 미러) — 그 부트가
@@ -689,7 +785,7 @@ let mem_write m addr v =
       | _ -> ()
     end
   else if
-    slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
+    slot = 2 && a >= 0x4000 && a < 0xc000 && not (is_plain m.cart_mapper)
   then begin
     let w = (a lsr 13) - 2 in
     if
@@ -839,8 +935,8 @@ let create ~machine =
       logo_rom = rom_or_empty logo;
       sub_rom = rom_or_empty sub;
       cart = Bytes.make 0 '\000';
-      cart_first_page = 0;
-      cart_mapper = Flat;
+      cart_pages = no_pages ();
+      cart_mapper = Plain (Mirrored Header);
       cart_banks = [| 0; 1; 2; 3 |];
       cart_sram = Bytes.make 0 '\000';
       cart_sram_bit = 0;
@@ -884,8 +980,7 @@ let palette_entries t = Array.init 16 (Vdp.palette_rgb t.vdp)
 let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
 
 let load_cartridge ?mapper t rom =
-  set_cart t (Bytes.of_string rom);
-  t.cart_mapper <- (match mapper with Some m -> m | None -> guess_mapper rom);
+  set_cart t (match mapper with Some m -> m | None -> guess_mapper rom) (Bytes.of_string rom);
   (* Reset the banks linear so a MegaROM boots: segment 0 at 0x4000 holds the
      "AB" header and INIT vector, and the running code sets the selectable banks
      before it relies on them. *)
@@ -1164,8 +1259,7 @@ let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
          FDC 레지스터 창(레거시 배선)에 스택(0x7FF8-0x7FFF)이 겹쳐 무한 루프
          한다(실측: 09-11, 0x02C0 프리미티브가 8만 회). HLE 트랩은 유지 — 부트
          섹터 로드와 BIOS 엔트리는 트랩이, 나머지는 실ROM 코드가 맡는다. *)
-     set_cart t real;
-     t.cart_mapper <- Flat;
+     set_cart t (Plain (Mirrored Header)) real;
      t.cart_banks.(0) <- 0;
      t.cart_banks.(1) <- 1;
      t.cart_banks.(2) <- 2;
@@ -1178,7 +1272,7 @@ let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
          맡는다 — FDC 모델이 그 프로토콜을 받는다. *)
      t.hle_disk <- false
    | None ->
-     if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ()))
+     if interface_rom then load_cartridge ~mapper:(Plain (Mirrored Header)) t (disk_rom_bytes ()))
 
 let disk_image t =
   if Bytes.length t.disk = 0 then None else Some (Bytes.to_string t.disk)
@@ -1215,8 +1309,7 @@ let boot_disk t =
        3-2 뷰의 문턱(>= 0x4000)과 같은 조건으로, 이미 올라온 ROM(interface_rom
        경로, 실ROM 하이브리드)은 그대로 둔다. *)
     if Bytes.length t.cart < 0x4000 then begin
-      set_cart t (Bytes.of_string (disk_rom_bytes ()));
-      t.cart_mapper <- Flat;
+      set_cart t (Plain (Mirrored Header)) (Bytes.of_string (disk_rom_bytes ()));
       t.cart_banks.(0) <- 0;
       t.cart_banks.(1) <- 1;
       t.cart_banks.(2) <- 2;
@@ -2118,10 +2211,34 @@ let frame_dims t = Vdp.frame_dims t.vdp
 
 let frame_rgb t = Vdp.frame_rgb t.vdp
 
+(* A plain ROM's layout goes in the mapper code. [Plain (Mirrored Header)]
+   keeps code 0, the plain cart's code before layouts, so an older state
+   restores as it was saved; the other layouts take 101-119. *)
 let mapper_code = function
-  | Flat -> 0 | Konami -> 1 | Konami_scc -> 2 | Ascii8 -> 3 | Ascii16 -> 4 | Ascii8_sram -> 5
+  | Plain (Mirrored Header) -> 0
+  | Konami -> 1 | Konami_scc -> 2 | Ascii8 -> 3 | Ascii16 -> 4 | Ascii8_sram -> 5
+  | Plain (Mirrored At_0000) -> 101 | Plain (Mirrored At_4000) -> 102
+  | Plain (Mirrored At_8000) -> 103 | Plain (Mirrored At_c000) -> 104
+  | Plain (Normal Header) -> 105 | Plain (Normal At_0000) -> 106
+  | Plain (Normal At_4000) -> 107 | Plain (Normal At_8000) -> 108
+  | Plain (Normal At_c000) -> 109
+  | Plain (Pages Page0) -> 110 | Plain (Pages Page1) -> 111 | Plain (Pages Page01) -> 112
+  | Plain (Pages Page2) -> 113 | Plain (Pages Page12) -> 114 | Plain (Pages Page012) -> 115
+  | Plain (Pages Page3) -> 116 | Plain (Pages Page23) -> 117 | Plain (Pages Page123) -> 118
+  | Plain (Pages Page0123) -> 119
+let last_mapper_code = 119
 let mapper_of_code = function
-  | 0 -> Flat | 1 -> Konami | 2 -> Konami_scc | 3 -> Ascii8 | 4 -> Ascii16 | 5 -> Ascii8_sram
+  | 0 -> Plain (Mirrored Header)
+  | 1 -> Konami | 2 -> Konami_scc | 3 -> Ascii8 | 4 -> Ascii16 | 5 -> Ascii8_sram
+  | 101 -> Plain (Mirrored At_0000) | 102 -> Plain (Mirrored At_4000)
+  | 103 -> Plain (Mirrored At_8000) | 104 -> Plain (Mirrored At_c000)
+  | 105 -> Plain (Normal Header) | 106 -> Plain (Normal At_0000)
+  | 107 -> Plain (Normal At_4000) | 108 -> Plain (Normal At_8000)
+  | 109 -> Plain (Normal At_c000)
+  | 110 -> Plain (Pages Page0) | 111 -> Plain (Pages Page1) | 112 -> Plain (Pages Page01)
+  | 113 -> Plain (Pages Page2) | 114 -> Plain (Pages Page12) | 115 -> Plain (Pages Page012)
+  | 116 -> Plain (Pages Page3) | 117 -> Plain (Pages Page23) | 118 -> Plain (Pages Page123)
+  | 119 -> Plain (Pages Page0123)
   | _ -> State_codec.fail "invalid cartridge mapper"
 
 let serialize t =
@@ -2193,13 +2310,13 @@ let restore_with_reader reader state =
     let t = create ~machine:{ram_kb = ram_size / 1024; vram_kb = 128;
         roms = List.map Bytes.to_string [main; logo; sub]} in
     Bytes.blit ram 0 t.ram 0 ram_size;
-    set_cart t (State_codec.get_bytes r);
+    let cart = State_codec.get_bytes r in
     t.cart_sram <- State_codec.get_bytes r;
     let sram_size = Bytes.length t.cart_sram in
     if sram_size <> 0 && (sram_size mod 8192 <> 0 || sram_size land (sram_size - 1) <> 0) then
       State_codec.fail "invalid cartridge SRAM size";
     t.disk <- State_codec.get_bytes r;
-    t.cart_mapper <- mapper_of_code (State_codec.get_int r ~min:0 ~max:5);
+    set_cart t (mapper_of_code (State_codec.get_int r ~min:0 ~max:last_mapper_code)) cart;
     State_codec.fill_int_array r ~min:0 ~max:255 t.cart_banks;
     State_codec.fill_int_array r ~min:0 ~max:63 t.mapper;
     State_codec.fill_int_array r ~min:0 ~max:255 t.psg;

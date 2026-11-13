@@ -34,12 +34,18 @@ val skipped : t -> int
 
 val kind_of_name : string -> kind
 (** A database type name, matched without regard to case as openMSX
-    RomInfo::nameToRomType does, aliases included. Every plain type
-    (Mirrored, Normal, Page...) is [Mapper Flat]: where a plain ROM sits
-    is {!Msx.load_cartridge}'s business. *)
+    RomInfo::nameToRomType does, aliases included. A plain type (Mirrored,
+    Normal, Page...) is [Mapper (Plain layout)] with openMSX's layout for it:
+    "Plain" and "64kB" are Mirrored, "0xNNNN" is NormalNNNN, "ROMBAS" is
+    Normal8000. *)
 
 val mapper_name : Msx.cart_mapper -> string
-(** The name [boot.exe --cart-mapper] takes for a mapper. *)
+(** The name [boot.exe --cart-mapper] takes for a mapper: "plain" for
+    [Plain (Mirrored Header)], openMSX's lowercased type name for another
+    plain layout. *)
+
+val all_mappers : Msx.cart_mapper list
+(** Every mapper this emulator has, each plain layout included. *)
 
 val mapper_of_name : string -> Msx.cart_mapper option
 (** The inverse of {!mapper_name}. *)
