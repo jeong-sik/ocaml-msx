@@ -565,6 +565,13 @@ let slots_sprites_on =
    last display line. *)
 let display_edge_cycle = vr_fall_cycle
 
+(* openMSX checks a line's sprites in one go when its frame clock passes
+   the end of that line (SpriteChecker::checkUntil, lines of 1368 ticks
+   from the frame start). That edge is tick 0 of openMSX's line, 84 ticks
+   into this model's line: S#0 5S/C and S#3-S#6 for the line below change
+   then, and a SAT write before it still counts. *)
+let sprite_check_cycle = (ticks_per_line - line_phase_tick) / ticks_per_cycle
+
 let display_area t =
   let visible = visible_lines t in
   if t.cycle_in_line < display_edge_cycle then t.line > 0 && t.line <= visible
@@ -1594,10 +1601,11 @@ let advance t ~cycles =
   while !remaining > 0 do
     let c = t.cycle_in_line in
     let start = line_start_cycle t in
-    (* The slot table holds between the line start, the display edge and
-       the line end. *)
+    (* The slot table holds between the sprite check, the line start, the
+       display edge and the line end. *)
     let until =
-      if c < start then start
+      if c < sprite_check_cycle then sprite_check_cycle
+      else if c < start then start
       else if c < display_edge_cycle then display_edge_cycle
       else cycles_per_line
     in
@@ -1606,6 +1614,8 @@ let advance t ~cycles =
     t.cycle_in_line <- c + step;
     remaining := !remaining - step;
     run_engine t slots ~ticks:(step * ticks_per_cycle);
+    if t.cycle_in_line = sprite_check_cycle && t.line < visible_lines t then
+      check_sprites t ~display_line:t.line;
     if t.cycle_in_line = start then take_deferred t;
     (* VScan (openMSX execVScan): the display ends at the display edge of
        the line below the last display line, compared against R#9 as it is
@@ -1640,7 +1650,6 @@ let advance t ~cycles =
          cannot see this point; S#0 F follows 48 cycles later. *)
       if t.line = visible_lines t then present t;
       next_vertical t;
-      if t.line < visible_lines t then check_sprites t ~display_line:t.line
     end
   done;
   !hit
