@@ -41,6 +41,10 @@ val halted : t -> bool
 val t_states : t -> int
 (** 생성 이후 누적 T-state. *)
 
+val charge : t -> int -> unit
+(** [charge z n] 은 CPU 대신 호스트가 돈 코드(가로챈 BIOS 호출)의 시간
+    [n] 을 [t_states] 에 더한다. 레지스터와 메모리는 건드리지 않는다. *)
+
 val dump_pc : t -> int
 (** 현재 PC. 하네스 판정용. *)
 
