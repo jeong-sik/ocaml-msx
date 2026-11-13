@@ -337,31 +337,95 @@ let set_fdc_trace on = fdc_trace := on
 let ppi_trace = ref false
 let set_ppi_trace on = ppi_trace := on
 
-(* The sector the track, side and sector registers name, on a 720KB image:
-   two sides, 9 sectors of 512 bytes per track, sectors numbered from 1. *)
-let fdc_sectors_per_track = 9
-let fdc_logical_sector f =
-  (((f.track * 2) + f.side) * fdc_sectors_per_track) + (f.sector - 1)
+(* How the image's sectors lie on the disk. The image is plain sector data
+   in logical order; the drive sees tracks, sides and sector numbers. *)
+type disk_geometry = { sides : int; sectors_per_track : int }
 
-(* Image offset of that sector, or None when the image has no such sector.
-   Sector 0 does not exist: without the check it gives offset -512, which
-   Bytes.blit rejects with an exception. Sector 10 does not exist either:
-   without the check it lands on sector 1 of the other side, and a
-   multi-sector write runs on across the whole image. *)
+let dd_sectors_per_track = 9
+let ds_dd_sectors = 1440 (* 720KB *)
+let ss_dd_sectors = 720 (* 360KB *)
+let media_8_sectors = 0x02 (* media byte bit 1: 8 sectors per track *)
+let media_lowest = 0xf8 (* media bytes run 0xF8-0xFF *)
+let bpb_sectors_per_track = 0x18
+let bpb_sides = 0x1a
+let jmp_near = 0xe9
+let jmp_short = 0xeb
+let media_two_sides = 0x01 (* media byte bit 0: two sides *)
+
+(* The geometry openMSX gives a .dsk image (SectorBasedDisk::detectGeometry
+   and Disk::detectGeometry):
+   - a 720KB image is two sides of 9 sectors, whatever its boot sector says;
+   - else a boot sector starting with a JMP (0xE9/0xEB) gives sectors per
+     track at 0x18 and sides at 0x1A (16-bit little endian), unless one of
+     them is 0 or above 255;
+   - else a FAT media byte (sector 1, byte 0) of 0xF8-0xFF gives 8 or 9
+     sectors (bit 1) and one or two sides (bit 0);
+   - else 9 sectors, and one side for a 360KB image, two for any other.
+   It is read from the current bytes on every access, so a restored machine
+   sees the geometry the saved one saw. openMSX reads it once per inserted
+   disk: the two differ only when software rewrites the boot sector or FAT
+   of an image that is not 720KB. *)
+let disk_geometry disk ~sector_size =
+  let sectors = Bytes.length disk / sector_size in
+  let byte i = Char.code (Bytes.get disk i) in
+  let word i = byte i lor (byte (i + 1) lsl 8) in
+  let fallback =
+    { sectors_per_track = dd_sectors_per_track;
+      sides = (if sectors = ss_dd_sectors then 1 else 2) }
+  in
+  let valid n = n >= 1 && n <= 255 in
+  if sectors = ds_dd_sectors then { sides = 2; sectors_per_track = dd_sectors_per_track }
+  else if sectors < 1 then fallback
+  else if byte 0 = jmp_near || byte 0 = jmp_short then begin
+    let sectors_per_track = word bpb_sectors_per_track and sides = word bpb_sides in
+    if valid sectors_per_track && valid sides then { sides; sectors_per_track }
+    else fallback
+  end
+  else if sectors < 2 then fallback
+  else begin
+    let media = byte sector_size in
+    if media >= media_lowest then
+      { sectors_per_track =
+          (if media land media_8_sectors <> 0 then 8 else dd_sectors_per_track);
+        sides = (if media land media_two_sides <> 0 then 2 else 1) }
+    else fallback
+  end
+
+(* The logical sector the track, side and sector registers name (openMSX
+   Disk::physToLog). Side 1 of a one-sided image counts on into the next
+   track, as openMSX does; software that reads such a disk by its media
+   byte never selects side 1. *)
+let fdc_logical_sector m =
+  let f = m.fdc in
+  let g = disk_geometry m.disk ~sector_size:(Bytes.length f.buf) in
+  (g.sectors_per_track * (f.side + (g.sides * f.track))) + (f.sector - 1)
+
+(* Image offset of that sector, or None when the disk has no such sector.
+   A track holds sectors 1 to sectors-per-track: sector 0 would give offset
+   -512, which Bytes.blit rejects with an exception, and the sector after
+   the last would land on the next side, letting a multi-sector write run
+   on across the whole image. openMSX builds a whole track from the image
+   and leaves it empty when any of its sectors is missing, so a track cut
+   short by the end of the image has no sectors at all. *)
 let fdc_sector_offset m =
   let f = m.fdc in
   let size = Bytes.length f.buf in
-  let off = fdc_logical_sector f * size in
-  if f.sector >= 1 && f.sector <= fdc_sectors_per_track
-     && off + size <= Bytes.length m.disk
-  then Some off
-  else None
+  if Bytes.length m.disk < size then None
+  else begin
+    let g = disk_geometry m.disk ~sector_size:size in
+    let logical = fdc_logical_sector m in
+    let last_on_track = logical + (g.sectors_per_track - f.sector) in
+    if f.sector >= 1 && f.sector <= g.sectors_per_track
+       && (last_on_track + 1) * size <= Bytes.length m.disk
+    then Some (logical * size)
+    else None
+  end
 
 let fdc_load_sector m =
   let f = m.fdc in
   if Bytes.length m.disk = 0 then f.drq <- false
   else begin
-    let logical = fdc_logical_sector f in
+    let logical = fdc_logical_sector m in
     match fdc_sector_offset m with
     | None ->
       if !fdc_trace then
