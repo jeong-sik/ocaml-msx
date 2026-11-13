@@ -697,6 +697,18 @@ let rtc_masks =
      Array.make 13 0xf;
      Array.make 13 0xf |]
 
+(* Power-on RTC registers. openMSX keeps the 52 nibbles in an SRAM that a
+   machine without a saved file starts filled with 0xFF (Ram::clear); the
+   RP5C01 then writes the time block and the leap-year counter (alarm
+   block register 11) from the host clock. This core reads no host clock:
+   the time stays zero, the alarm block and the two RAM blocks read 0xF.
+   C-BIOS leaves them so; a real MSX2 sub ROM rewrites them at boot. *)
+let rtc_block_size = 13
+let rtc_leap_year = rtc_block_size + 11
+let rtc_power_on () =
+  Array.init (4 * rtc_block_size) (fun i ->
+      if i < rtc_block_size || i = rtc_leap_year then 0 else 0x0f)
+
 let rtc_read_reg m =
   match m.rtc_reg land 0x0f with
   | 13 -> m.rtc_mode land 0x0f
@@ -810,7 +822,7 @@ let create ~machine =
       bdos_files = Hashtbl.create 4;
       frames = 0;
       rtc_reg = 0;
-      rtc_regs = Array.make 52 0;
+      rtc_regs = rtc_power_on ();
       rtc_mode = 0x8;
       con_esc = 0;
       rst30_pending = [];
