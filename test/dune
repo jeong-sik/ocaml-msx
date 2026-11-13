@@ -92,3 +92,8 @@
  (name state_fdc_test)
  (modules state_fdc_test)
  (libraries msx))
+
+(test
+ (name vdp_port_latch_test)
+ (modules vdp_port_latch_test)
+ (libraries msx))
