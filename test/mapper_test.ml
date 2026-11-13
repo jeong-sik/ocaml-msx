@@ -118,13 +118,13 @@ let detection () =
   check "scc from 0x5000/0x9000/0xB000"
     (Msx.guess_mapper (rom_with_writes [ 0x5000; 0x9000; 0xb000 ]) = Msx.Konami_scc);
   check "ascii8 from 0x6800/0x7800"
-    (Msx.guess_mapper (rom_with_writes [ 0x6800; 0x7800 ]) = Msx.Ascii8_sram);
+    (Msx.guess_mapper (rom_with_writes [ 0x6800; 0x7800 ]) = Msx.Ascii8_sram Koei);
   (* An ASCII8 game also writes 0x6000/0x7000 (two of its four registers), so a
      naive count reads it as ASCII16. The 0x6800/0x7800 writes must still win.
      This is the Deep Dungeon case. *)
   check "ascii8 wins over ascii16 when both register sets appear"
     (Msx.guess_mapper (rom_with_writes [ 0x6000; 0x6800; 0x7000; 0x7800; 0x6000; 0x7000 ])
-     = Msx.Ascii8_sram);
+     = Msx.Ascii8_sram Koei);
   check "ascii16 from 0x6000/0x7000"
     (Msx.guess_mapper (rom_with_writes [ 0x6000; 0x7000 ]) = Msx.Ascii16);
   (* a flat 32KB cart reads through the flat path, not a bank register *)
@@ -137,7 +137,7 @@ let detection () =
    window stays; a ROM bank still reads its segment. *)
 let koei_sram () =
   let t = machine () in
-  Msx.load_cartridge ~mapper:Msx.Ascii8_sram t (synth 32);
+  Msx.load_cartridge ~mapper:(Msx.Ascii8_sram Koei) t (synth 32);
   show_cart t;
   (* register 0x7000 selects window 2 (0x8000); a plain segment reads ROM *)
   Msx.mem_write t 0x7000 5;
@@ -146,7 +146,7 @@ let koei_sram () =
   Msx.mem_write t 0x7000 0x20;
   Msx.mem_write t 0x8000 0xab;
   check "koei sram store is read back" (win t 0x8000 = 0xab);
-  check "koei sram starts clear" (win t 0x8001 = 0);
+  check "koei sram starts blank (0xFF)" (win t 0x8001 = 0xff);
   (* back to a ROM bank shows ROM again; the SRAM keeps its byte *)
   Msx.mem_write t 0x7000 5;
   check "koei rom again after sram" (win t 0x8000 = 5);
@@ -193,23 +193,95 @@ let out_of_range () =
    so bank 8 selects SRAM. *)
 let koei_windows () =
   let t = machine () in
-  Msx.load_cartridge ~mapper:Msx.Ascii8_sram t (synth 32);
+  Msx.load_cartridge ~mapper:(Msx.Ascii8_sram Koei) t (synth 32);
   show_cart t;
   Msx.mem_write t 0x6000 0x20;
   Msx.mem_write t 0x4000 0xcd;
   check "koei window 0 stores into sram" (win t 0x4000 = 0xcd);
   Msx.mem_write t 0x6800 0x21;
-  check "koei window 1 reads sram page 1" (win t 0x6000 = 0);
+  check "koei window 1 reads sram page 1" (win t 0x6000 = 0xff);
   Msx.mem_write t 0x6800 0x20;
   check "koei window 1 reads sram page 0" (win t 0x6000 = 0xcd);
   let t = machine () in
-  Msx.load_cartridge ~mapper:Msx.Ascii8_sram t (synth 24);
+  Msx.load_cartridge ~mapper:(Msx.Ascii8_sram Koei) t (synth 24);
   show_cart t;
   Msx.mem_write t 0x7000 8;
   Msx.mem_write t 0x8000 0x5a;
   check "koei 24 segments: bank 8 has the sram bit" (win t 0x8000 = 0x5a);
   Msx.mem_write t 0x7000 7;
   check "koei 24 segments: bank 7 is rom" (win t 0x8000 = 7)
+
+(* openMSX RomAscii8_8 ASCII8_2 / ASCII8_8 / WIZARDRY (sramPages 0x30): any
+   window whose bank has the SRAM bit shows the SRAM, but only windows 2 and
+   3 (0x8000-0xBFFF) take stores. A 2KB SRAM repeats through the 8KB window.
+   16 segments make the SRAM bit 0x10; Wizardry's is 0x80 whatever the size. *)
+let ascii8_sram () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:(Msx.Ascii8_sram Ascii8_2kb) t (synth 16);
+  show_cart t;
+  Msx.mem_write t 0x7000 0x10;
+  check "ascii8sram2 starts blank" (win t 0x8000 = 0xff);
+  Msx.mem_write t 0x8000 0x5a;
+  check "ascii8sram2 window 2 stores" (win t 0x8000 = 0x5a);
+  check "ascii8sram2 repeats every 2KB" (win t 0x8800 = 0x5a && win t 0x9800 = 0x5a);
+  Msx.mem_write t 0x7800 0x13;
+  check "ascii8sram2 has one page" (win t 0xa000 = 0x5a);
+  Msx.mem_write t 0xa001 0x77;
+  check "ascii8sram2 window 3 stores" (win t 0x8001 = 0x77);
+  Msx.mem_write t 0x6000 0x10;
+  check "ascii8sram2 window 0 shows sram" (win t 0x4000 = 0x5a);
+  Msx.mem_write t 0x4000 0x11;
+  check "ascii8sram2 window 0 is read-only" (win t 0x4000 = 0x5a);
+  Msx.mem_write t 0x7000 3;
+  check "ascii8sram2 rom bank again" (win t 0x8000 = 3);
+  let t = machine () in
+  Msx.load_cartridge ~mapper:(Msx.Ascii8_sram Ascii8_8kb) t (synth 16);
+  show_cart t;
+  Msx.mem_write t 0x7000 0x10;
+  Msx.mem_write t 0x8000 0x11;
+  Msx.mem_write t 0x8800 0x22;
+  check "ascii8sram8 holds 8KB" (win t 0x8000 = 0x11 && win t 0x8800 = 0x22);
+  Msx.mem_write t 0x7800 0x17;
+  check "ascii8sram8 has one page" (win t 0xa800 = 0x22);
+  let t = machine () in
+  Msx.load_cartridge ~mapper:(Msx.Ascii8_sram Wizardry) t (synth 16);
+  show_cart t;
+  Msx.mem_write t 0x7000 0x10;
+  check "wizardry 0x10 is a rom bank" (win t 0x8000 = 0);
+  Msx.mem_write t 0x7000 0x80;
+  Msx.mem_write t 0x8000 0x42;
+  check "wizardry 0x80 selects sram" (win t 0x8000 = 0x42);
+  Msx.mem_write t 0x8800 0x43;
+  check "wizardry holds 8KB" (win t 0x8000 = 0x42 && win t 0x8800 = 0x43)
+
+(* openMSX RomAscii16_2: the bank value 0x10 maps the SRAM into a 16KB page,
+   repeated through it, even when the ROM has a block 16. The page at 0x8000
+   takes stores; the one at 0x4000 is read-only. *)
+let ascii16_sram () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:(Msx.Ascii16_sram Ascii16_2kb) t (synth 16);
+  show_cart t;
+  Msx.mem_write t 0x7000 0x10;
+  check "ascii16sram2 starts blank" (win t 0x8000 = 0xff);
+  Msx.mem_write t 0x8000 0x33;
+  check "ascii16sram2 page 2 stores" (win t 0x8000 = 0x33);
+  check "ascii16sram2 repeats every 2KB" (win t 0x8800 = 0x33 && win t 0xb800 = 0x33);
+  Msx.mem_write t 0x6000 0x10;
+  check "ascii16sram2 page 1 shows sram" (win t 0x4000 = 0x33);
+  Msx.mem_write t 0x4000 0x44;
+  check "ascii16sram2 page 1 is read-only" (win t 0x4000 = 0x33);
+  Msx.mem_write t 0x7000 2;
+  check "ascii16sram2 rom bank again" (win t 0x8000 = 4);
+  let t = machine () in
+  Msx.load_cartridge ~mapper:(Msx.Ascii16_sram Ascii16_8kb) t (synth 40);
+  show_cart t;
+  Msx.mem_write t 0x7000 0x10;
+  check "ascii16sram8: 0x10 is sram although block 16 exists" (win t 0x8000 = 0xff);
+  Msx.mem_write t 0x9fff 0x66;
+  check "ascii16sram8 holds 8KB"
+    (win t 0x9fff = 0x66 && win t 0xbfff = 0x66 && win t 0x8000 = 0xff);
+  Msx.mem_write t 0x7000 0x11;
+  check "ascii16sram8 0x11 is rom block 17" (win t 0x8000 = 34)
 
 (* openMSX RomGeneric8kB / RomGeneric16kB: a write anywhere in a window
    selects that window's bank; the banks start at 0-3 (8kB) and 0,1
@@ -241,6 +313,8 @@ let generic () =
   check "generic16 5 of 4 banks -> 1" (Msx.mem_write t 0x8000 5; win t 0x8000 = 2)
 
 let () =
+  ascii8_sram ();
+  ascii16_sram ();
   generic ();
   konami ();
   out_of_range ();

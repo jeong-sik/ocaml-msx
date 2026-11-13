@@ -77,7 +77,8 @@ let () =
         "  실 디스크 ROM 코드를 cart 에 (DISK_ROM env 로 경로, 기본 cbios_disk)" );
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
-        "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc|koei|generic8|generic16" );
+        "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc|generic8|generic16|\
+         ascii8sram2|ascii8sram8|koeisram32|wizardry|ascii16sram2|ascii16sram8" );
       ( "--tap-key",
         Arg.String (fun spec -> tap_key_spec := spec),
         "F:KEY[,F:KEY..]  해당 프레임에 키 탭 (space/return/up/.../shift/a)" );
@@ -109,7 +110,12 @@ let () =
       | "ascii16" -> Some Msx.Ascii16
       | "konami" -> Some Msx.Konami
       | "konami-scc" -> Some Msx.Konami_scc
-      | "koei" -> Some Msx.Ascii8_sram
+      | "ascii8sram2" -> Some (Msx.Ascii8_sram Ascii8_2kb)
+      | "ascii8sram8" -> Some (Msx.Ascii8_sram Ascii8_8kb)
+      | "koeisram32" -> Some (Msx.Ascii8_sram Koei)
+      | "wizardry" -> Some (Msx.Ascii8_sram Wizardry)
+      | "ascii16sram2" -> Some (Msx.Ascii16_sram Ascii16_2kb)
+      | "ascii16sram8" -> Some (Msx.Ascii16_sram Ascii16_8kb)
       | "generic8" -> Some Msx.Generic8
       | "generic16" -> Some Msx.Generic16
       | "" -> None

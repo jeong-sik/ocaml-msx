@@ -38,15 +38,36 @@ type t
 
 (** MegaROM cartridge mapper. [Flat] is a plain 16/32KB cart; the others bank
     8KB/16KB windows the way the named hardware does (openMSX RomKonami /
-    RomKonamiSCC / RomAscii8 / RomAscii16 / RomGeneric8kB / RomGeneric16kB).
-    SCC sound is not modelled. *)
+    RomKonamiSCC / RomAscii8 / RomAscii16 / RomGeneric8kB / RomGeneric16kB,
+    and RomAscii8_8 / RomAscii16_2 for the carts with battery RAM). SCC sound
+    is not modelled. *)
+
+(** ASCII8 carts with battery RAM, by openMSX database name. A bank value
+    with the SRAM bit set (the ROM's block count; 0x80 for Wizardry) shows
+    the SRAM in that 8KB window instead of ROM. *)
+type ascii8_sram =
+  | Ascii8_2kb  (** ASCII8SRAM2: 2KB; stores reach 0x8000-0xBFFF *)
+  | Ascii8_8kb  (** ASCII8SRAM8: 8KB; stores reach 0x8000-0xBFFF *)
+  | Koei
+      (** KoeiSRAM32: 32KB in four 8KB pages; stores reach 0x4000-0x5FFF and
+          0x8000-0xBFFF *)
+  | Wizardry  (** Wizardry: 8KB; stores reach 0x8000-0xBFFF *)
+
+(** ASCII16 carts with battery RAM: bank value 0x10 shows the SRAM, repeated
+    through the 16KB page, read-only at 0x4000-0x7FFF and writable at
+    0x8000-0xBFFF. *)
+type ascii16_sram =
+  | Ascii16_2kb  (** ASCII16SRAM2 *)
+  | Ascii16_8kb  (** ASCII16SRAM8 *)
+
 type cart_mapper =
   | Flat
   | Konami
   | Konami_scc
   | Ascii8
   | Ascii16
-  | Ascii8_sram
+  | Ascii8_sram of ascii8_sram
+  | Ascii16_sram of ascii16_sram
   | Generic8
   | Generic16
 
@@ -64,10 +85,11 @@ val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
     ({!guess_mapper}); pass it to override a wrong guess. A MegaROM is padded
     with 0xFF to whole banks and its registers start as openMSX resets them:
-    Konami and Konami SCC at blocks 0-3, ASCII8 and ASCII16 at block 0 in
-    every window. A bank number past the ROM wraps as openMSX RomBlocks
-    does (mask blocks - 1, 31 for Konami) and reads 0xFF if it still falls
-    outside. *)
+    Konami and Konami SCC at blocks 0-3, ASCII8 and ASCII16 (with or without
+    SRAM) at block 0 in every window. A bank number past the ROM wraps as
+    openMSX RomBlocks does (mask blocks - 1, 31 for Konami) and reads 0xFF if
+    it still falls outside. Battery RAM starts blank (0xFF), as openMSX's does
+    with no saved file. *)
 
 val cart_mapper : t -> cart_mapper
 (** The mapper the plugged-in cart is using ([Flat] when none/plain). *)
