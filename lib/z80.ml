@@ -324,10 +324,15 @@ let daa z =
   z.f <- sz53 a1 lor parity a1 lor (f0 land 0x02)
          lor (if h_out then 0x10 else 0) lor (if !c_out then 1 else 0)
 
-(* INI/OUTI 계열: Z(내려간 B) 와 N 만 바뀐다. S/F5/F3/H/PV/C 불변 —
-   superzazu/z80.c 와 같은 선택, 그 코어로 zexall 을 통과했다. *)
-let io_block_flags z =
-  z.f <- (z.f land 0xfd) lor 0x02 lor (if z.b = 0 then 0x40 else 0)
+(* INI/IND/OUTI/OUTD and their repeats set every flag (openMSX CPUCore
+   BLOCK_IN / BLOCK_OUT): S, Z, F5 and F3 from the decremented B; N from bit
+   7 of the byte [v] moved; H and C when [k] -- the byte plus L after the
+   step (OUT), or plus C +/- 1 (IN) -- carries out of 8 bits; P/V the parity
+   of (k & 7) xor B. A Z left over from an earlier instruction is cleared. *)
+let io_block_flags z ~v ~k =
+  z.f <-
+    sz53 z.b lor ((v land 0x80) lsr 6) lor (if k > 0xff then 0x11 else 0)
+    lor parity ((k land 7) lxor z.b)
 
 let inc_r z = z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f)
 
@@ -535,8 +540,8 @@ and ed_exec z op =
     let v = z.pin port in
     z.wb addr v;
     z.b <- m8 (z.b - 1);
-    io_block_flags z;
     let dir = if op land 0x08 = 0 then 1 else -1 in
+    io_block_flags z ~v ~k:(v + m8 (z.c + dir));
     let hl' = m16 (addr + dir) in
     z.h <- hl' lsr 8;
     z.l <- hl' land 0xff;
@@ -550,11 +555,11 @@ and ed_exec z op =
     let v = z.rb addr in
     z.b <- m8 (z.b - 1);
     z.pout port v;
-    io_block_flags z;
     let dir = if op land 0x08 = 0 then 1 else -1 in
     let hl' = m16 (addr + dir) in
     z.h <- hl' lsr 8;
     z.l <- hl' land 0xff;
+    io_block_flags z ~v ~k:(v + z.l);
     if op >= 0xB3 && z.b <> 0 then begin
       z.pc <- m16 (z.pc - 2);
       add_t 21
