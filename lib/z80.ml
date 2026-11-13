@@ -343,9 +343,12 @@ let inc_r z =
 
 let rec exec z op p =
   match op with
-  (* 접두어는 dispatch 와 실제 실행에 각각 R 을 올린다 (2). *)
-  | 0xDD -> inc_r z; exec z (fetch z) IXp
-  | 0xFD -> inc_r z; exec z (fetch z) IYp
+  (* 접두어는 dispatch 와 실제 실행에 각각 R 을 올린다 (2). The prefix is
+     an M1 of its own, 4 T-states (openMSX CC_DD); the entries below count
+     from the opcode after it, so an opcode the prefix does not change
+     costs 4 more than plain. *)
+  | 0xDD -> inc_r z; add_t 4; exec z (fetch z) IXp
+  | 0xFD -> inc_r z; add_t 4; exec z (fetch z) IYp
   | 0xCB ->
     (* DDCB/FDCB 은 [CB d op]: 변위를 먼저 읽고 opcode 가 나중. 그 op 는
        M1 이 아니라 메모리 읽기라 R 을 올리지 않는다: DD CB d op 의 R 은
@@ -392,7 +395,7 @@ and cb_exec z op p dd_addr =
     add_t
       (match p with
        | No -> if r = 6 then 12 else 8
-       | _ -> 20)
+       | _ -> 16)
   end
   else begin
     let v' =
@@ -407,7 +410,7 @@ and cb_exec z op p dd_addr =
     add_t
       (match p with
        | No -> if r = 6 then 15 else 8
-       | _ -> 23)
+       | _ -> 19)
   end
 
 and ed_exec z op =
@@ -588,7 +591,7 @@ and main_exec z op p =
       add_t
         (match p with
          | No -> if y = 6 || w = 6 then 7 else 4
-         | _ -> if y = 6 || w = 6 then 19 else 4)
+         | _ -> if y = 6 || w = 6 then 15 else 4)
     end
   end
   else if x = 2 then begin
@@ -602,7 +605,7 @@ and main_exec z op p =
      | 5 -> alu_xor z v
      | 6 -> alu_or z v
      | _ -> alu_cp z v);
-    add_t (match p with No -> if w = 6 then 7 else 4 | _ -> if w = 6 then 19 else 4)
+    add_t (match p with No -> if w = 6 then 7 else 4 | _ -> if w = 6 then 15 else 4)
   end
   else
     match op with
@@ -625,16 +628,17 @@ and main_exec z op p =
       add_t 12
     | 0x20 | 0x28 | 0x30 | 0x38 ->
       let d = disp8 z in
+      (* Zilog: 12 (4,3,5) taken, 7 (4,3) not. *)
       if cond z (y - 4) then begin
         z.pc <- m16 (z.pc + d);
         add_t 12
-      end else add_t 8
+      end else add_t 7
     | 0x01 | 0x11 | 0x21 | 0x31 ->
       pset z (op lsr 4) (imm16 z) p;
-      add_t (if op = 0x21 && p <> No then 14 else 10)
+      add_t 10
     | 0x09 | 0x19 | 0x29 | 0x39 ->
       pset z 2 (add16 z (pget z 2 p) (pget z (op lsr 4) p) false) p;
-      add_t (if p <> No then 15 else 11)
+      add_t 11
     | 0x02 -> z.wb ((z.b lsl 8) lor z.c) z.a; add_t 7
     | 0x12 -> z.wb ((z.d lsl 8) lor z.e) z.a; add_t 7
     | 0x22 ->
@@ -642,7 +646,7 @@ and main_exec z op p =
       let v = pget z 2 p in
       z.wb a (v land 0xff);
       z.wb (m16 (a + 1)) (v lsr 8);
-      add_t (if p <> No then 20 else 16)
+      add_t 16
     | 0x32 ->
       let a = imm16 z in
       z.wb a z.a;
@@ -652,7 +656,7 @@ and main_exec z op p =
     | 0x2A ->
       let a = imm16 z in
       pset z 2 (rd16 z a) p;
-      add_t (if p <> No then 20 else 16)
+      add_t 16
     | 0x3A ->
       let a = imm16 z in
       z.a <- z.rb a;
@@ -660,11 +664,11 @@ and main_exec z op p =
     | 0x03 | 0x13 | 0x23 | 0x33 ->
       let i = op lsr 4 in
       pset z i (m16 (pget z i p + 1)) p;
-      add_t (if i = 2 && p <> No then 10 else 6)
+      add_t 6
     | 0x0B | 0x1B | 0x2B | 0x3B ->
       let i = op lsr 4 in
       pset z i (m16 (pget z i p - 1)) p;
-      add_t (if i = 2 && p <> No then 10 else 6)
+      add_t 6
     | 0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 | 0x3C ->
       let read_v, write_v =
         match y, p with
@@ -680,7 +684,7 @@ and main_exec z op p =
       write_v nv;
       z.f <- nf;
       add_t
-        (if y = 6 then (if p <> No then 23 else 11) else 4)
+        (if y = 6 then (if p <> No then 19 else 11) else 4)
     | 0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D ->
       let read_v, write_v =
         match y, p with
@@ -696,10 +700,10 @@ and main_exec z op p =
       write_v nv;
       z.f <- nf;
       add_t
-        (if y = 6 then (if p <> No then 23 else 11) else 4)
+        (if y = 6 then (if p <> No then 19 else 11) else 4)
     | 0x06 | 0x0E | 0x16 | 0x1E | 0x26 | 0x2E | 0x3E ->
       rset z y (imm8 z) p;
-      add_t (if p <> No then 10 else 7)
+      add_t 7
     | 0x36 ->
       (* LD (HL),n / LD (IX+d),n: 변위를 먼저 읹고 그 다음 데이터. *)
       (match p with
@@ -707,7 +711,7 @@ and main_exec z op p =
        | q ->
          let a = ea z q in
          z.wb a (imm8 z));
-      add_t (if p <> No then 19 else 10)
+      add_t (if p <> No then 15 else 10)
     | 0x07 | 0x0F | 0x17 | 0x1F ->
       (* S,Z,PV 불변. F3/F5 는 결과의 bit3/5 로, H=N=0, C=회전비트. *)
       let v, c = rot ((op lsr 3) land 3) z.a (z.f land 1) in
@@ -733,10 +737,10 @@ and main_exec z op p =
       end else add_t 5
     | 0xC1 | 0xD1 | 0xE1 ->
       pset z ((op lsr 4) land 3) (pop z) p;
-      add_t (if op = 0xE1 && p <> No then 14 else 10)
+      add_t 10
     | 0xC5 | 0xD5 | 0xE5 ->
       push z (pget z ((op lsr 4) land 3) p);
-      add_t (if op = 0xE5 && p <> No then 15 else 11)
+      add_t 11
     (* AF 는 pget/pset 의 짝이 아니다 — 전용. *)
     | 0xF1 ->
       let v = pop z in
@@ -796,8 +800,8 @@ and main_exec z op p =
       z.wb z.sp (v land 0xff);
       z.wb (m16 (z.sp + 1)) (v lsr 8);
       pset z 2 spv p;
-      add_t (if p <> No then 23 else 19)
-    | 0xE9 -> z.pc <- pget z 2 p; add_t (if p <> No then 14 else 4)
+      add_t 19
+    | 0xE9 -> z.pc <- pget z 2 p; add_t 4
     | 0xEB ->
       let de = (z.d lsl 8) lor z.e and hl = hl16 z in
       z.d <- hl lsr 8;
@@ -812,7 +816,7 @@ and main_exec z op p =
     z.iff2 <- true;
     z.after_ei <- true;
     add_t 4
-    | 0xF9 -> z.sp <- pget z 2 p; add_t (if p <> No then 10 else 6)
+    | 0xF9 -> z.sp <- pget z 2 p; add_t 6
     | 0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF ->
       push z z.pc;
       z.pc <- op land 0x38;

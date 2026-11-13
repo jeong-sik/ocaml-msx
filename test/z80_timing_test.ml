@@ -38,6 +38,27 @@ let machine ~m1_wait code =
 (* T-states of the first instruction of [code]. *)
 let cycles ~m1_wait code = Z80.step (machine ~m1_wait code)
 
+(* T-states of [code]'s first instruction with F and B set (C is 1). *)
+let cycles_in ~m1_wait ~f ~b code =
+  let z = machine ~m1_wait code in
+  Z80.set_af z f;
+  Z80.set_bc z ((b lsl 8) lor 1);
+  Z80.step z
+
+(* Opcodes a DD/FD prefix changes: they name HL, H, L or (HL) (z80.info
+   decoding). Every other opcode runs as if unprefixed. *)
+let uses_hl op =
+  let x = op lsr 6 and y = (op lsr 3) land 7 and w = op land 7 in
+  let hl r = r = 4 || r = 5 || r = 6 in
+  match x with
+  | 0 ->
+    List.mem op
+      [ 0x09; 0x19; 0x29; 0x39; 0x21; 0x22; 0x2a; 0x23; 0x2b;
+        0x24; 0x25; 0x26; 0x2c; 0x2d; 0x2e; 0x34; 0x35; 0x36 ]
+  | 1 -> hl y || hl w
+  | 2 -> hl w
+  | _ -> List.mem op [ 0xe1; 0xe3; 0xe5; 0xe9; 0xf9 ]
+
 (* R after running [code]'s first instruction, read back with LD A,R
    (ED 5F: two more M1s before A takes R). R starts at 0. *)
 let r_after code =
@@ -56,13 +77,57 @@ let () =
       ("BIT 0,(IX+d)", "\xdd\xcb\x05\x46", 20, 22);
       ("IN A,(n)", "\xdb\x99", 11, 12);
       ("PUSH BC", "\xc5", 11, 12);
-      ("CALL nn", "\xcd\x00\x20", 17, 18) ]
+      ("CALL nn", "\xcd\x00\x20", 17, 18);
+      (* Zilog: JR cc,e is 12 (4,3,5) taken, 7 (4,3) not; openMSX
+         CC_JR_A = 5+3+5, CC_JR_B = 5+3, CC_DJNZ = 6+3+5. F and B are 0. *)
+      ("JR NZ,e taken", "\x20\x05", 12, 13);
+      ("JR Z,e not taken", "\x28\x05", 7, 8);
+      ("JR C,e not taken", "\x38\x05", 7, 8);
+      ("DJNZ taken", "\x10\x05", 13, 14);
+      (* A DD/FD prefix is an M1 of its own, 4 T-states (openMSX CC_DD
+         = 5 with the wait): 4 + the unprefixed opcode, or the IX
+         instruction's full time. *)
+      ("DD NOP", "\xdd\x00", 8, 10);
+      ("INC IXH", "\xdd\x24", 8, 10);
+      ("LD IXL,n", "\xdd\x2e\x12", 11, 13);
+      ("LD IX,nn", "\xdd\x21\x00\x20", 14, 16);
+      ("ADD IX,BC", "\xdd\x09", 15, 17);
+      ("INC (IX+d)", "\xdd\x34\x05", 23, 25);
+      ("LD (IX+d),n", "\xdd\x36\x05\x12", 19, 21);
+      ("ADD A,(IY+d)", "\xfd\x86\x05", 19, 21);
+      ("PUSH IX", "\xdd\xe5", 15, 17);
+      ("POP IY", "\xfd\xe1", 14, 16);
+      ("EX (SP),IX", "\xdd\xe3", 23, 25);
+      ("JP (IX)", "\xdd\xe9", 8, 10);
+      ("LD SP,IY", "\xfd\xf9", 10, 12);
+      ("RLC (IX+d)", "\xdd\xcb\x05\x06", 23, 25) ]
   in
   List.iter
     (fun (name, code, bare, msx) ->
       check (name ^ ": bare Z80") (cycles ~m1_wait:0 code = bare);
       check (name ^ ": MSX") (cycles ~m1_wait:1 code = msx))
     table;
+
+  (* Every opcode a DD/FD prefix leaves alone costs the prefix's M1 more:
+     4 on a bare Z80, 5 on an MSX. Conditional ones under both flag
+     states, DJNZ both ways. *)
+  for op = 0 to 255 do
+    if not (List.mem op [ 0xcb; 0xdd; 0xed; 0xfd; 0x76 ] || uses_hl op) then begin
+      let code = String.make 1 (Char.chr op) ^ "\x05\x00\x00" in
+      List.iter
+        (fun (f, b) ->
+          List.iter
+            (fun (prefix, m1_wait, extra) ->
+              let plain = cycles_in ~m1_wait ~f ~b code in
+              let prefixed = cycles_in ~m1_wait ~f ~b (prefix ^ code) in
+              check
+                (Printf.sprintf "%02x %02x (F=%02x B=%d, wait %d): prefix costs %d"
+                   (Char.code prefix.[0]) op f b m1_wait extra)
+                (prefixed = plain + extra))
+            [ ("\xdd", 0, 4); ("\xfd", 0, 4); ("\xdd", 1, 5); ("\xfd", 1, 5) ])
+        [ (0x00, 1); (0xff, 1); (0x00, 2); (0xff, 2) ]
+    end
+  done;
 
   (* R counts M1 cycles *)
   check "R: NOP is one M1" (r_after "\x00" = 1);
