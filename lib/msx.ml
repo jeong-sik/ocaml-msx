@@ -180,7 +180,20 @@ type t = {
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
-  mutable ppi_c : int;
+      (** The primary slot register: what the PPI port A pins drive. While
+          port A is an output these pins are its latch. *)
+  mutable ppi_c : int;  (** PPI port C latch. *)
+  mutable ppi_ctrl : int;
+      (** i8255 control word (openMSX I8255): bits 4, 1, 3 and 0 make port
+          A, port B, port C high and port C low inputs; bits 6-5 and 2 pick
+          mode 1 or 2, which MSX does not use. *)
+  mutable ppi_latch_a : int;
+      (** Port A's latch while port A is an input. The pins keep the value
+          last output, so [ppi_a] stays as it was. *)
+  mutable ppi_b : int;  (** Port B latch, read back while port B is an output. *)
+  mutable ppi_row : int;
+      (** The keyboard row the port C low pins hold while that half is an
+          input: the latch's low nibble when the half last was an output. *)
   mutable slot3_sel : int;
   keys : bool array;  (** key_rows × 8, 눌림=true *)
   psg : int array;
@@ -713,6 +726,55 @@ let rtc_write_reg m v =
     let bank = m.rtc_mode land 3 in
     m.rtc_regs.((bank * 13) + r) <- (v land 0x0f) land rtc_masks.(bank).(r)
 
+(* i8255 control word bits (openMSX I8255.cc). Bit 7 set: a mode word.
+   Bit 7 clear: bits 3-1 pick a port C bit and bit 0 sets or clears it. *)
+let ppi_set_mode = 0x80
+let ppi_mode_a = 0x60
+let ppi_mode_b = 0x04
+let ppi_input_a = 0x10
+let ppi_input_b = 0x02
+let ppi_input_c_high = 0x08
+let ppi_input_c_low = 0x01
+
+(* The mode every MSX BIOS sets: port A and C outputs, port B the keyboard
+   input. [create] starts the PPI in it. A real i8255 resets with every
+   port an input (openMSX I8255::reset), but C-BIOS and the NMS 8250 BIOS
+   both write 0x82 to port 0xAB before any other PPI access (openMSX 21.0:
+   at 6.7 us and 31 us), so a BIOS boot cannot tell the two apart. The
+   tests that drive the ports with no BIOS rely on starting here. *)
+let ppi_bios_mode = ppi_set_mode lor ppi_input_b
+
+let ppi_is_input m bit = m.ppi_ctrl land bit <> 0
+
+(* A mode word re-drives the output ports from their latches
+   (I8255::writeControlPort). The pins of a port that turns into an input
+   keep the value they had. *)
+let ppi_write_control m v =
+  if v land ppi_set_mode <> 0 then begin
+    let latch_a = if ppi_is_input m ppi_input_a then m.ppi_latch_a else m.ppi_a in
+    if not (ppi_is_input m ppi_input_c_low) then m.ppi_row <- m.ppi_c land 0x0f;
+    m.ppi_ctrl <- v;
+    if ppi_is_input m ppi_input_a then m.ppi_latch_a <- latch_a else m.ppi_a <- latch_a
+  end else begin
+    let bit = 1 lsl ((v lsr 1) land 7) in
+    m.ppi_c <- if v land 1 <> 0 then m.ppi_c lor bit else m.ppi_c land lnot bit
+  end
+
+(* The keyboard row the port C low pins select: the latch while that half
+   is an output, the value it last drove while it is an input. *)
+let ppi_selected_row m =
+  if ppi_is_input m ppi_input_c_low then m.ppi_row else m.ppi_c land 0x0f
+
+let keyboard_row m row =
+  if row >= key_rows then 0xff
+  else begin
+    let bits = ref 0xff in
+    for b = 0 to 7 do
+      if m.keys.((row * 8) + b) then bits := !bits land lnot (1 lsl b)
+    done;
+    !bits
+  end
+
 let port_read m port =
   match port land 0xff with
   | 0xB4 -> m.rtc_reg land 0x0f
@@ -720,19 +782,22 @@ let port_read m port =
   | 0xD0 | 0xD1 | 0xD2 | 0xD3 -> fdc_read m port
   | 0x98 -> Vdp.io_read m.vdp ~port:0x98
   | 0x99 -> Vdp.io_read m.vdp ~port:0x99
-  | 0xA8 -> m.ppi_a
+  (* openMSX I8255::readPortA/B: mode 1 and 2 read 0xFF, an output port
+     reads its latch, an input reads the device. MSXPPI::peekA is 0; port B
+     is the keyboard row (pressed = 0). *)
+  | 0xA8 ->
+    if m.ppi_ctrl land ppi_mode_a <> 0 then 0xff
+    else if ppi_is_input m ppi_input_a then 0
+    else m.ppi_a
   | 0xA9 ->
-    (* 키보드: PPI C 하위 4비트가 행(0-10), B 가 그 행의 8키 (눌림 = 0). *)
-    let row = m.ppi_c land 0x0f in
-    if row >= key_rows then 0xff
-    else begin
-      let bits = ref 0xff in
-      for b = 0 to 7 do
-        if m.keys.((row * 8) + b) then bits := !bits land lnot (1 lsl b)
-      done;
-      !bits
-    end
-  | 0xAA -> m.ppi_c
+    if m.ppi_ctrl land ppi_mode_b <> 0 then 0xff
+    else if ppi_is_input m ppi_input_b then keyboard_row m (ppi_selected_row m)
+    else m.ppi_b
+  (* readPortC: each input half reads 0xF (MSXPPI::peekC0/C1). *)
+  | 0xAA ->
+    (if ppi_is_input m ppi_input_c_high then 0xf0 else m.ppi_c land 0xf0)
+    lor (if ppi_is_input m ppi_input_c_low then 0x0f else m.ppi_c land 0x0f)
+  | 0xAB -> m.ppi_ctrl
   | 0xFC | 0xFD | 0xFE | 0xFF -> m.mapper.(port land 3)
   | 0xA2 -> psg_read m
   | _ -> 0xff
@@ -757,8 +822,12 @@ let port_write m port v =
     if v = 0x0d then Printf.eprintf "\n%!"
   | 0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xD4 -> fdc_write m port v
   | 0x98 | 0x99 | 0x9A | 0x9B -> Vdp.io_write m.vdp ~port:(port land 0xff) v
-  | 0xA8 -> m.ppi_a <- v land 0xff
+  | 0xA8 ->
+    if ppi_is_input m ppi_input_a then m.ppi_latch_a <- v land 0xff
+    else m.ppi_a <- v land 0xff
+  | 0xA9 -> m.ppi_b <- v land 0xff
   | 0xAA -> m.ppi_c <- v land 0xff
+  | 0xAB -> ppi_write_control m (v land 0xff)
   | 0xA0 -> m.psg_latch <- v land 0xff
   | 0xA1 -> if m.psg_latch < 16 then m.psg.(m.psg_latch) <- v land 0xff
   | 0xFC | 0xFD | 0xFE | 0xFF ->
@@ -829,6 +898,10 @@ let create ~machine =
       mapper = Array.make 4 3;
       ppi_a = 0x00;
       ppi_c = 0x00;
+      ppi_ctrl = ppi_bios_mode;
+      ppi_latch_a = 0x00;
+      ppi_b = 0x00;
+      ppi_row = 0;
       slot3_sel = 0x00;
       keys = Array.make (key_rows * 8) false;
       psg = Array.make 16 0;
@@ -2136,6 +2209,11 @@ let serialize t =
   State_codec.put_int w f.side_reg;
   State_codec.put_int w f.drive_reg;
   State_codec.put_bool w f.intr_fired;
+  (* v4: the i8255 control word and the latches it can expose. *)
+  State_codec.put_int w t.ppi_ctrl;
+  State_codec.put_int w t.ppi_latch_a;
+  State_codec.put_int w t.ppi_b;
+  State_codec.put_int w t.ppi_row;
   Z80.write_state w t.cpu;
   Vdp.write_state w t.vdp;
   State_codec.finish w
@@ -2216,6 +2294,14 @@ let restore_with_reader reader state =
       f.drive_reg <- State_codec.get_int r ~min:0 ~max:255;
       f.intr_fired <- State_codec.get_bool r
     end;
+    (* Before v4 the PPI had no control word and always behaved as the
+       BIOS's 0x82 sets it: port A and C outputs, port B the keyboard. *)
+    if State_codec.version r >= 4 then begin
+      t.ppi_ctrl <- State_codec.get_int r ~min:ppi_set_mode ~max:255;
+      t.ppi_latch_a <- State_codec.get_int r ~min:0 ~max:255;
+      t.ppi_b <- State_codec.get_int r ~min:0 ~max:255;
+      t.ppi_row <- State_codec.get_int r ~min:0 ~max:15
+    end else t.ppi_ctrl <- ppi_bios_mode;
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
     State_codec.end_of_input r;
