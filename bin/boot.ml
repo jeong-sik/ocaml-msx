@@ -12,6 +12,7 @@ let disk = ref ""
 let disk_warm = ref false
 let disk_real = ref false
 let cart_mapper = ref ""
+let rom_db = ref ""
 let tap_space : int list ref = ref []
 let tap_keys : (int * Msx.key) list ref = ref []
 let tap_key_spec = ref ""
@@ -77,7 +78,10 @@ let () =
         "  실 디스크 ROM 코드를 cart 에 (DISK_ROM env 로 경로, 기본 cbios_disk)" );
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
-        "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
+        "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc|koei" );
+      ( "--rom-db",
+        Arg.Set_string rom_db,
+        "PATH  openMSX softwaredb.xml — 카트 매퍼를 ROM 의 SHA-1 로 찾는다 (없으면 추정)" );
       ( "--tap-key",
         Arg.String (fun spec -> tap_key_spec := spec),
         "F:KEY[,F:KEY..]  해당 프레임에 키 탭 (space/return/up/.../shift/a)" );
@@ -103,17 +107,28 @@ let () =
      swallows every following statement (run loop, prints), so a no-cart boot
      (BIOS only or disk) ran nothing and exited silently. *)
   if !cart <> "" then begin
-    let mapper = match !cart_mapper with
-      | "plain" -> Some Msx.Flat
-      | "ascii8" -> Some Msx.Ascii8
-      | "ascii16" -> Some Msx.Ascii16
-      | "konami" -> Some Msx.Konami
-      | "konami-scc" -> Some Msx.Konami_scc
-      | "koei" -> Some Msx.Ascii8_sram
-      | "" -> None
-      | other -> Printf.ksprintf failwith "unknown --cart-mapper %s" other
+    let rom = read_file !cart in
+    (* Like openMSX: an explicit mapper wins, then the software database,
+       then the guess from the code. The line says which one picked it. *)
+    let mapper, source =
+      match !cart_mapper with
+      | "" when !rom_db = "" -> (None, "guess")
+      | "" -> (
+        match Rom_db.parse (read_file !rom_db) with
+        | Error m -> Printf.ksprintf failwith "--rom-db %s: %s" !rom_db m
+        | Ok db -> (
+          match Rom_db.find db rom with
+          | Some (Mapper m) -> (Some m, "softwaredb")
+          | Some (Not_emulated name) ->
+            (None, Printf.sprintf "guess; softwaredb says %S, not emulated" name)
+          | None -> (None, "guess; not in softwaredb")))
+      | name -> (
+        match Rom_db.mapper_of_name name with
+        | Some m -> (Some m, "--cart-mapper")
+        | None -> Printf.ksprintf failwith "unknown --cart-mapper %s" name)
     in
-    Msx.load_cartridge ?mapper t (read_file !cart)
+    Msx.load_cartridge ?mapper t rom;
+    Printf.printf "cart mapper=%s (%s)\n" (Rom_db.mapper_name (Msx.cart_mapper t)) source
   end;
   if !disk <> "" then begin
     Msx.load_disk ~interface_rom:(not !disk_warm) ~real_rom:!disk_real t (read_file !disk);
