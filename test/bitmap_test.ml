@@ -160,7 +160,10 @@ let () =
   let t = fresh 0x06 in reg t 9 0x80;
   ignore (Vdp.advance t ~cycles:(192*228));
   check "212-line vblank does not begin at 192" (Vdp.status0 t land 0x80 = 0);
-  ignore (Vdp.advance t ~cycles:(20*228));
+  (* fresh leaves the beam at cycle [line_start]: go to line 212, cycle 47 *)
+  ignore (Vdp.advance t ~cycles:(20*228 + 47 - line_start));
+  check "212-line vblank waits for cycle 48 of line 212" (Vdp.status0 t land 0x80 = 0);
+  ignore (Vdp.advance t ~cycles:1);
   check "212-line vblank begins at 212" (Vdp.status0 t land 0x80 <> 0);
   let t = fresh 0x06 in reg t 0 0x16; reg t 19 10;
   ignore (Vdp.advance t ~cycles:(10*228));

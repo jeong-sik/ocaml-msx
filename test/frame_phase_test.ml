@@ -67,11 +67,10 @@ let eo_flips t ~cycles ~at =
 let () =
   (* openMSX 21.0 raises S#0 F 53386 cycles after power-on: display line 0
      is 42 lines below the frame start, plus 202 ticks, and the display
-     ends 192 lines later, (234 * 1368 + 202) / 6 = 53385.7. This model's
-     VScan is at the right border, 48 cycles before openMSX's (issue #63). *)
+     ends 192 lines later, (234 * 1368 + 202) / 6 = 53385.7. *)
   let t = Vdp.create () in
-  check "first VBlank 53338 cycles after power-on" (until_vblank t = 53338);
-  check "the first VBlank is display line 192" (Vdp.line_now t = (192, 0));
+  check "first VBlank 53386 cycles after power-on" (until_vblank t = 53386);
+  check "the first VBlank is display line 192, cycle 48" (Vdp.line_now t = (192, 48));
   ack t;
   check "VBlanks are a frame apart" (until_vblank t = frame_cycles);
 
@@ -110,8 +109,8 @@ let () =
   seek t 215 0;
   reg t 9 0x80;
   check "192 to 212 lines in the bottom border: next VBlank 272 lines on"
-    (until_vblank t = (272 - (215 - 192)) * line_cycles);
-  check "display line 0 came at 252, 10 lines early" (Vdp.line_now t = (212, 0));
+    (until_vblank t = ((272 - (215 - 192)) * line_cycles) + 48);
+  check "display line 0 came at 252, 10 lines early" (Vdp.line_now t = (212, 48));
   ack t;
   check "then VBlanks are a frame apart again" (until_vblank t = frame_cycles);
 
@@ -123,7 +122,7 @@ let () =
   seek t 240 0;
   reg t 9 0x80;
   check "212 lines after the reset: next VBlank 282 lines on"
-    (until_vblank t = (282 - (240 - 192)) * line_cycles);
+    (until_vblank t = ((282 - (240 - 192)) * line_cycles) + 48);
 
   (* R#18 vertical between the frame start (220) and the reset (235): the
      reset follows the adjust while it stays ahead of the beam. 0x70 is

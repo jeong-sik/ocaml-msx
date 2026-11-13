@@ -170,6 +170,17 @@ let () =
   check "blank split: line 100 black" (px t 0 100 = (0, 0, 0))
 
 let () =
+  (* 8. 프레임은 마지막 표시 줄(191)을 그린 뒤에 확정된다. 첫 프레임은
+     흰색, VBlank 에 팔레트를 빨강으로 바꾼 다음 프레임은 191 줄까지 빨갛다. *)
+  let t = screen5 () in
+  finish t;
+  check "last line: first frame white" (px t 0 191 = white);
+  palette t 1 (7, 0, 0);
+  finish t;
+  check "last line: line 190 of the next frame" (px t 0 190 = red);
+  check "last line: line 191 is in the published frame" (px t 0 191 = red)
+
+let () =
   if !failures > 0 then begin
     Printf.eprintf "raster_test: %d failure(s)\n%!" !failures;
     exit 1
