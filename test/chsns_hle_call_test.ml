@@ -12,7 +12,7 @@
    the handler's vector (0x009C for CONST, 0x009F for CONIN, 0x00A2 for
    CONOUT, 0x0156 for DIRIN) -- while page 0 is mapped to RAM (the
    DOS-kernel-replay shape, ppi_a land 3 = 3). The CALL then executes RAM
-   power-on garbage -- the (00 FF)* initial pattern, not a jump -- and
+   power-on bytes -- 0xFF, RST 38h, not a jump -- and
    every key-wait path stalls: CONST never sees a key, CONIN never reads
    one. A CHSNS-only trap was not enough: the game would hang one step
    later, inside CONIN's CHGET.
@@ -84,10 +84,10 @@ let run_scenario ?(pre = []) call_bytes =
   t
 
 let () =
-  check "power-on RAM at the vectors is garbage, not a jump"
+  check "power-on RAM at the vectors reads 0xFF (RST 38h), not a jump"
     (let t = run_scenario [] in
      t |> ignore;
-     Msx.mem_read t 0x9c = 0 && Msx.mem_read t 0x9f = 0xff);
+     Msx.mem_read t 0x9c = 0xff && Msx.mem_read t 0x9f = 0xff);
 
   (* -- 1. CHSNS: CONST's plain CALL must reach the stub. *)
   let t = run_scenario [ 0xcd; 0x9c; 0x00 ] in
@@ -111,17 +111,16 @@ let () =
   check "CHGET: ppi_a restored after the CALL returned" (Msx.ppi_a t = 0xc3);
 
   (* -- 3. Whitelist control: 0x009A is no BIOS vector -- the trap must not
-     fire for it. The CALL stays in RAM (power-on garbage), so the scenario
-     plants HALT at the next instruction boundary the CPU can only reach by
-     executing that garbage 0xFF (RST 38h at 0x0009): halt at 0x0038. *)
+     fire for it. The CALL stays in RAM (power-on 0xFF), so the scenario
+     plants HALT where the CPU can only arrive by executing that 0xFF
+     (RST 38h): halt at 0x0038. *)
   let t =
     run_scenario ~pre:[ (0x38, 0x76) ] [ 0xcd; 0x9a; 0x00 ]
   in
   check "control: ppi_a untouched (trap did not fire)" (Msx.ppi_a t = 0xc3);
-  (* Absence evidence: the marker cell still holds the (00 FF)* power-on
-     byte 0xff -- observed directly before any step -- so the stub never
-     wrote it; 0x00 would be the wrong expectation here, this RAM does not
-     start zeroed. *)
+  (* Absence evidence: the marker cell still holds the power-on byte 0xff,
+     so the stub never wrote it; 0x00 would be the wrong expectation here,
+     this RAM does not start zeroed. *)
   check "control: main_rom stub not dispatched (marker cell untouched)"
     (Msx.mem_read t 0xc100 = 0xff)
 
