@@ -53,8 +53,12 @@ val fdc_recent_calls : unit -> (int * int * int * int) array
 
 val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
-    ({!guess_mapper}); pass it to override a wrong guess. The bank registers
-    reset linear so the ROM boots from segment 0. *)
+    ({!guess_mapper}); pass it to override a wrong guess. A MegaROM is padded
+    with 0xFF to whole banks and its registers start as openMSX resets them:
+    Konami and Konami SCC at blocks 0-3, ASCII8 and ASCII16 at block 0 in
+    every window. A bank number past the ROM wraps as openMSX RomBlocks
+    does (mask blocks - 1, 31 for Konami) and reads 0xFF if it still falls
+    outside. *)
 
 val cart_mapper : t -> cart_mapper
 (** The mapper the plugged-in cart is using ([Flat] when none/plain). *)
