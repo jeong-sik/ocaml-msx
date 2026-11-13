@@ -61,8 +61,11 @@ val cart_mapper : t -> cart_mapper
 
 val guess_mapper : string -> cart_mapper
 (** Guess a ROM's mapper by counting its bank-register writes. [Flat] for a ROM
-    of 32KB or less. A heuristic — the caller can override with
-    [load_cartridge ~mapper]. *)
+    under 64KB, or a 64KB one without an "AB" header at its first byte
+    (openMSX RomFactory). A [Flat] ROM sits where its "AB" header's routine
+    pointers say (0x0000, 0x4000 or 0x8000) and is mirrored over the rest of
+    the slot (openMSX RomPlain, type Mirrored). A heuristic — the caller can
+    override with [load_cartridge ~mapper]. *)
 
 val palette_entries : t -> (int * int * int) array
 (** 팔레트 레지스터 16색의 RGB (채널 확대 후). 부트 판정 재료. *)
