@@ -8,7 +8,9 @@ let seek t ~write a =
   Vdp.io_write t ~port:0x99 (((a lsr 8) land 63) lor if write then 64 else 0)
 let data t xs = List.iter (Vdp.io_write t ~port:0x98) xs
 let raw t a = Vdp.vram_read t a
-let fresh mode = let t = Vdp.create () in reg t 0 mode; reg t 1 0x40; t
+(* R#8 VR = 1 (64K DRAM wiring), as the BIOS leaves it: at power-on R#8 is 0
+   and the VDP reaches only 0x0000-0x7FFF. *)
+let fresh mode = let t = Vdp.create () in reg t 8 0x08; reg t 0 mode; reg t 1 0x40; t
 let xy t r x = reg t r (x land 255); reg t (r + 1) (x lsr 8)
 let command t ~cmd ~dx ~dy ~nx ~ny ~arg ~color =
   xy t 36 dx; xy t 38 dy; xy t 40 nx; xy t 42 ny;
