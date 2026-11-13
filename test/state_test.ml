@@ -130,7 +130,7 @@ let () =
   done;
   same "direction-switched transfer continues identically" reversed reversed_copy;
   let t = fresh () in
-  Msx.load_cartridge ~mapper:Msx.Ascii8_sram t (String.make 0x40000 '\x42');
+  Msx.load_cartridge ~mapper:(Msx.Ascii8_sram Koei) t (String.make 0x40000 '\x42');
   Msx.port_out t 0xa8 0xe8;
   Msx.mem_write t 0x7000 0x20;
   Msx.mem_write t 0x8000 0x5a;
@@ -149,6 +149,39 @@ let () =
       check "generic mapper restored" (Msx.cart_mapper copy = mapper);
       check "generic bank restored" (Msx.mem_read copy 0x8000 = Msx.mem_read t 0x8000))
     [ Msx.Generic8; Msx.Generic16 ];
+  (* Every cart with battery RAM keeps its mapper and its SRAM bytes. A 128KB
+     ROM has 16 8KB blocks, so 0x10 is the ASCII8 SRAM bit; Wizardry's is 0x80
+     and ASCII16 selects SRAM with the value 0x10. *)
+  List.iter
+    (fun (mapper, select) ->
+      let t = fresh () in
+      Msx.load_cartridge ~mapper t (String.make 0x20000 '\x42');
+      Msx.port_out t 0xa8 0xe8;
+      Msx.mem_write t 0x7000 select;
+      Msx.mem_write t 0x8000 0x5a;
+      let copy = restored t in
+      check "SRAM mapper restored" (Msx.cart_mapper copy = mapper);
+      check "SRAM byte restored" (Msx.mem_read copy 0x8000 = 0x5a))
+    [ (Msx.Ascii8_sram Ascii8_2kb, 0x10); (Msx.Ascii8_sram Ascii8_8kb, 0x10);
+      (Msx.Ascii8_sram Koei, 0x10); (Msx.Ascii8_sram Wizardry, 0x80);
+      (Msx.Ascii16_sram Ascii16_2kb, 0x10); (Msx.Ascii16_sram Ascii16_8kb, 0x10) ];
+  (* The SRAM size follows from the mapper: a Koei state (32KB SRAM) relabelled
+     as ASCII8SRAM2 (2KB) is rejected. The mapper code follows seven byte
+     blobs (RAM, three BIOS ROMs, cart, SRAM, disk), each a length then bytes. *)
+  let koei = fresh () in
+  Msx.load_cartridge ~mapper:(Msx.Ascii8_sram Koei) koei (String.make 0x40000 '\x42');
+  let mapper_offset payload =
+    let rec skip off n =
+      if n = 0 then off
+      else skip (off + 8 + Int64.to_int (String.get_int64_be payload off)) (n - 1)
+    in
+    skip 0 7
+  in
+  rejection "SRAM size must fit the mapper" "invalid cartridge SRAM size"
+    (edit_payload (Msx.serialize koei) (fun payload ->
+      let bytes = Bytes.of_string payload in
+      Bytes.set_int64_be bytes (mapper_offset payload) 8L;
+      Bytes.to_string bytes));
   let t = fresh () in
   Msx.load_disk ~interface_rom:false t (String.init 737280 (fun i -> Char.chr (i land 255)));
   same "mounted disk bytes restored" t (restored t);

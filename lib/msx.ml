@@ -87,14 +87,31 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    the SCC sound chip is not modelled, only its banking. [Generic8] and
    [Generic16] (openMSX RomGeneric8kB / RomGeneric16kB, the database's "8kB"
    or "GenericKonami" and "16kB") take a bank from a write anywhere in the
-   window it selects. *)
+   window it selects. [Ascii8_sram] and [Ascii16_sram] add battery RAM to the
+   ASCII mappers (openMSX RomAscii8_8 / RomAscii16_2). *)
+
+(* The ASCII8 carts with battery RAM, by the openMSX database name. A bank
+   value with the SRAM bit set shows the SRAM instead of ROM. *)
+type ascii8_sram =
+  | Ascii8_2kb  (* ASCII8SRAM2: 2KB, stores reach windows 2-3 *)
+  | Ascii8_8kb  (* ASCII8SRAM8: 8KB, stores reach windows 2-3 *)
+  | Koei  (* KoeiSRAM32: 32KB in four 8KB pages, stores reach windows 0, 2, 3 *)
+  | Wizardry  (* Wizardry: 8KB, SRAM bit 0x80, stores reach windows 2-3 *)
+
+(* The ASCII16 carts with battery RAM: bank value 0x10 shows the SRAM,
+   read-only at 0x4000-0x7FFF and writable at 0x8000-0xBFFF. *)
+type ascii16_sram =
+  | Ascii16_2kb  (* ASCII16SRAM2 *)
+  | Ascii16_8kb  (* ASCII16SRAM8 *)
+
 type cart_mapper =
   | Flat
   | Konami
   | Konami_scc
   | Ascii8
   | Ascii16
-  | Ascii8_sram
+  | Ascii8_sram of ascii8_sram
+  | Ascii16_sram of ascii16_sram
   | Generic8
   | Generic16
 
@@ -137,11 +154,12 @@ type t = {
       (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
           window); ASCII16 uses [.(0)]/[.(1)] as 16KB banks. *)
   mutable cart_sram : Bytes.t;
-      (** battery RAM for an [Ascii8_sram] (Koei) cart: a bank whose value has
-          [cart_sram_bit] set reads/writes here instead of ROM. Empty otherwise. *)
+      (** battery RAM of an [Ascii8_sram] or [Ascii16_sram] cart, sized by
+          {!cart_sram_size}. Empty otherwise. *)
   mutable cart_sram_bit : int;
-      (** the bank-value bit that selects SRAM (just above the ROM's segment
-          range), e.g. 0x20 for a 256KB cart. *)
+      (** for [Ascii8_sram], the bank-value bit that selects SRAM: the ROM's
+          block count (0x20 for a 256KB cart), or 0x80 for Wizardry. 0 for
+          the other mappers. *)
   mutable disk : Bytes.t;
       (** the floppy image, 512 bytes a sector (empty = no drive). The disk
           interface ROM itself rides in [cart]; see [load_disk]. *)
@@ -206,8 +224,8 @@ let rom_or_empty = function "" -> Bytes.make 0x4000 '\000' | s -> Bytes.of_strin
    Rom8kBBlocks / Rom16kBBlocks). load_cartridge pads the image with 0xFF
    to whole blocks, as RomBlocks does. *)
 let cart_block_size = function
-  | Ascii16 | Generic16 -> 0x4000
-  | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram | Generic8 -> 0x2000
+  | Ascii16 | Ascii16_sram _ | Generic16 -> 0x4000
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram _ | Generic8 -> 0x2000
 
 (* What a block number past the end of the ROM wraps with: openMSX
    RomBlocks::setRom keeps a block below nrBlocks, masks a larger one with
@@ -223,22 +241,66 @@ let cart_rom_read m w off =
   let blocks = Bytes.length m.cart / size in
   let bank, within =
     match m.cart_mapper with
-    | Ascii16 | Generic16 -> (m.cart_banks.(w lsr 1), ((w land 1) * 0x2000) + off)
-    | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram | Generic8 -> (m.cart_banks.(w), off)
+    | Ascii16 | Ascii16_sram _ | Generic16 ->
+      (m.cart_banks.(w lsr 1), ((w land 1) * 0x2000) + off)
+    | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram _ | Generic8 -> (m.cart_banks.(w), off)
   in
   let mask =
     match m.cart_mapper with
     | Konami -> konami_block_mask
-    | Flat | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram | Generic8 | Generic16 -> blocks - 1
+    | Flat | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram _ | Ascii16_sram _ | Generic8
+    | Generic16 -> blocks - 1
   in
   let block = if bank < blocks then bank else bank land mask in
   if block < blocks then Char.code (Bytes.get m.cart ((block * size) + within))
   else unmapped_read
 
-(* Koei carts (openMSX RomAscii8_8 KOEI_8/KOEI_32, sramPages 0x34) let the
-   CPU store into battery RAM through windows 0, 2 and 3; window 1
-   (0x6000-0x7FFF) holds the bank registers, so a store there selects. *)
-let koei_sram_writable w = w <> 1
+(* Battery RAM size per cart, as openMSX sizes each SRAM sub-type. *)
+let cart_sram_size = function
+  | Ascii8_sram Ascii8_2kb | Ascii16_sram Ascii16_2kb -> 0x800
+  | Ascii8_sram (Ascii8_8kb | Wizardry) | Ascii16_sram Ascii16_8kb -> 0x2000
+  | Ascii8_sram Koei -> 0x8000
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Generic8 | Generic16 -> 0
+
+(* openMSX Ram::clear: an SRAM with no saved file reads 0xFF. *)
+let sram_blank = '\xff'
+
+(* openMSX RomAscii8_8: Wizardry selects SRAM with bit 7; the other ASCII8
+   carts with the bit just above their blocks (sramEnableBit = rom.size() /
+   8KB). *)
+let wizardry_sram_bit = 0x80
+
+(* openMSX RomAscii16_2: this bank value maps the SRAM into a 16KB page. *)
+let ascii16_sram_select = 0x10
+
+(* The SRAM offset that byte [off] (0..0x1FFF) of window [w] reaches, or None
+   when the window shows ROM. An ASCII8 bank picks an 8KB SRAM page with its
+   low bits (masked to the pages there are); SRAM smaller than the window
+   repeats through it, as it does in an ASCII16 page. *)
+let cart_sram_offset m w off =
+  let size = Bytes.length m.cart_sram in
+  match m.cart_mapper with
+  | Ascii8_sram _ ->
+    let bank = m.cart_banks.(w) in
+    if bank land m.cart_sram_bit = 0 then None
+    else
+      let pages = (size + 0x1fff) / 0x2000 in
+      Some (((bank land (pages - 1)) * 0x2000) + (off land (size - 1)))
+  | Ascii16_sram _ ->
+    if m.cart_banks.(w lsr 1) <> ascii16_sram_select then None
+    else Some ((((w land 1) * 0x2000) + off) land (size - 1))
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Generic8 | Generic16 -> None
+
+(* Whether a store into window [w] reaches the SRAM mapped there (openMSX
+   sramPages): Koei through windows 0, 2 and 3 (0x34), the other ASCII8 carts
+   through 2 and 3 (0x30), ASCII16 through its second page. Elsewhere the SRAM
+   is read-only. Window 1 (0x6000-0x7FFF) holds the bank registers, so a store
+   there always selects. *)
+let cart_sram_writable m w =
+  match m.cart_mapper with
+  | Ascii8_sram Koei -> w <> 1
+  | Ascii8_sram (Ascii8_2kb | Ascii8_8kb | Wizardry) | Ascii16_sram _ -> w >= 2
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Generic8 | Generic16 -> false
 
 (* A write into the cart window selects a bank. Each mapper decodes the target
    address differently; a write that hits no register is ignored (ROM is not
@@ -256,14 +318,14 @@ let cart_bank_write m a v =
   | Konami_scc ->
     (* Register at 0x5000/0x7000/0x9000/0xB000: (a land 0x1800) = 0x1000. *)
     if a land 0x1800 = 0x1000 then m.cart_banks.((a lsr 13) - 2) <- v
-  | Ascii8 | Ascii8_sram ->
+  | Ascii8 | Ascii8_sram _ ->
     (match a land 0xf800 with
      | 0x6000 -> m.cart_banks.(0) <- v
      | 0x6800 -> m.cart_banks.(1) <- v
      | 0x7000 -> m.cart_banks.(2) <- v
      | 0x7800 -> m.cart_banks.(3) <- v
      | _ -> ())
-  | Ascii16 ->
+  | Ascii16 | Ascii16_sram _ ->
     (match a land 0xf800 with
      | 0x6000 -> m.cart_banks.(0) <- v
      | 0x7000 -> m.cart_banks.(1) <- v
@@ -295,10 +357,10 @@ let guess_mapper rom =
         (match addr with 0x6000 | 0x7000 -> incr a16 | _ -> ())
       end
     done;
-    (* ASCII8 detection returns the SRAM-capable variant: the SRAM only engages
+    (* ASCII8 detection returns the Koei variant: the SRAM only engages
        when a bank sets its select bit (Koei games do; plain ASCII8 never does),
        so it is a safe superset and lets Koei carts boot without an override. *)
-    if !a8 > 0 && !a8 >= !scc && !a8 >= !konami then Ascii8_sram
+    if !a8 > 0 && !a8 >= !scc && !a8 >= !konami then Ascii8_sram Koei
     else if !scc > 0 && !scc >= !konami then Konami_scc
     else if !konami > 0 then Konami
     else if !a16 > 0 then Ascii16
@@ -546,18 +608,9 @@ let mem_read m addr =
     (* MegaROM: 0x4000-0xBFFF is four 8KB windows, each showing the block its
        bank register selects. The cart sits in slot 2 (see load_cartridge). *)
     let w = (a lsr 13) - 2 in
-    let bank = m.cart_banks.(w) in
-    if
-      m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
-      && bank land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
-    then begin
-      (* A Koei cart maps its battery RAM into a window whose bank has the SRAM
-         bit; the low bits pick the 8KB SRAM page. *)
-      let pages = Bytes.length m.cart_sram / 0x2000 in
-      let off = ((bank land (pages - 1)) * 0x2000) + (a land 0x1fff) in
-      Char.code (Bytes.get m.cart_sram off)
-    end
-    else cart_rom_read m w (a land 0x1fff)
+    match cart_sram_offset m w (a land 0x1fff) with
+    | Some off -> Char.code (Bytes.get m.cart_sram off)
+    | None -> cart_rom_read m w (a land 0x1fff)
   end
   else begin
     let off = a land 0x3fff in
@@ -692,16 +745,11 @@ let mem_write m addr v =
     slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
   then begin
     let w = (a lsr 13) - 2 in
-    if
-      koei_sram_writable w && m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
-      && m.cart_banks.(w) land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
-    then begin
+    match cart_sram_offset m w (a land 0x1fff) with
+    | Some off when cart_sram_writable m w ->
       (* A store into a window mapped to battery RAM lands in the SRAM. *)
-      let pages = Bytes.length m.cart_sram / 0x2000 in
-      let off = ((m.cart_banks.(w) land (pages - 1)) * 0x2000) + (a land 0x1fff) in
       Bytes.set m.cart_sram off (Char.chr (v land 0xff))
-    end
-    else
+    | Some _ | None ->
       (* Otherwise a write into the cart window is a bank select, not a store. *)
       cart_bank_write m a (v land 0xff)
   end
@@ -887,7 +935,8 @@ let load_cartridge ?mapper t rom =
   t.cart <-
     (match t.cart_mapper with
      | Flat -> Bytes.of_string rom
-     | Konami | Konami_scc | Ascii8 | Ascii8_sram | Ascii16 | Generic8 | Generic16 ->
+     | Konami | Konami_scc | Ascii8 | Ascii8_sram _ | Ascii16 | Ascii16_sram _ | Generic8
+     | Generic16 ->
        let size = cart_block_size t.cart_mapper in
        let len = String.length rom in
        let padded = Bytes.make ((len + size - 1) / size * size) '\xff' in
@@ -896,25 +945,21 @@ let load_cartridge ?mapper t rom =
   (* The banks power up as openMSX's reset leaves them: Konami, Konami SCC
      and Generic 8kB show blocks 0-3 (bankSwitch(i, i - 2) / setRom(i,
      i - 2)), Generic 16kB blocks 0 and 1, ASCII8 and ASCII16 block 0 in
-     every window (setRom(i, 0)). Block 0 at 0x4000 holds the "AB" header
-     either way. *)
+     every window (setRom(i, 0)), their SRAM variants too. Block 0 at
+     0x4000 holds the "AB" header either way. *)
   Array.blit
     (match t.cart_mapper with
      | Flat | Konami | Konami_scc | Generic8 -> [| 0; 1; 2; 3 |]
      | Generic16 -> [| 0; 1; 0; 0 |]
-     | Ascii8 | Ascii8_sram | Ascii16 -> [| 0; 0; 0; 0 |])
+     | Ascii8 | Ascii8_sram _ | Ascii16 | Ascii16_sram _ -> [| 0; 0; 0; 0 |])
     0 t.cart_banks 0 4;
-  (* A Koei cart gets 32KB of battery RAM (covers KoeiSRAM8 and KoeiSRAM32).
-     A bank value with the SRAM bit selects it; the bit is the ROM's block
-     count, as openMSX RomAscii8_8 computes sramEnableBit (rom.size() /
-     8KB), the first bit above the segments of a power-of-two ROM. *)
-  (match t.cart_mapper with
-   | Ascii8_sram ->
-     t.cart_sram_bit <- Bytes.length t.cart / cart_block_size Ascii8_sram;
-     t.cart_sram <- Bytes.make 0x8000 '\000'
-   | _ ->
-     t.cart_sram_bit <- 0;
-     t.cart_sram <- Bytes.make 0 '\000');
+  t.cart_sram <- Bytes.make (cart_sram_size t.cart_mapper) sram_blank;
+  t.cart_sram_bit <-
+    (match t.cart_mapper with
+     | Ascii8_sram Wizardry -> wizardry_sram_bit
+     | Ascii8_sram (Ascii8_2kb | Ascii8_8kb | Koei) ->
+       Bytes.length t.cart / cart_block_size t.cart_mapper
+     | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii16_sram _ | Generic8 | Generic16 -> 0);
   (* mem_read 은 카트리지를 슬롯2 페이지0·1 에 둔다. 페이지0 을 슬롯2 로
      돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
@@ -2128,13 +2173,18 @@ let frame_dims t = Vdp.frame_dims t.vdp
 
 let frame_rgb t = Vdp.frame_rgb t.vdp
 
-(* State codes; the reader bounds them by Generic16's, the highest. *)
+(* State codes; the reader bounds them by the last one. *)
 let mapper_code = function
-  | Flat -> 0 | Konami -> 1 | Konami_scc -> 2 | Ascii8 -> 3 | Ascii16 -> 4 | Ascii8_sram -> 5
-  | Generic8 -> 6 | Generic16 -> 7
+  | Flat -> 0 | Konami -> 1 | Konami_scc -> 2 | Ascii8 -> 3 | Ascii16 -> 4
+  | Ascii8_sram Koei -> 5 | Generic8 -> 6 | Generic16 -> 7
+  | Ascii8_sram Ascii8_2kb -> 8 | Ascii8_sram Ascii8_8kb -> 9 | Ascii8_sram Wizardry -> 10
+  | Ascii16_sram Ascii16_2kb -> 11 | Ascii16_sram Ascii16_8kb -> 12
+let last_mapper_code = 12
 let mapper_of_code = function
-  | 0 -> Flat | 1 -> Konami | 2 -> Konami_scc | 3 -> Ascii8 | 4 -> Ascii16 | 5 -> Ascii8_sram
-  | 6 -> Generic8 | 7 -> Generic16
+  | 0 -> Flat | 1 -> Konami | 2 -> Konami_scc | 3 -> Ascii8 | 4 -> Ascii16
+  | 5 -> Ascii8_sram Koei | 6 -> Generic8 | 7 -> Generic16
+  | 8 -> Ascii8_sram Ascii8_2kb | 9 -> Ascii8_sram Ascii8_8kb | 10 -> Ascii8_sram Wizardry
+  | 11 -> Ascii16_sram Ascii16_2kb | 12 -> Ascii16_sram Ascii16_8kb
   | _ -> State_codec.fail "invalid cartridge mapper"
 
 let serialize t =
@@ -2208,11 +2258,10 @@ let restore_with_reader reader state =
     Bytes.blit ram 0 t.ram 0 ram_size;
     t.cart <- State_codec.get_bytes r;
     t.cart_sram <- State_codec.get_bytes r;
-    let sram_size = Bytes.length t.cart_sram in
-    if sram_size <> 0 && (sram_size mod 8192 <> 0 || sram_size land (sram_size - 1) <> 0) then
-      State_codec.fail "invalid cartridge SRAM size";
     t.disk <- State_codec.get_bytes r;
-    t.cart_mapper <- mapper_of_code (State_codec.get_int r ~min:0 ~max:(mapper_code Generic16));
+    t.cart_mapper <- mapper_of_code (State_codec.get_int r ~min:0 ~max:last_mapper_code);
+    if Bytes.length t.cart_sram <> cart_sram_size t.cart_mapper then
+      State_codec.fail "invalid cartridge SRAM size";
     State_codec.fill_int_array r ~min:0 ~max:255 t.cart_banks;
     State_codec.fill_int_array r ~min:0 ~max:63 t.mapper;
     State_codec.fill_int_array r ~min:0 ~max:255 t.psg;
