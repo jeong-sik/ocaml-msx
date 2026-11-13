@@ -20,7 +20,7 @@ let rejection name expected state =
 (* Recompute the envelope after payload edits: these cases must reach the
    decoder, rather than merely fail the corruption checksum. *)
 let edit_payload state edit =
-  let magic = "OCAML-MSX\000\011" in
+  let magic = "OCAML-MSX\000\012" in
   let offset = String.length magic + 16 in
   let payload = String.sub state offset (String.length state - offset) |> edit in
   magic ^ Digest.string payload ^ payload
@@ -75,6 +75,9 @@ let () =
   check "restore does not alias original RAM" (Msx.serialize t <> Msx.serialize copy);
   let t = fresh () in
   reg t 0 0x0a; reg t 1 0x40;
+  (* SCREEN7 takes effect where the next line starts; the HMMC below needs
+     it. *)
+  Msx.step t ~frames:1;
   (* Save between the two address bytes. *)
   Msx.port_out t 0x99 0x34;
   let copy = restored t in
@@ -104,9 +107,11 @@ let () =
   let active,_,_,_,_ = Msx.tx_state copy in check "restored transfer completes" (not active);
   let switched = fresh () in
   reg switched 0 0x0a;
+  Msx.step switched ~frames:1;
   List.iter (fun (r,v) -> reg switched r v)
     [36,255;37,1;38,0;39,0;40,0;41,0;42,1;43,0;45,4;44,0x12;46,0xf0];
   reg switched 0 0x08;
+  Msx.step switched ~frames:1;
   for _ = 1 to 130 do reg switched 44 0x34 done;
   let active,_,_,_,_ = Msx.tx_state switched in
   check "mode-switched reverse transfer remains pending" active;
@@ -118,6 +123,7 @@ let () =
   same "mode-switched transfer continues identically" switched switched_copy;
   let reversed = fresh () in
   reg reversed 0 0x0a;
+  Msx.step reversed ~frames:1;
   List.iter (fun (r,v) -> reg reversed r v)
     [36,0;37,0;38,0;39,0;40,2;41,0;42,8;43,0;45,0;44,0x12;46,0xf0];
   reg reversed 45 8;
@@ -195,7 +201,8 @@ let () =
     (edit_payload state (fun payload -> String.sub payload 0 (String.length payload - 1)));
   rejection "valid checksum with extra payload" "trailing data in MSX state"
     (edit_payload state (fun payload -> payload ^ "extra"));
-  (* Older payloads are this one without its tail: v10 lacks the latched
+  (* Older payloads are this one without its tail: v11 lacks the R#0/R#1/
+     R#8 values waiting for the next line start (v12), v10 also the latched
      vertical adjust (v11), v9 also the VDP blink state (v10), v8 also the
      SCC (v9),
      v7 also the PSG generators (v8), v6 also the EO bit and the PAL latch (v7), v5 also the
@@ -203,13 +210,15 @@ let () =
      (v5), v3 also the two collision ints (v4). They restore with the PSG
      counters at power-on, a black screen, EO = 0 and 60 Hz, and once two
      frames have been scanned match the v7 machine stepped the same way
-     from EO = 0. v10, v9, v8 and v7 states show the same picture as the
-     v11 one: sound does not reach the screen, this machine never wrote
-     R#13, so blinking is off either way, and R#18 is 0, which older
-     states read as the vertical adjust. *)
+     from EO = 0. v11, v10, v9, v8 and v7 states show the same picture as
+     the v12 one: sound does not reach the screen, this machine never wrote
+     R#13, so blinking is off either way, R#18 is 0, which older states read
+     as the vertical adjust, and no mode bit is waiting at the save. *)
+  let v12 payload = "OCAML-MSX\000\012" ^ Digest.string payload ^ payload in
+  let offset = String.length (v12 "") in
+  let v12_payload = String.sub state offset (String.length state - offset) in
+  let v11_payload = String.sub v12_payload 0 (String.length v12_payload - (3 * 8)) in
   let v11 payload = "OCAML-MSX\000\011" ^ Digest.string payload ^ payload in
-  let offset = String.length (v11 "") in
-  let v11_payload = String.sub state offset (String.length state - offset) in
   let v10_payload = String.sub v11_payload 0 (String.length v11_payload - 8) in
   let v10 payload = "OCAML-MSX\000\010" ^ Digest.string payload ^ payload in
   let blink_tail = 1 + 8 in
@@ -245,10 +254,11 @@ let () =
     | Error e -> failwith ("state must restore: " ^ e)
     | Ok m -> Msx.step m ~frames:2; Msx.frame_rgb m
   in
-  check "v10 restores and shows the v11 picture" (picture (v10 v10_payload) = picture state);
-  check "v9 restores and shows the v11 picture" (picture (v9 v9_payload) = picture state);
-  check "v8 restores and shows the v11 picture" (picture (v8 v8_payload) = picture state);
-  check "v7 restores and shows the v11 picture" (picture (v7 v7_payload) = picture state);
+  check "v11 restores and shows the v12 picture" (picture (v11 v11_payload) = picture state);
+  check "v10 restores and shows the v12 picture" (picture (v10 v10_payload) = picture state);
+  check "v9 restores and shows the v12 picture" (picture (v9 v9_payload) = picture state);
+  check "v8 restores and shows the v12 picture" (picture (v8 v8_payload) = picture state);
+  check "v7 restores and shows the v12 picture" (picture (v7 v7_payload) = picture state);
   check "v6 restores and rescans to the same machine"
     (stepped (older 6 frame_tail) = reference);
   check "v5 restores and rescans to the same machine"

@@ -40,6 +40,14 @@ let screen5 = { r0 = 0x06; r5 = 0xef; r11 = 0; r6 = 0x0f; sat = 0x7600; ct = 0x7
 let screen6 = { screen5 with r0 = 0x08 }
 let screen8 = { r0 = 0x0e; r5 = 0xf7; r11 = 1; r6 = 0x1e; sat = 0xfa00; ct = 0xf800; pt = 0xf000 }
 
+(* The display mode, blank and sprite-disable bits take effect where the
+   next line starts, 39 cycles into a line in the graphic modes (openMSX
+   syncAtNextLine); the CPU's planar addressing follows the mode from
+   then. [setup] starts at cycle 0, so 39 cycles reach it and the line
+   count stays. *)
+let line_start = 39
+let settle t = ignore (Vdp.advance t ~cycles:line_start)
+
 let setup ?(r1 = 0x60) l =
   let t = Vdp.create () in
   set_reg t 0 l.r0;
@@ -47,6 +55,7 @@ let setup ?(r1 = 0x60) l =
   set_reg t 5 l.r5;
   set_reg t 11 l.r11;
   set_reg t 6 l.r6;
+  settle t;
   vram_w t l.sat 216;
   t
 

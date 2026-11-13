@@ -39,11 +39,18 @@ let tr t = status t 2 land 0x80 <> 0
 let bd t = status t 2 land 0x10 <> 0
 let border_x t = status t 8 lor ((status t 9 land 1) lsl 8)
 
+(* The display mode, blank and sprite-disable bits take effect where the
+   next line starts (openMSX syncAtNextLine); the CPU's planar addressing
+   and the command engine follow the mode from then. One line always
+   passes one line start. *)
+let settle t = ignore (Vdp.advance t ~cycles:228)
+
 (* R#0 values: SCREEN5 0x06, SCREEN6 0x08, SCREEN7 0x0a, SCREEN8 0x0e. *)
 let fresh r0 =
   let t = Vdp.create () in
   reg t 0 r0;
   reg t 1 0x40;
+  settle t;
   t
 
 (* SCREEN5 dot: two per byte, the even X in the high nibble. *)

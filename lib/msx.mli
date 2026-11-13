@@ -12,7 +12,8 @@
     and ASX (format v6), the VDP S#2 EO bit and 50/60 Hz frame length
     (format v7), the PSG generators (format v8), the cartridge SCC (format
     v9), the VDP R#13 blink state (format v10), the latched R#18 vertical
-    adjust (format v11) and device state; file IO
+    adjust (format v11), the VDP mode, blank and sprite-disable bits waiting
+    for the next line start (format v12) and device state; file IO
     belongs to callers. *)
 
 type key =
