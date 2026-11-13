@@ -283,6 +283,54 @@ let ascii16_sram () =
   Msx.mem_write t 0x7000 0x11;
   check "ascii16sram8 0x11 is rom block 17" (win t 0x8000 = 34)
 
+(* openMSX RomRType: block 0x17 stays at 0x4000, and a write anywhere in
+   0x4000-0x7FFF picks the block at 0x8000. Bit 4 selects the second ROM
+   chip, which keeps bits 0-2 (mask 0x17); the first keeps bits 0-3 (0x1F).
+   A 512KB ROM (32 blocks, wrap mask 31) shows the 0x17 mask, a 1MB one
+   the 0x1F mask. *)
+let r_type () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.R_type t (synth 64);
+  show_cart t;
+  check "r-type 0x4000 is block 0x17" (win t 0x4000 = 46 && win t 0x6000 = 47);
+  check "r-type 0x8000 starts at block 0" (win t 0x8000 = 0 && win t 0xa000 = 1);
+  Msx.mem_write t 0x7000 5;
+  check "r-type 0x7000 picks block 5" (win t 0x8000 = 10);
+  Msx.mem_write t 0x4123 7;
+  check "r-type any write below 0x8000 selects" (win t 0x8000 = 14);
+  Msx.mem_write t 0x7800 0x18;
+  check "r-type chip 2 keeps bits 0-2" (win t 0x8000 = 32);
+  Msx.mem_write t 0x8000 3;
+  Msx.mem_write t 0xa000 3;
+  check "r-type ignores writes from 0x8000" (win t 0x8000 = 32);
+  check "r-type 0x4000 stays fixed" (win t 0x4000 = 46);
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.R_type t (synth 128);
+  show_cart t;
+  Msx.mem_write t 0x7000 0x2f;
+  check "r-type chip 1 keeps bits 0-3" (win t 0x8000 = 30)
+
+(* openMSX RomHarryFox: bit 0 of a write to 0x6xxx picks block 0 or 2 for
+   0x4000, of a write to 0x7xxx block 1 or 3 for 0x8000. The ROM here has 8
+   blocks, so a value used whole would reach blocks 4-7 instead of wrapping
+   onto 0-3. *)
+let harry_fox () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Harry_fox t (synth 16);
+  show_cart t;
+  check "harry fox starts at blocks 0 and 1" (win t 0x4000 = 0 && win t 0x8000 = 2);
+  Msx.mem_write t 0x6fff 1;
+  check "harry fox 0x6xxx odd = block 2" (win t 0x4000 = 4 && win t 0x6000 = 5);
+  Msx.mem_write t 0x7abc 0xfd;
+  check "harry fox 0x7xxx odd = block 3" (win t 0x8000 = 6 && win t 0xa000 = 7);
+  Msx.mem_write t 0x7000 2;
+  check "harry fox 0x7xxx even = block 1" (win t 0x8000 = 2);
+  Msx.mem_write t 0x6000 2;
+  check "harry fox 0x6xxx even = block 0" (win t 0x4000 = 0);
+  Msx.mem_write t 0x5000 1;
+  Msx.mem_write t 0x8000 1;
+  check "harry fox ignores other writes" (win t 0x4000 = 0 && win t 0x8000 = 2)
+
 (* openMSX RomGeneric8kB / RomGeneric16kB: a write anywhere in a window
    selects that window's bank; the banks start at 0-3 (8kB) and 0,1
    (16kB). *)
@@ -313,6 +361,8 @@ let generic () =
   check "generic16 5 of 4 banks -> 1" (Msx.mem_write t 0x8000 5; win t 0x8000 = 2)
 
 let () =
+  r_type ();
+  harry_fox ();
   ascii8_sram ();
   ascii16_sram ();
   generic ();
