@@ -28,12 +28,31 @@ let machine ~m1_wait code =
     Z80.create ~m1_wait
       ~read:(fun a -> Char.code (Bytes.get mem (a land 0xffff)))
       ~write:(fun a v -> Bytes.set mem (a land 0xffff) (Char.chr (v land 0xff)))
-      ~port_in:(fun _ -> 0xff)
-      ~port_out:(fun _ _ -> ())
+      ~port_in:(fun ~at:_ _ -> 0xff)
+      ~port_out:(fun ~at:_ _ _ -> ())
   in
   Z80.set_pc z 0x100;
   Z80.set_sp z 0xf000;
   z
+
+(* The [at] each port callback saw while [code]'s first instruction ran,
+   and that instruction's T-states. B is 1, so a block instruction ends. *)
+let port_cycles ~m1_wait code =
+  Bytes.fill mem 0 0x10000 '\000';
+  String.iteri (fun i c -> Bytes.set mem (0x100 + i) c) code;
+  let seen = ref [] in
+  let z =
+    Z80.create ~m1_wait
+      ~read:(fun a -> Char.code (Bytes.get mem (a land 0xffff)))
+      ~write:(fun a v -> Bytes.set mem (a land 0xffff) (Char.chr (v land 0xff)))
+      ~port_in:(fun ~at _ -> seen := at :: !seen; 0xff)
+      ~port_out:(fun ~at _ _ -> seen := at :: !seen)
+  in
+  Z80.set_pc z 0x100;
+  Z80.set_bc z 0x0199;
+  Z80.set_hl z 0xc000;
+  let total = Z80.step z in
+  (List.rev !seen, total)
 
 (* T-states of the first instruction of [code]. *)
 let cycles ~m1_wait code = Z80.step (machine ~m1_wait code)
@@ -63,6 +82,39 @@ let () =
       check (name ^ ": bare Z80") (cycles ~m1_wait:0 code = bare);
       check (name ^ ": MSX") (cycles ~m1_wait:1 code = msx))
     table;
+
+  (* The port cycle inside each I/O instruction (openMSX Z80.hh, one wait
+     per M1): IN A,(n) / OUT (n),A 5+3+1, IN r,(C) / OUT (C),r 5+5+1,
+     INI 5+6+1, OUTI 5+6+3+1. Bare: one fewer per M1. *)
+  let ports =
+    [ ("IN A,(n)", [ "\xdb\x99" ], 8, 9);
+      ("OUT (n),A", [ "\xd3\x99" ], 8, 9);
+      ( "IN r,(C)",
+        List.map (fun op -> "\xed" ^ String.make 1 (Char.chr op))
+          [ 0x40; 0x48; 0x50; 0x58; 0x60; 0x68; 0x70; 0x78 ],
+        9, 11 );
+      ( "OUT (C),r",
+        List.map (fun op -> "\xed" ^ String.make 1 (Char.chr op))
+          [ 0x41; 0x49; 0x51; 0x59; 0x61; 0x69; 0x71; 0x79 ],
+        9, 11 );
+      ("INI/IND/INIR/INDR", [ "\xed\xa2"; "\xed\xaa"; "\xed\xb2"; "\xed\xba" ], 10, 12);
+      ("OUTI/OUTD/OTIR/OTDR", [ "\xed\xa3"; "\xed\xab"; "\xed\xb3"; "\xed\xbb" ], 13, 15) ]
+  in
+  List.iter
+    (fun (name, codes, bare, msx) ->
+      List.iter
+        (fun code ->
+          let op = Printf.sprintf "%s %02x" name (Char.code code.[String.length code - 1]) in
+          List.iter
+            (fun (m1_wait, want, label) ->
+              let seen, total = port_cycles ~m1_wait code in
+              check (op ^ ": one port access, " ^ label) (List.length seen = 1);
+              check (op ^ ": port cycle, " ^ label) (seen = [ want ]);
+              check (op ^ ": inside the instruction, " ^ label)
+                (List.for_all (fun at -> at < total) seen))
+            [ (0, bare, "bare Z80"); (1, msx, "MSX") ])
+        codes)
+    ports;
 
   (* R counts M1 cycles *)
   check "R: NOP is one M1" (r_after "\x00" = 1);

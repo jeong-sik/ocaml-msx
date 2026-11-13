@@ -38,8 +38,8 @@ type t = {
   m1_wait : int;
   rb : int -> int;
   wb : int -> int -> unit;
-  pin : int -> int;
-  pout : int -> int -> unit;
+  pin : at:int -> int -> int;
+  pout : at:int -> int -> int -> unit;
 }
 
 let m8 x = x land 0xff
@@ -86,6 +86,17 @@ let dump_sp z = z.sp
 (* 한 step 의 T-state 카운터. *)
 let dt = ref 0
 let add_t n = dt := !dt + n
+
+(* The port cycle of each I/O instruction, counted from the instruction
+   start on a bare Z80. The table charges an instruction's cycles when it
+   ends, so [!dt] at the port holds just the M1 wait states so far. With one
+   wait per M1 these are openMSX Z80.hh CC_IN_A_N_2 = 5+3+1, CC_IN_R_C_1 =
+   5+5+1, CC_INI_1 = 5+6+1 and CC_OUTI_2 = 5+6+3+1. *)
+let io_n = 8 (* IN A,(n), OUT (n),A: M1 4, n 3, then the port *)
+let io_c = 9 (* IN r,(C), OUT (C),r: two M1s, then the port *)
+let io_ini = 10 (* INI and kin: two M1s, one more cycle, then the port *)
+let io_outi = 13 (* OUTI and kin: two M1s, one cycle, (HL) 3, the port *)
+let io_at bare = !dt + bare
 
 (* R 은 명령당 한 번만 오른다 (operand fetch 는 세지 않는다) —
    step 에서 증가. *)
@@ -415,14 +426,14 @@ and ed_exec z op =
   match op with
   | 0x40 | 0x48 | 0x50 | 0x58 | 0x60 | 0x68 | 0x70 | 0x78 ->
     (* IN r,(C) — 0x70 은 IN F,(C): 플래그만 갱신. *)
-    let v = z.pin ((z.b lsl 8) lor z.c) in
+    let v = z.pin ~at:(io_at io_c) ((z.b lsl 8) lor z.c) in
     (* F3/F5 와 C 는 불변 — S/Z/PV/H/N 만 갱신. *)
     z.f <- (z.f land 0x29) lor (v land 0x80) lor (if v = 0 then 0x40 else 0)
            lor parity v;
     if y <> 6 then rset z y v No;
     add_t 12
   | 0x41 | 0x49 | 0x51 | 0x59 | 0x61 | 0x69 | 0x71 | 0x79 ->
-    z.pout ((z.b lsl 8) lor z.c)
+    z.pout ~at:(io_at io_c) ((z.b lsl 8) lor z.c)
       (if op = 0x71 then 0 else rget z y No);
     add_t 12
   | 0x42 | 0x52 | 0x62 | 0x72 ->
@@ -543,7 +554,7 @@ and ed_exec z op =
   | 0xA2 | 0xAA | 0xB2 | 0xBA ->
     let addr = hl16 z in
     let port = (z.b lsl 8) lor z.c in
-    let v = z.pin port in
+    let v = z.pin ~at:(io_at io_ini) port in
     z.wb addr v;
     z.b <- m8 (z.b - 1);
     io_block_flags z;
@@ -560,7 +571,7 @@ and ed_exec z op =
     let port = (z.b lsl 8) lor z.c in
     let v = z.rb addr in
     z.b <- m8 (z.b - 1);
-    z.pout port v;
+    z.pout ~at:(io_at io_outi) port v;
     io_block_flags z;
     let dir = if op land 0x08 = 0 then 1 else -1 in
     let hl' = m16 (addr + dir) in
@@ -776,11 +787,11 @@ and main_exec z op p =
       end else add_t 10
     | 0xD3 ->
       let port = imm8 z in
-      z.pout port z.a;
+      z.pout ~at:(io_at io_n) port z.a;
       add_t 11
     | 0xDB ->
       let port = imm8 z in
-      z.a <- z.pin port;
+      z.a <- z.pin ~at:(io_at io_n) port;
       add_t 11
     | 0xD9 ->
       let t = z.b in z.b <- z.b2; z.b2 <- t;
