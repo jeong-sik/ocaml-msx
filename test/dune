@@ -92,3 +92,8 @@
  (name state_fdc_test)
  (modules state_fdc_test)
  (libraries msx))
+
+(test
+ (name z80_write_order_test)
+ (modules z80_write_order_test)
+ (libraries z80core))

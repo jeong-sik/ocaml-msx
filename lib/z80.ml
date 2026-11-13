@@ -101,13 +101,22 @@ let disp8 z =
   let d = imm8 z in
   if d >= 0x80 then d - 256 else d
 
-let rd16 z addr = (z.rb (m16 (addr + 1)) lsl 8) lor z.rb addr
+(* The low byte is read first (openMSX RD_WORD). The two reads are bound
+   in turn because OCaml leaves the operand order of [lor] unspecified. *)
+let rd16 z addr =
+  let lo = z.rb addr in
+  let hi = z.rb (m16 (addr + 1)) in
+  (hi lsl 8) lor lo
 
+(* The low byte goes to the lower address, but a push writes the high
+   byte first: SP-1, then SP-2 (openMSX CPUCore::PUSH, WR_WORD_rev). The
+   order shows when the stack lies on memory-mapped registers: Meikyu no
+   Tobira pushes a return address onto its ASCII16 bank register, and the
+   bank left selected is the low byte's. *)
 let push z v =
-  (* 하위 바이트가 낮은 주소에 — Z80 16비트 메모리 규약 (little-endian). *)
   z.sp <- m16 (z.sp - 2);
-  z.wb z.sp (v land 0xff);
-  z.wb (m16 (z.sp + 1)) (v lsr 8)
+  z.wb (m16 (z.sp + 1)) (v lsr 8);
+  z.wb z.sp (v land 0xff)
 
 let pop z =
   let lo = z.rb z.sp in
@@ -782,8 +791,9 @@ and main_exec z op p =
     | 0xE3 ->
       let spv = rd16 z z.sp in
       let v = pget z 2 p in
-      z.wb z.sp (v land 0xff);
+      (* High byte first, like a push (openMSX ex_xsp_SS, WR_WORD_rev). *)
       z.wb (m16 (z.sp + 1)) (v lsr 8);
+      z.wb z.sp (v land 0xff);
       pset z 2 spv p;
       add_t (if p <> No then 23 else 19)
     | 0xE9 -> z.pc <- pget z 2 p; add_t (if p <> No then 14 else 4)
