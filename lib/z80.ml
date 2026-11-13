@@ -842,10 +842,12 @@ let irq_cycles_rst = 13
 let irq_cycles_vector = 19
 
 let interrupt z =
-  (* HALT 는 인터럽트가 아니어도 깨어난다 (VBlank 대기 루프). *)
-  z.halted <- false;
+  (* A refused interrupt leaves a HALT halted: only an accepted one (or NMI,
+     reset) ends it, so DI; HALT stops the CPU (Zilog; openMSX CPUCore
+     takes the IRQ only with IFF1 set and not right after EI). *)
   if (not z.iff1) || z.after_ei then 0
   else begin
+    z.halted <- false;
     (* The acknowledge cycle is an M1: R counts it. *)
     z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
     let cycles =

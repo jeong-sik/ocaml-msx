@@ -95,5 +95,32 @@ let () =
   ignore (Z80.step z);
   check "the acknowledge is an M1 for R" (Z80.dump_a z = 5);
 
+  (* HALT ends with an accepted interrupt only. DI; HALT, then the INT line:
+     refused, still halted, PC still past the HALT. *)
+  let z = machine ~m1_wait:1 "\xf3\x76" in
+  ignore (Z80.step z);
+  ignore (Z80.step z);
+  check "DI; HALT: an INT is refused" (Z80.interrupt z = 0);
+  check "DI; HALT: still halted" (Z80.halted z);
+  check "DI; HALT: PC stays past the HALT" (Z80.dump_pc z = 0x102);
+  check "DI; HALT: the HALT repeats" (Z80.step z = 5 && Z80.halted z);
+  (* EI; HALT: accepted, the HALT ends and the return address is past it. *)
+  let z = machine ~m1_wait:1 "\xfb\x76" in
+  ignore (Z80.step z);
+  ignore (Z80.step z);
+  let sp0 = Z80.dump_sp z in
+  check "EI; HALT: an INT is accepted" (Z80.interrupt z = 13);
+  check "EI; HALT: no longer halted" (not (Z80.halted z));
+  check "EI; HALT: returns past the HALT"
+    (Z80.dump_sp z = sp0 - 2
+     && Char.code (Bytes.get mem (sp0 - 2)) = 0x02
+     && Char.code (Bytes.get mem (sp0 - 1)) = 0x01);
+  (* EI then the INT line at once: refused (the instruction after EI runs
+     first), and a CPU that is not halted is not made to halt. *)
+  let z = machine ~m1_wait:1 "\xfb\x00" in
+  ignore (Z80.step z);
+  check "right after EI: an INT is refused" (Z80.interrupt z = 0);
+  check "right after EI: not halted" (not (Z80.halted z));
+
   if !failures > 0 then exit 1;
   print_endline "z80_timing_test: all pass"
