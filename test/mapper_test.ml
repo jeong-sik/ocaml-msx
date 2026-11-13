@@ -278,6 +278,27 @@ let megarom_outside () =
         [ 0x0000; 0x2000; 0xc000; 0xe000 ])
     [ ("ascii8", Msx.Ascii8); ("ascii16", Msx.Ascii16); ("koei", Msx.Ascii8_sram) ]
 
+(* A plain ROM image that is not a whole number of 8KB banks is padded with
+   0xFF to the next bank, as openMSX RomBlocks does. *)
+let padding () =
+  (* 16KB plus one byte (David II's dump) is three 8KB banks. Bank 2 holds the
+     stray byte, then padding; pages outside the ROM mirror with land 2, so
+     0xFFFF shows bank 0's last byte, not bank 1's. *)
+  let b = Bytes.of_string (plain_rom ~size:0x4000 ~header:0 [ 0x4010 ]) in
+  Bytes.set b 0x1fff '\x02';
+  Bytes.set b 0x3fff '\xf0';
+  let odd = Bytes.to_string b ^ "\x3e" in
+  let t = machine () in
+  Msx.load_cartridge t odd;
+  Msx.port_out t 0xA8 0xAA;
+  let got = List.init 8 (fun p -> Msx.mem_read t ((p * 0x2000) + 0x100)) in
+  check
+    (Printf.sprintf "16KB + 1 byte: pages %s" (String.concat "," (List.map string_of_int got)))
+    (got = [ 0xff; 0xff; 0; 1; 0xff; 0xff; 0; 0 ]);
+  check "16KB + 1 byte: the stray byte opens bank 2" (Msx.mem_read t 0x8000 = 0x3e);
+  check "16KB + 1 byte: padding reads 0xFF" (Msx.mem_read t 0x8001 = 0xff);
+  check "16KB + 1 byte: 0xFFFF shows bank 0's last byte" (Msx.mem_read t 0xffff = 0x02)
+
 let () =
   konami ();
   konami_scc ();
@@ -288,6 +309,7 @@ let () =
   plain ();
   layouts ();
   megarom_outside ();
+  padding ();
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1
