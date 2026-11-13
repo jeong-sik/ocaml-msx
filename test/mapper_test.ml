@@ -146,7 +146,18 @@ let koei_sram () =
   Msx.mem_write t 0x7000 0x20;
   check "koei sram retained across bank switch" (win t 0x8000 = 0xab)
 
+(* Plugging a cart does not touch slot selection: PPI port A stays at its
+   power-on 0x00 (every page on slot 0), as on the real machine and in
+   openMSX. C-BIOS finds the cart by scanning the slots itself; a page 1
+   left on slot 2 would outlive the scan, which only rewrites the page 2
+   and 3 bits. *)
+let ppi_untouched () =
+  let t = machine () in
+  Msx.load_cartridge t (synth 2);
+  check "cart leaves PPI A at 0x00" (Msx.port_in t 0xA8 = 0x00)
+
 let () =
+  ppi_untouched ();
   konami ();
   konami_scc ();
   ascii8 ();

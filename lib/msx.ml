@@ -865,11 +865,7 @@ let load_cartridge ?mapper t rom =
      t.cart_sram <- Bytes.make 0x8000 '\000'
    | _ ->
      t.cart_sram_bit <- 0;
-     t.cart_sram <- Bytes.make 0 '\000');
-  (* mem_read 은 카트리지를 슬롯2 페이지0·1 에 둔다. 페이지0 을 슬롯2 로
-     돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
-     슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
-  t.ppi_a <- (t.ppi_a land 0xf3) lor 0x08
+     t.cart_sram <- Bytes.make 0 '\000')
 
 (* --- Disk interface (HLE) -------------------------------------------------
    A game disk boots through a disk interface ROM that rides in the cartridge
