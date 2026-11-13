@@ -200,6 +200,22 @@ let cart_seg8 m w =
   | Ascii16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
   | Flat -> w
 
+(* The window (0..3) a MegaROM shows at CPU address [a] of its slot, or [None]
+   where the cart leaves the bus empty. 0x4000-0xBFFF is windows 0-3 for every
+   mapper. Konami mirrors windows 0-1 at 0x0000 and 2-3 at 0xC000, Konami SCC
+   the other way round (openMSX RomKonami / RomKonamiSCC bankSwitch); the
+   ASCII mappers leave both pages unmapped. A [Flat] cart has no window. *)
+let cart_window m a =
+  let page8 = a lsr 13 in
+  let inside = page8 >= 2 && page8 < 6 in
+  match m.cart_mapper with
+  | Konami ->
+    Some (if page8 < 2 then page8 else if inside then page8 - 2 else page8 - 4)
+  | Konami_scc ->
+    Some (if page8 < 2 then page8 + 2 else if inside then page8 - 2 else page8 - 6)
+  | Ascii8 | Ascii16 | Ascii8_sram -> if inside then Some (page8 - 2) else None
+  | Flat -> None
+
 (* A write into the cart window selects a bank. Each mapper decodes the target
    address differently; a write that hits no register is ignored (ROM is not
    RAM). Segment values are masked to the ROM size at read time. *)
@@ -497,13 +513,12 @@ let mem_read m addr =
        with Not_found -> ());
        fdc_note m 0 0xd7 v;
        v)
-  else if
-    a >= 0x4000 && a < 0xc000 && slot = 2 && m.cart_mapper <> Flat
-    && Bytes.length m.cart > 0
-  then begin
-    (* MegaROM: 0x4000-0xBFFF is four 8KB windows, each showing the segment its
-       bank register selects. The cart sits in slot 2 (see load_cartridge). *)
-    let w = (a lsr 13) - 2 in
+  else
+    match if slot = 2 && Bytes.length m.cart > 0 then cart_window m a else None with
+    | Some w ->
+    (* MegaROM: each 8KB window shows the segment its bank register selects
+       ([cart_window] says which window an address falls in). The cart sits in
+       slot 2 (see load_cartridge). *)
     let bank = m.cart_banks.(w) in
     if
       m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
@@ -520,8 +535,8 @@ let mem_read m addr =
       let off = (seg * 0x2000) + (a land 0x1fff) in
       Char.code (Bytes.get m.cart (off mod Bytes.length m.cart))
     end
-  end
-  else begin
+    | None ->
+  begin
     let off = a land 0x3fff in
     match slot with
     | 0 | 1 | 2 ->
