@@ -224,15 +224,6 @@ type t = {
 
 let rom_or_empty = function "" -> Bytes.make 0x4000 '\000' | s -> Bytes.of_string s
 
-(* Which 8KB segment a MegaROM shows in window [w] (0..3, one per 8KB of
-   0x4000-0xBFFF). The 8KB mappers read the register straight; ASCII16 splits a
-   16KB bank into its two 8KB halves. *)
-let cart_seg8 m w =
-  match m.cart_mapper with
-  | Konami | Konami_scc | Ascii8 | Ascii8_sram | Neo8 -> m.cart_banks.(w)
-  | Ascii16 | Neo16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
-  | Flat | Ram64 -> w
-
 (* The window (0..3) a MegaROM shows at CPU address [a] of its slot, or [None]
    where the cart leaves the bus empty. 0x4000-0xBFFF is windows 0-3 for every
    mapper. Konami mirrors windows 0-1 at 0x0000 and 2-3 at 0xC000, Konami SCC
@@ -260,6 +251,33 @@ let neo_bank_write m reg a v =
   let old = m.cart_banks.(reg) in
   m.cart_banks.(reg) <-
     (if a land 1 = 0 then (old land 0x3f00) lor v else (old land 0xff) lor ((v land 0x3f) lsl 8))
+
+let cart_block_size = function Ascii16 -> 0x4000 | _ -> 0x2000
+
+let cart_rom_read m w off =
+  let length = Bytes.length m.cart in
+  match m.cart_mapper with
+  | Neo8 ->
+    Char.code (Bytes.get m.cart ((m.cart_banks.(w) * 0x2000 + off) mod length))
+  | Neo16 ->
+    let within = (w land 1) * 0x2000 + off in
+    Char.code (Bytes.get m.cart ((m.cart_banks.(w lsr 1) * 0x4000 + within) mod length))
+  | mapper ->
+    let size = cart_block_size mapper in
+    let blocks = (length + size - 1) / size in
+    let bank, within =
+      if mapper = Ascii16 then (m.cart_banks.(w lsr 1), (w land 1) * 0x2000 + off)
+      else (m.cart_banks.(w), off)
+    in
+    (* RomBlocks masks an out-of-range bank and leaves unmapped bytes high. *)
+    let mask = if mapper = Konami then 31 else blocks - 1 in
+    let block = if bank < blocks then bank else bank land mask in
+    let offset = block * size + within in
+    if block < blocks && offset < length then Char.code (Bytes.get m.cart offset)
+    else 0xff
+
+(* Koei maps SRAM in windows 0, 2 and 3 (openMSX sramPages = 0x34). *)
+let koei_sram_writable w = w <> 1
 
 (* A write into the cart window selects a bank. Each mapper decodes the target
    address differently; a write that hits no register is ignored (ROM is not
@@ -648,11 +666,7 @@ let mem_read m addr =
       let off = ((bank land (pages - 1)) * 0x2000) + (a land 0x1fff) in
       Char.code (Bytes.get m.cart_sram off)
     end
-    else begin
-      let seg = cart_seg8 m w in
-      let off = (seg * 0x2000) + (a land 0x1fff) in
-      Char.code (Bytes.get m.cart (off mod Bytes.length m.cart))
-    end
+    else cart_rom_read m w (a land 0x1fff)
     | None ->
   begin
     let off = a land 0x3fff in
@@ -775,7 +789,7 @@ let mem_write m addr v =
   then begin
     let w = (a lsr 13) - 2 in
     if
-      a >= 0x8000 && m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
+      koei_sram_writable w && m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
       && m.cart_banks.(w) land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
     then begin
       (* A store into a window mapped to battery RAM lands in the SRAM. *)
@@ -1061,21 +1075,15 @@ let load_cartridge ?mapper t rom =
     invalid_arg "Msx.load_cartridge: a RAM cartridge has no ROM; use insert_ram_cartridge";
   set_cart t (Bytes.of_string rom);
   t.cart_mapper <- (match mapper with Some m -> m | None -> guess_mapper rom);
-  (* Reset the banks linear so a MegaROM boots: segment 0 at 0x4000 holds the
-     "AB" header and INIT vector, and the running code sets the selectable banks
-     before it relies on them. A NEO cart resets every region to block 0
-     (openMSX RomNeo8 / RomNeo16 reset). *)
+  (* ASCII and NEO windows reset to block 0. Konami maps blocks 0-3. *)
   (match t.cart_mapper with
-   | Neo8 | Neo16 -> Array.fill t.cart_banks 0 (Array.length t.cart_banks) 0
-   | _ -> Array.iteri (fun i _ -> t.cart_banks.(i) <- i) t.cart_banks);
-  (* A Koei cart gets 32KB of battery RAM (covers KoeiSRAM8 and KoeiSRAM32); the
-     SRAM-select bit is the first bit above the ROM's segment range. *)
+   | Ascii8 | Ascii8_sram | Ascii16 | Neo8 | Neo16 ->
+     Array.fill t.cart_banks 0 (Array.length t.cart_banks) 0
+   | Flat | Ram64 | Konami | Konami_scc ->
+     Array.iteri (fun i _ -> t.cart_banks.(i) <- i) t.cart_banks);
   (match t.cart_mapper with
    | Ascii8_sram ->
-     let nseg = (String.length rom + 0x1fff) / 0x2000 in
-     let bit = ref 1 in
-     while !bit < nseg do bit := !bit lsl 1 done;
-     t.cart_sram_bit <- !bit;
+     t.cart_sram_bit <- (Bytes.length t.cart + 0x1fff) / 0x2000;
      t.cart_sram <- Bytes.make 0x8000 '\000'
    | _ ->
      t.cart_sram_bit <- 0;
