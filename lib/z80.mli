@@ -28,7 +28,8 @@ val interrupt : t -> bool
 (** INT 라인이 활성일 때 호출. IM1 이면 RST 38h 로 점프하고 IFF 를
     끈다. [false] 는 인터럽트를 받지 않았음 (IFF1 꺼짐·EI 직후 지연) —
     호출자는 라인을 유지해 다시 시도할 수 있다. HALT 중이면 깨운다.
-    NMI 는 아직 없다. *)
+    직전 명령이 LD A,I·LD A,R 이면 받는 순간 F 의 P/V 를 지운다
+    (NMOS Z80 동작, openMSX 도 같다). NMI 는 아직 없다. *)
 
 val halted : t -> bool
 

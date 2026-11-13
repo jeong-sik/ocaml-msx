@@ -32,6 +32,7 @@ type t = {
   mutable im : int;
   mutable halted : bool;
   mutable after_ei : bool;
+  mutable after_ld_a_ir : bool;
   mutable t : int;
   rb : int -> int;
   wb : int -> int -> unit;
@@ -51,6 +52,7 @@ let create ~read ~write ~port_in ~port_out =
     iff1 = false; iff2 = false; im = 0;
     halted = false;
     after_ei = false;
+    after_ld_a_ir = false;
     t = 0;
     rb = read;
     wb = write;
@@ -459,6 +461,7 @@ and ed_exec z op =
     let v = if op = 0x57 then z.i else z.r in
     z.f <- (z.f land 0x01) lor sz53 v lor (if z.iff2 then 0x04 else 0);
     z.a <- v;
+    z.after_ld_a_ir <- true;
     add_t 9
   | 0x67 | 0x6F ->
     let addr = hl16 z in
@@ -813,6 +816,7 @@ let step z =
   else begin
     z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
     let op = fetch z in
+    z.after_ld_a_ir <- false;
     exec z op No;
     (* 이 명령이 EI 였으면 그 명령 자체는 INT 를 못 받는다 —
        다음 step 에서 플래그를 소비한다. *)
@@ -826,6 +830,13 @@ let interrupt z =
   z.halted <- false;
   if (not z.iff1) || z.after_ei then false
   else begin
+    (* An NMOS Z80 that takes an IRQ right after LD A,I or LD A,R leaves
+       P/V at 0 instead of the IFF2 copy (openMSX CPUCore::executeSlow, Z80
+       only). C-BIOS CALSLT saves IFF2 with LD A,I; PUSH AF and on return
+       runs EI only on P/V set, so an IRQ in that window leaves the caller
+       with interrupts off. *)
+    if z.after_ld_a_ir then z.f <- z.f land 0xfb;
+    z.after_ld_a_ir <- false;
     (match z.im with
      | 0 | 1 ->
        push z z.pc;
@@ -875,6 +886,7 @@ let write_state w z =
   State_codec.put_bool w z.iff2;
   State_codec.put_bool w z.halted;
   State_codec.put_bool w z.after_ei;
+  State_codec.put_bool w z.after_ld_a_ir;
   ()
 
 let read_state r z =
@@ -906,4 +918,6 @@ let read_state r z =
   z.iff2 <- State_codec.get_bool r;
   z.halted <- State_codec.get_bool r;
   z.after_ei <- State_codec.get_bool r;
+  (* Format 4 added this flag; older states were saved without it. *)
+  z.after_ld_a_ir <- (if State_codec.version r >= 4 then State_codec.get_bool r else false);
   ()
