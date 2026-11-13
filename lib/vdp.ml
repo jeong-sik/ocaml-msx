@@ -192,10 +192,10 @@ let move_line_count_reset t =
    text modes: 52 and 67.3 cycles.
    VR (openMSX readStatusReg case 2) drops one line before display start, at
    tick 202 of the line above display line 0. That is 1368 - 1282 + 202 =
-   288 ticks, 48 cycles, into our last line. It rises with S#0 F when the
-   counter reaches the display end. openMSX raises both 48 cycles later, at
-   tick 202 of the line below the last display line; this model's VScan sits
-   at the right border. *)
+   288 ticks, 48 cycles, into our last line. It rises with S#0 F at the
+   display end, tick 202 of the line below the last display line (openMSX
+   scheduleVScan, displayStart + lines * TICKS_PER_LINE): 48 cycles into
+   our line [visible_lines]. *)
 let hr_cycles_graphic = 52
 let hr_cycles_text = 68
 let vr_fall_cycle = 48
@@ -351,7 +351,8 @@ let horizontal_retrace t =
 let line_start_cycle t = if text_timing t then 43 else 39
 
 let vertical_retrace t =
-  t.line >= visible_lines t
+  let visible = visible_lines t in
+  (t.line > visible || (t.line = visible && t.cycle_in_line >= vr_fall_cycle))
   && not
        (next_display_line t = Some (t.line + 1)
         && t.cycle_in_line >= vr_fall_cycle)
@@ -1603,6 +1604,14 @@ let advance t ~cycles =
     remaining := !remaining - step;
     run_engine t slots ~ticks:(step * ticks_per_cycle);
     if t.cycle_in_line = start then take_deferred t;
+    (* VScan (openMSX execVScan): the display ends at the display edge of
+       the line below the last display line, compared against R#9 as it is
+       then, so a 212-line switch after line 192 ends it again at 212. *)
+    if t.cycle_in_line = display_edge_cycle && t.line = visible_lines t then begin
+      t.status0 <- t.status0 lor 0x80;
+      t.int_pending <- true;
+      hit := true
+    end;
     if t.cycle_in_line = cycles_per_line then begin
       t.cycle_in_line <- 0;
       let finished = t.line in
@@ -1624,12 +1633,9 @@ let advance t ~cycles =
         hit := true
       end;
       t.line <- t.line + 1;
-      if t.line = visible_lines t then begin
-        t.status0 <- t.status0 lor 0x80;
-        t.int_pending <- true;
-        hit := true;
-        present t
-      end;
+      (* The last display line is drawn: publish the frame. The software
+         cannot see this point; S#0 F follows 48 cycles later. *)
+      if t.line = visible_lines t then present t;
       next_vertical t;
       if t.line < visible_lines t then check_sprites t ~display_line:t.line
     end

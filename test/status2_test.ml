@@ -86,18 +86,21 @@ let () =
     [ ("TEXT1", 0x00, 0x50); ("TEXT2", 0x04, 0x50); ("TEXT1Q", 0x02, 0x50) ];
   check "GRAPHIC1 uses the graphic HR" (not (hr (at (fresh ~r0:0 ~r1:0x40 ()) 20 52)));
 
-  (* VR: 0 over the display, 1 from VBlank until 48 cycles into line 261 *)
+  (* VR: 0 over the display, 1 from VBlank (48 cycles into line 192) until
+     48 cycles into line 261 *)
   let t = fresh () in
   check "VR clear on display line 0" (not (vr (at t 0 100)));
   check "VR clear on the last display line" (not (vr (at t 191 227)));
-  check "VR set with VBlank (192 lines)" (vr (at t 192 0));
+  check "VR clear until VBlank (192 lines)" (not (vr (at t 192 47)));
+  check "VR set with VBlank (192 lines)" (vr (at t 192 48));
   check "VR set in the bottom border" (vr (at t 230 0));
   check "VR set until cycle 47 of the last line" (vr (at t 261 47));
   check "VR clears 48 cycles into the last line" (not (vr (at t 261 48)));
   check "VR clear into display line 0" (not (vr (at t 0 0)));
   let t = fresh ~r9:0x80 () in
   check "VR clear on line 211 with 212 lines" (not (vr (at t 211 100)));
-  check "VR set at line 212 with 212 lines" (vr (at t 212 0));
+  check "VR clear at line 212 cycle 47 with 212 lines" (not (vr (at t 212 47)));
+  check "VR set at line 212 with 212 lines" (vr (at t 212 48));
 
   (* Bits 3-2 read 1; EO is the power-on flip; nothing else is set on an
      idle VDP in the first display *)
