@@ -89,7 +89,9 @@ type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
 
 (* WD279x 근사 상태. 즉시-완료 모델: 명령을 받으면 상태 읽기 한 번 안에
    seek/read 준비를 끝낸다 — 실기 타이밍의 근사이고, 로더가 상태 비트를
-   폴링하는 한 관측상 같다. [buf] 는 READ SECTOR 가 채운 섹터 한 개. *)
+   폴링하는 한 관측상 같다. [buf] 는 섹터 한 개: READ SECTOR 는 이미지에서
+   채워 [pos] 로 내보내고, WRITE SECTOR 는 CPU 가 보낸 바이트로 채운 뒤
+   마지막 바이트에서 이미지에 쓴다. *)
 type fdc_state = {
   mutable cmd : int;         (** 마지막 명령 바이트 — 상태 산출용 *)
   mutable track : int;       (** 트랙 레지스터 *)
@@ -101,7 +103,7 @@ type fdc_state = {
   mutable busy : bool;
   mutable drq : bool;
   mutable intr : bool;
-  buf : Bytes.t;             (** READ SECTOR 버퍼, 512 *)
+  buf : Bytes.t;             (** 섹터 버퍼, 512 (READ·WRITE SECTOR) *)
   mutable pos : int;
   mutable side_reg : int;   (** Philips 0x7FFC: bit0 = side *)
   mutable drive_reg : int;  (** Philips 0x7FFD: bits0-1 drive, bit7 motor *)
@@ -335,20 +337,39 @@ let set_fdc_trace on = fdc_trace := on
 let ppi_trace = ref false
 let set_ppi_trace on = ppi_trace := on
 
+(* The sector the track, side and sector registers name, on a 720KB image:
+   two sides, 9 sectors of 512 bytes per track, sectors numbered from 1. *)
+let fdc_sectors_per_track = 9
+let fdc_logical_sector f =
+  (((f.track * 2) + f.side) * fdc_sectors_per_track) + (f.sector - 1)
+
+(* Image offset of that sector, or None when the image has no such sector.
+   Sector 0 does not exist: without the check it gives offset -512, which
+   Bytes.blit rejects with an exception. Sector 10 does not exist either:
+   without the check it lands on sector 1 of the other side, and a
+   multi-sector write runs on across the whole image. *)
+let fdc_sector_offset m =
+  let f = m.fdc in
+  let size = Bytes.length f.buf in
+  let off = fdc_logical_sector f * size in
+  if f.sector >= 1 && f.sector <= fdc_sectors_per_track
+     && off + size <= Bytes.length m.disk
+  then Some off
+  else None
+
 let fdc_load_sector m =
   let f = m.fdc in
   if Bytes.length m.disk = 0 then f.drq <- false
   else begin
-    let logical = ((f.track * 2) + f.side) * 9 + (f.sector - 1) in
-    let off = logical * 512 in
-    if off + 512 > Bytes.length m.disk then begin
+    let logical = fdc_logical_sector f in
+    match fdc_sector_offset m with
+    | None ->
       if !fdc_trace then
-        Printf.eprintf "FDC readsec MISS t=%d side=%d sec=%d -> logical %d (off %d, len %d)\n%!"
-          f.track f.side f.sector logical off (Bytes.length m.disk);
+        Printf.eprintf "FDC readsec MISS t=%d side=%d sec=%d -> logical %d (len %d)\n%!"
+          f.track f.side f.sector logical (Bytes.length m.disk);
       f.drq <- false
-    end
-    else begin
-      Bytes.blit m.disk off f.buf 0 512;
+    | Some off ->
+      Bytes.blit m.disk off f.buf 0 (Bytes.length f.buf);
       if !fdc_trace then
         Printf.eprintf "FDC readsec t=%d side=%d sec=%d -> logical %d (off %d) buf0=%02x drive=%d motor=%b\n%!"
           f.track f.side f.sector logical off (Char.code (Bytes.get f.buf 0))
@@ -356,8 +377,55 @@ let fdc_load_sector m =
       f.pos <- 0;
       f.drq <- true;
       f.busy <- true
-    end
   end
+
+(* WRITE SECTOR is 0xA0, or 0xB0 with the multi-sector flag; READ SECTOR is
+   0x80/0x90. Bit 5 tells them apart (openMSX WD2793 tests cmd & 0xE0). *)
+let fdc_writing f = f.cmd land 0xe0 = 0xa0
+let fdc_multi_sector = 0x10
+
+(* End of a Type II command: BUSY and DRQ drop, INTRQ rises (openMSX
+   WD2793::endCmd). *)
+let fdc_end_command f =
+  f.busy <- false;
+  f.drq <- false;
+  f.intr <- true
+
+(* WRITE SECTOR takes the sector through the data register, one byte per
+   DRQ, and stores it in the image after the last byte. The chip asks for
+   the first byte once the sector header passes under the head; this model
+   has no rotation, so DRQ is up as soon as the command is taken. A sector
+   the image does not have ends the command without writing. The chip would
+   also report RECORD NOT FOUND (status bit 4); that bit is not modelled. *)
+let fdc_start_write m =
+  let f = m.fdc in
+  match fdc_sector_offset m with
+  | None -> fdc_end_command f
+  | Some _ ->
+    f.pos <- 0;
+    f.drq <- true;
+    f.busy <- true
+
+(* One byte written to the data register while WRITE SECTOR holds DRQ. The
+   offset is looked up again at the last byte: the registers name the
+   sector, and only a full sector reaches the image. With the multi-sector
+   flag the chip moves to the next sector number and keeps going until the
+   track has no such sector (openMSX WD2793::postWriteSector). *)
+let fdc_take_byte m v =
+  let f = m.fdc in
+  let size = Bytes.length f.buf in
+  Bytes.set f.buf f.pos (Char.chr v);
+  if f.pos < size - 1 then f.pos <- f.pos + 1
+  else
+    match fdc_sector_offset m with
+    | None -> fdc_end_command f
+    | Some off ->
+      Bytes.blit f.buf 0 m.disk off size;
+      if f.cmd land fdc_multi_sector = 0 then fdc_end_command f
+      else begin
+        f.sector <- (f.sector + 1) land 0xff;
+        fdc_start_write m
+      end
 
 let fdc_write m port v =
   let f = m.fdc in
@@ -378,13 +446,16 @@ let fdc_write m port v =
                            변형)은 실 디스크 ROM 0x783F 의 되돌리기 스텝이 쓴다. *)
        | 0x60 | 0x70 -> f.track <- max 0 (f.track - 1); f.step_out <- true;
          f.intr <- true (* STEP OUT — 0 에서 멈춘다 *)
-       | 0x80 | 0x90 | 0xA0 | 0xB0 -> fdc_load_sector m (* READ SECTOR *)
+       | 0x80 | 0x90 -> fdc_load_sector m (* READ SECTOR *)
+       | 0xA0 | 0xB0 -> fdc_start_write m (* WRITE SECTOR *)
        | 0xC0 -> f.intr <- true (* READ ADDRESS — 최소 *)
        | 0xD0 -> f.busy <- false; f.intr <- true (* FORCE INTERRUPT *)
        | _ -> f.intr <- true)
   | 0xD1 -> f.track <- v land 0xff
   | 0xD2 -> f.sector <- v land 0xff
-  | 0xD3 -> f.data <- v land 0xff
+  | 0xD3 ->
+      f.data <- v land 0xff;
+      if fdc_writing f && f.drq then fdc_take_byte m f.data
   | 0xD4 ->
       (* 시스템 컨트롤: bit1 side, bit3 motor (배선은 로더 로그로 맞춘다). *)
       fdc_note m 1 0xD4 v;
@@ -407,6 +478,11 @@ let fdc_read m port =
       st
   | 0xD1 -> f.track
   | 0xD2 -> f.sector
+  | 0xD3 when fdc_writing f ->
+      (* During a write the data register holds the last byte the CPU
+         sent; reading it moves nothing (openMSX WD2793::getDataReg pumps
+         only for read commands). *)
+      f.data
   | 0xD3 ->
       let b = Char.code (Bytes.get f.buf f.pos) in
       if f.pos < 2 && !fdc_trace then
