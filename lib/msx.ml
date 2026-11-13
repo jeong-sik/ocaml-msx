@@ -979,8 +979,22 @@ let palette_entries t = Array.init 16 (Vdp.palette_rgb t.vdp)
 
 let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
 
+(* A plain ROM image that is not a whole number of 8KB banks is padded with
+   0xFF to the next bank (openMSX RomPlain is a Rom8kBBlocks, and RomBlocks
+   pads with Rom::addPadding, warning that the dump is probably incomplete).
+   The padded size is what the layout sees: a 16385-byte image is three
+   banks, so its mirror lands differently from a 16KB one. *)
+let pad_plain mapper rom =
+  match mapper with
+  | Plain _ ->
+    let len = String.length rom in
+    let padded = (len + bank_size - 1) / bank_size * bank_size in
+    if padded = len then rom else rom ^ String.make (padded - len) '\xff'
+  | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram -> rom
+
 let load_cartridge ?mapper t rom =
-  set_cart t (match mapper with Some m -> m | None -> guess_mapper rom) (Bytes.of_string rom);
+  let mapper = match mapper with Some m -> m | None -> guess_mapper rom in
+  set_cart t mapper (Bytes.of_string (pad_plain mapper rom));
   (* Reset the banks linear so a MegaROM boots: segment 0 at 0x4000 holds the
      "AB" header and INIT vector, and the running code sets the selectable banks
      before it relies on them. *)
