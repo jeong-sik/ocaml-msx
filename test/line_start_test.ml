@@ -1,12 +1,13 @@
 (* Where the display mode, blank and sprite-disable bits take effect. openMSX
    VDP::changeRegister defers them to the next line start (syncAtNextLine),
    144 ticks after the line's sync; every other register bit applies at
-   once. In this model a line starts at the right border of the line above,
-   so that point is 230 ticks (cycle 39) into the line in the graphic modes
-   and 258 ticks (cycle 43) in the text modes. A write before it changes the
-   line being scanned, a later one the next line. The same timing was
-   measured against openMSX 21.0 with a probe ROM (sprite collision on one
-   line versus the cycle of an R#1 BL or R#8 SPD write). *)
+   once. This model's line starts at tick 1284 of openMSX's line, so in the
+   graphic modes that point is 228 ticks in, cycle 38: a write up to cycle 38
+   changes the line being scanned, a later one the next line. The text modes
+   put it at cycle 43, counted from their right border at 1254 (issue #104).
+   The graphic-mode timing was measured against openMSX 21.0 with a probe
+   ROM (sprite collision on one line versus the cycle of an R#1 BL or R#8
+   SPD write). *)
 
 let failures = ref 0
 

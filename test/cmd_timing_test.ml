@@ -87,9 +87,9 @@ let hmmm_time screen =
 
 (* Exact times, worked out by hand from the slot tables. Every case starts
    at line 10 cycle 60 unless it says otherwise: tick 360 of this model's
-   line, which is tick (360 + 1282) mod 1368 = 274 of openMSX's line. A
+   line, which is tick (360 + 1284) mod 1368 = 276 of openMSX's line. A
    result is the cycles until S#2 reads CE clear, so an access at tick T
-   (openMSX T - 86 here) shows from the first cycle boundary after T.
+   (openMSX T - 84 here) shows from the first cycle boundary after T.
    Screen-off slots near there: 268 276 292 300 ... 404 420 ... 532 548 ...;
    sprites-off: 252 278 310 316 342; sprites-on: 252 316 348 380. *)
 let timed ?line ?cycle screen ?sx ?sy ?dx ?dy ?nx ?ny ?col ?arg cmr =
@@ -98,15 +98,18 @@ let timed ?line ?cycle screen ?sx ?sy ?dx ?dy ?nx ?ny ?col ?arg cmr =
   duration t
 
 let () =
-  (* POINT: one read at 276 (362 here, cycle 60.3). *)
+  (* POINT: one read at 276 (360 here, cycle 60 itself). *)
   check "POINT reads at the first slot" (timed Off 0x40 = 1);
-  (* PSET: read 276, write at the first slot 24 later, 300 (cycle 64.3). *)
+  (* PSET: read 276, write at the first slot 24 later, 300 (cycle 64). *)
   check "PSET reads, then writes 24 ticks later" (timed Off 0x50 = 5);
-  (* From cycle 58 (tick 262): read 268, write 292 = 378 here, exactly
-     cycle 63, so CE shows clear from cycle 64. *)
+  (* From cycle 59 (tick 270): read 276, write 300 = 384 here, exactly
+     cycle 64, so CE shows clear from cycle 65. From cycle 58 (tick 264)
+     the write at 292 is 376 here, cycle 62.7, and shows from cycle 63. *)
   check "an access on a cycle boundary shows from the next cycle"
-    (timed ~cycle:58 Off 0x50 = 6);
-  (* HMMV, two bytes in a row: 276, then 48 later 324 (cycle 68.3). *)
+    (timed ~cycle:59 Off 0x50 = 6);
+  check "an access between cycle boundaries shows from the next one"
+    (timed ~cycle:58 Off 0x50 = 5);
+  (* HMMV, two bytes in a row: 276, then 48 later 324 (cycle 68). *)
   check "HMMV bytes are 48 ticks apart" (timed Off ~dy:50 ~nx:4 ~ny:1 ~col:0x11 hmmv = 9);
   (* HMMV, one byte in each of two rows: 276, then 104 later 380. *)
   check "HMMV turns a row in 104 ticks" (timed Off ~dy:50 ~nx:2 ~ny:2 ~col:0x11 hmmv = 18);
@@ -115,25 +118,26 @@ let () =
   check "HMMV with sprites off" (timed Sprites_off ~dy:50 ~nx:4 ~ny:1 hmmv = 12);
   check "HMMV with sprites on" (timed Sprites_on ~dy:50 ~nx:4 ~ny:1 hmmv = 18);
   (* Line 192 is past the last display line (R#9 LN = 0), but the display
-     area ends only at cycle 48: from cycle 10 (openMSX 1342) the
-     sprites-on slots 1368+28 and 1368+92 give 178 here, cycle 29.7. *)
+     area ends only at cycle 48: from cycle 10 (openMSX 1344) the
+     sprites-on slots 1368+28 and 1368+92 give 176 here, cycle 29.3. *)
   check "the display area ends at cycle 48 of the line below it"
     (timed ~line:192 ~cycle:10 Sprites_on ~dy:50 ~nx:4 ~ny:1 hmmv = 20);
   check "the bottom border has the screen-off slots"
     (timed ~line:215 Sprites_on ~dy:50 ~nx:4 ~ny:1 hmmv = 9);
   (* HMMM, one byte: read 276, write 300. *)
   check "HMMM writes 24 ticks after its read" (timed Off ~sy:300 ~dy:50 ~nx:2 ~ny:1 hmmm = 5);
-  (* Two bytes: 276 300, then 64 later 364 388 = 474 here, cycle 79. *)
-  check "HMMM steps 64 ticks a byte" (timed Off ~sy:300 ~dy:50 ~nx:4 ~ny:1 hmmm = 20);
+  (* Two bytes: 276 300, then 64 later 364 388 = 472 here, cycle 78.7:
+     the last access is two ticks before a cycle edge. *)
+  check "HMMM steps 64 ticks a byte" (timed Off ~sy:300 ~dy:50 ~nx:4 ~ny:1 hmmm = 19);
   (* Two rows of one byte: 276 300, then 128 later 428 452. *)
   check "HMMM turns a row in 128 ticks" (timed Off ~sy:300 ~dy:50 ~nx:2 ~ny:2 hmmm = 30);
   (* YMMM from DX 252, two bytes: 276 300, then 40 later 340 364. *)
   check "YMMM steps 40 ticks a byte"
-    (timed Off ~sy:300 ~dx:252 ~dy:50 ~ny:1 0xe0 = 16);
+    (timed Off ~sy:300 ~dx:252 ~dy:50 ~ny:1 0xe0 = 15);
   (* LMMV, two dots: 276 300, then 72 later 372 396. *)
   check "LMMV steps 72 ticks a dot" (timed Off ~dy:50 ~nx:2 ~ny:1 ~col:5 0x80 = 21);
-  (* Two rows of one dot: 276 300, then 136 later 436 460 = 546, cycle 91. *)
-  check "LMMV turns a row in 136 ticks" (timed Off ~dy:50 ~nx:1 ~ny:2 ~col:5 0x80 = 32);
+  (* Two rows of one dot: 276 300, then 136 later 436 460 = 544, cycle 90.7. *)
+  check "LMMV turns a row in 136 ticks" (timed Off ~dy:50 ~nx:1 ~ny:2 ~col:5 0x80 = 31);
   (* LMMM, two dots: source 276, destination 308 and 332, then 64 later
      396, 428, 452. *)
   check "LMMM reads source, reads and writes destination"
@@ -141,11 +145,11 @@ let () =
   (* Two rows of one dot: 276 308 332, then 128 later 460 492 516. *)
   check "LMMM turns a row in 128 ticks" (timed Off ~sy:300 ~dx:1 ~dy:50 ~nx:1 ~ny:2 lmmm = 41);
   (* SRCH from 254 to the edge: 276, 364. *)
-  check "SRCH steps 88 ticks a dot" (timed Off ~sx:254 ~sy:300 ~col:9 0x60 = 16);
+  check "SRCH steps 88 ticks a dot" (timed Off ~sx:254 ~sy:300 ~col:9 0x60 = 15);
   (* LINE NX 2 NY 1: dot one 276 300 and a minor step (120 more), dot two
-     420 444, dot three 532 556 = 642 here, exactly cycle 107. *)
+     420 444, dot three 532 556 = 640 here, cycle 106.7. *)
   check "LINE: 88 ticks a dot, 32 more on a minor step"
-    (timed Off ~dx:9 ~dy:50 ~nx:2 ~ny:1 ~col:7 line = 48);
+    (timed Off ~dx:9 ~dy:50 ~nx:2 ~ny:1 ~col:7 line = 47);
 
   (* CE is set from the CMR write until the last access. *)
   let t = screen5 Off in
@@ -155,7 +159,7 @@ let () =
   check "HMMV filled its row" (Vdp.vram_read t (50 * 128) = 0x11 && Vdp.vram_read t ((50 * 128) + 63) = 0x11);
 
   (* A CPU VRAM access claims the first slot 16 ticks on. At cycle 65
-     (openMSX 304) that is 324, the slot of HMMV's second byte, which moves
+     (openMSX 306) that is 324, the slot of HMMV's second byte, which moves
      to 332: one cycle later than alone. *)
   let t = screen5 Off in
   command t ~dy:50 ~nx:4 ~ny:1 ~col:0x11 hmmv;
@@ -266,9 +270,9 @@ let () =
   done;
   check "HMMV saved at any cycle ends at the same cycle" !same;
   (* A claimed slot can wait for a later engine access. Sprites on, HMMV
-     of three bytes: 316, 380, 444. A CPU write at cycle 76 (openMSX 370)
+     of three bytes: 316, 380, 444. A CPU write at cycle 76 (openMSX 372)
      claims 444 while the engine still waits for 380; the third byte then
-     moves to 476 (cycle 93.7). Alone it ends at 444 (cycle 88.3). *)
+     moves to 476 (cycle 93.3). Alone it ends at 444 (cycle 88). *)
   let three () =
     let t = screen5 Sprites_on in
     command t ~dy:50 ~nx:6 ~ny:1 ~col:0x11 hmmv;
