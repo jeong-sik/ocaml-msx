@@ -452,16 +452,13 @@ and ed_exec z op =
   | 0x5E -> z.im <- 2; add_t 8
   | 0x47 -> z.i <- z.a; add_t 9
   | 0x4F -> z.r <- z.a; add_t 9
-  | 0x57 ->
-    (* F3/F5/C 불변. *)
-    z.f <- (z.f land 0x29) lor (z.i land 0x80) lor (if z.i = 0 then 0x40 else 0)
-           lor (if z.iff2 then 0x04 else 0);
-    z.a <- z.i;
-    add_t 9
-  | 0x5F ->
-    z.f <- (z.f land 0x29) lor (z.r land 0x80) lor (if z.r = 0 then 0x40 else 0)
-           lor (if z.iff2 then 0x04 else 0);
-    z.a <- z.r;
+  | 0x57 | 0x5F ->
+    (* LD A,I / LD A,R: C stays; S, Z, X and Y come from the value moved,
+       P/V is IFF2, H and N clear (openMSX CPUCore::ld_a_IR on a Z80:
+       (F & C) | ZSXY[A]). Keeping X and Y from the old F is the R800. *)
+    let v = if op = 0x57 then z.i else z.r in
+    z.f <- (z.f land 0x01) lor sz53 v lor (if z.iff2 then 0x04 else 0);
+    z.a <- v;
     add_t 9
   | 0x67 | 0x6F ->
     let addr = hl16 z in
