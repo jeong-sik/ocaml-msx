@@ -593,7 +593,14 @@ let mem_read m addr =
           (* 실ROM 부트의 디스크 인터페이스는 3-3 에만 있다. 카트리지 슬롯은
              실기처럼 비어 있다 — 전 페이지 빈 버스. *)
           (Bytes.make 0 '\000', 0)
-        | 2, _ when Bytes.length m.cart > 0 -> (m.cart, plain_rom_offset m a)
+        | 2, _ when Bytes.length m.cart > 0 && m.cart_mapper = Flat ->
+          (m.cart, plain_rom_offset m a)
+        | 2, _ when Bytes.length m.cart > 0 ->
+          (* A MegaROM gets here only for addresses its mapper does not
+             decode; they read as an empty bus (openMSX RomAscii8kB,
+             RomAscii16kB and RomAscii8_8 leave 0x0000-0x3FFF and
+             0xC000-0xFFFF unmapped). The plain mirror is for [Flat] only. *)
+          (Bytes.make 0 '\000', 0)
         | 2, 0 | 2, 1 ->
           (* 카트가 없는 C-BIOS 부트의 기존 폴백(main ROM 미러) — 그 부트가
              이 뷰를 읽는다. *)

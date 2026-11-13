@@ -201,6 +201,21 @@ let plain () =
   shows "48KB at 0x0000" (plain_rom ~size:0xc000 ~header:0x4000 [ 0x4010 ]) [ 0; 1; 2; 3; 4; 5; 4; 5 ];
   shows "64KB at 0x0000" (plain_rom ~size:0x10000 ~header:0x4000 [ 0x4010 ]) [ 0; 1; 2; 3; 4; 5; 6; 7 ]
 
+(* A MegaROM is no plain ROM: outside 0x4000-0xBFFF the ASCII mappers show
+   an empty bus, not a mirror of the file (openMSX RomAscii8kB, RomAscii16kB,
+   RomAscii8_8 reset). *)
+let megarom_outside () =
+  List.iter
+    (fun (name, mapper) ->
+      let t = machine () in
+      Msx.load_cartridge ~mapper t (synth 8);
+      Msx.port_out t 0xA8 0xAA;
+      List.iter
+        (fun a ->
+          check (Printf.sprintf "%s: 0x%04x reads 0xFF" name a) (win t a = 0xff))
+        [ 0x0000; 0x2000; 0xc000; 0xe000 ])
+    [ ("ascii8", Msx.Ascii8); ("ascii16", Msx.Ascii16); ("koei", Msx.Ascii8_sram) ]
+
 let () =
   konami ();
   konami_scc ();
@@ -209,6 +224,7 @@ let () =
   koei_sram ();
   detection ();
   plain ();
+  megarom_outside ();
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1
