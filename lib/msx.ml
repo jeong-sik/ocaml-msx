@@ -191,14 +191,39 @@ type t = {
 
 let rom_or_empty = function "" -> Bytes.make 0x4000 '\000' | s -> Bytes.of_string s
 
-(* Which 8KB segment a MegaROM shows in window [w] (0..3, one per 8KB of
-   0x4000-0xBFFF). The 8KB mappers read the register straight; ASCII16 splits a
-   16KB bank into its two 8KB halves. *)
-let cart_seg8 m w =
-  match m.cart_mapper with
-  | Konami | Konami_scc | Ascii8 | Ascii8_sram -> m.cart_banks.(w)
-  | Ascii16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
-  | Flat -> w
+(* A MegaROM is cut into blocks of the mapper's bank size (openMSX
+   Rom8kBBlocks / Rom16kBBlocks). load_cartridge pads the image with 0xFF
+   to whole blocks, as RomBlocks does. *)
+let cart_block_size = function
+  | Ascii16 -> 0x4000
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram -> 0x2000
+
+(* What a block number past the end of the ROM wraps with: openMSX
+   RomBlocks::setRom keeps a block below nrBlocks, masks a larger one with
+   blockMask (nrBlocks - 1; RomKonami sets 31), and leaves the window
+   unmapped (0xFF) when the masked number is still past the end. *)
+let konami_block_mask = 31
+let unmapped_read = 0xff
+
+(* The ROM byte at [off] (0..0x1FFF) of window [w] (0..3, one per 8KB of
+   0x4000-0xBFFF). ASCII16 shows one 16KB bank across two windows. *)
+let cart_rom_read m w off =
+  let size = cart_block_size m.cart_mapper in
+  let blocks = Bytes.length m.cart / size in
+  let bank, within =
+    match m.cart_mapper with
+    | Ascii16 -> (m.cart_banks.(w lsr 1), ((w land 1) * 0x2000) + off)
+    | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram -> (m.cart_banks.(w), off)
+  in
+  let mask = match m.cart_mapper with Konami -> konami_block_mask | _ -> blocks - 1 in
+  let block = if bank < blocks then bank else bank land mask in
+  if block < blocks then Char.code (Bytes.get m.cart ((block * size) + within))
+  else unmapped_read
+
+(* Koei carts (openMSX RomAscii8_8 KOEI_8/KOEI_32, sramPages 0x34) let the
+   CPU store into battery RAM through windows 0, 2 and 3; window 1
+   (0x6000-0x7FFF) holds the bank registers, so a store there selects. *)
+let koei_sram_writable w = w <> 1
 
 (* A write into the cart window selects a bank. Each mapper decodes the target
    address differently; a write that hits no register is ignored (ROM is not
@@ -501,7 +526,7 @@ let mem_read m addr =
     a >= 0x4000 && a < 0xc000 && slot = 2 && m.cart_mapper <> Flat
     && Bytes.length m.cart > 0
   then begin
-    (* MegaROM: 0x4000-0xBFFF is four 8KB windows, each showing the segment its
+    (* MegaROM: 0x4000-0xBFFF is four 8KB windows, each showing the block its
        bank register selects. The cart sits in slot 2 (see load_cartridge). *)
     let w = (a lsr 13) - 2 in
     let bank = m.cart_banks.(w) in
@@ -515,11 +540,7 @@ let mem_read m addr =
       let off = ((bank land (pages - 1)) * 0x2000) + (a land 0x1fff) in
       Char.code (Bytes.get m.cart_sram off)
     end
-    else begin
-      let seg = cart_seg8 m w in
-      let off = (seg * 0x2000) + (a land 0x1fff) in
-      Char.code (Bytes.get m.cart (off mod Bytes.length m.cart))
-    end
+    else cart_rom_read m w (a land 0x1fff)
   end
   else begin
     let off = a land 0x3fff in
@@ -655,7 +676,7 @@ let mem_write m addr v =
   then begin
     let w = (a lsr 13) - 2 in
     if
-      a >= 0x8000 && m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
+      koei_sram_writable w && m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
       && m.cart_banks.(w) land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
     then begin
       (* A store into a window mapped to battery RAM lands in the SRAM. *)
@@ -845,23 +866,32 @@ let palette_entries t = Array.init 16 (Vdp.palette_rgb t.vdp)
 let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
 
 let load_cartridge ?mapper t rom =
-  t.cart <- Bytes.of_string rom;
   t.cart_mapper <- (match mapper with Some m -> m | None -> guess_mapper rom);
-  (* Reset the banks linear so a MegaROM boots: segment 0 at 0x4000 holds the
-     "AB" header and INIT vector, and the running code sets the selectable banks
-     before it relies on them. *)
-  t.cart_banks.(0) <- 0;
-  t.cart_banks.(1) <- 1;
-  t.cart_banks.(2) <- 2;
-  t.cart_banks.(3) <- 3;
-  (* A Koei cart gets 32KB of battery RAM (covers KoeiSRAM8 and KoeiSRAM32); the
-     SRAM-select bit is the first bit above the ROM's segment range. *)
+  t.cart <-
+    (match t.cart_mapper with
+     | Flat -> Bytes.of_string rom
+     | Konami | Konami_scc | Ascii8 | Ascii8_sram | Ascii16 ->
+       let size = cart_block_size t.cart_mapper in
+       let len = String.length rom in
+       let padded = Bytes.make ((len + size - 1) / size * size) '\xff' in
+       Bytes.blit_string rom 0 padded 0 len;
+       padded);
+  (* The banks power up as openMSX's reset leaves them: Konami and Konami
+     SCC show blocks 0-3 (RomKonami/RomKonamiSCC bankSwitch(i, i - 2)),
+     ASCII8 and ASCII16 show block 0 in every window (setRom(i, 0)). Block 0
+     at 0x4000 holds the "AB" header either way. *)
+  Array.blit
+    (match t.cart_mapper with
+     | Flat | Konami | Konami_scc -> [| 0; 1; 2; 3 |]
+     | Ascii8 | Ascii8_sram | Ascii16 -> [| 0; 0; 0; 0 |])
+    0 t.cart_banks 0 4;
+  (* A Koei cart gets 32KB of battery RAM (covers KoeiSRAM8 and KoeiSRAM32).
+     A bank value with the SRAM bit selects it; the bit is the ROM's block
+     count, as openMSX RomAscii8_8 computes sramEnableBit (rom.size() /
+     8KB), the first bit above the segments of a power-of-two ROM. *)
   (match t.cart_mapper with
    | Ascii8_sram ->
-     let nseg = (String.length rom + 0x1fff) / 0x2000 in
-     let bit = ref 1 in
-     while !bit < nseg do bit := !bit lsl 1 done;
-     t.cart_sram_bit <- !bit;
+     t.cart_sram_bit <- Bytes.length t.cart / cart_block_size Ascii8_sram;
      t.cart_sram <- Bytes.make 0x8000 '\000'
    | _ ->
      t.cart_sram_bit <- 0;
