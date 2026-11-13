@@ -774,6 +774,14 @@ let watch_mem_addrs : int list ref = ref []
 let watch_mem_log : (int * int * int * int) list ref = ref []
 let instr_count = ref 0
 
+(* Every RAM byte reads 0xFF at power-on. openMSX Ram::clear fills RAM with
+   0xFF unless the machine config gives an initialContent pattern, and the
+   C-BIOS machines give none. Eggerland Mystery 2 reads 0xED21 before it
+   writes it and takes another path when the byte is 0x00. Rune Master 1's
+   disk boot ends the same with 0xFF as with the Philips NMS 8250 tile
+   (00 FF)*128 (FF 00)*128 we filled before, and differently with zeros. *)
+let ram_power_on_byte = '\xff'
+
 let create ~machine =
   let main = match machine.roms with x :: _ -> x | [] -> "" in
   let logo = match machine.roms with _ :: x :: _ -> x | _ -> "" in
@@ -817,15 +825,7 @@ let create ~machine =
       hle_disk = true;
       cart_is_disk_rom = false;
       fdc = fdc_create ();
-      (* 전원 인가 시 RAM 의 실측 패턴(openMSX Philips_NMS_8250 initialContent):
-         (00 FF)*128 (FF 00)*128 의 512 바이트 블록이 전체를 덮는다. 룬마스터
-         1 의 커널 슬롯 프로브는 이 패턴의 보수쌍(byte2 = ~byte1)을 "이 슬롯에
-         신선한 RAM 이 있나" 의 지문으로 쓴다(c611 스캔) — 0 으로 초기화하면
-         (00,00) 쌍만 나와 프로브 16 회 전부 실패, ~270 프레임 재부팅 루프. *)
-      ram = Bytes.init (ram_kb * 1024) (fun i ->
-          let phase = i land 0x1ff in
-          let even = phase land 1 = 0 in
-          if phase < 0x100 = even then '\000' else '\255');
+      ram = Bytes.make (ram_kb * 1024) ram_power_on_byte;
       mapper = Array.make 4 3;
       ppi_a = 0x00;
       ppi_c = 0x00;
