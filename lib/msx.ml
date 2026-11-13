@@ -1921,10 +1921,18 @@ let trace_remaining = ref 0
 let watch_enter : (int * int) option ref = ref None
 let pc_hist = Array.make 256 0
 
+(* A disk BIOS entry served in OCaml stands in for a call's worth of
+   cycles. *)
+let trap_cycles = 18
+
 let step t ~frames =
   for _ = 1 to frames do
-    let budget = ref cycles_per_frame in
-    while !budget > 0 do
+    (* Frame N ends at CPU T-state N * cycles_per_frame: the cycles the last
+       instruction ran past the boundary come off the next frame, so N
+       frames are N * 59736 cycles and not N * (59736 + overshoot). Both
+       counts are in the save state. *)
+    let frame_end = (t.frames + 1) * cycles_per_frame in
+    while Z80.t_states t.cpu < frame_end do
       (* 인터럽트 선은 VDP 만: NMS8250(PhilipsFDC) 의 WD2793 INTRQ/DRQ 는
          Z80 인터럽트 선에 연결되지 않는다(openMSX PhilipsFDC 정본 주석:
          "Drive control IRQ and DRQ lines are not connected to Z80
@@ -1970,10 +1978,16 @@ let step t ~frames =
           :: !ldirvm_calls;
       (* A disk BIOS entry is served in OCaml (HLE), not by fetching the ROM's
          opcode there; the trap moves PC on, so charge a nominal call's cycles. *)
-      let used = irq_used + if disk_trap t pc then 18 else Z80.step t.cpu in
+      let used =
+        irq_used
+        + if disk_trap t pc then begin
+            Z80.charge t.cpu trap_cycles;
+            trap_cycles
+          end
+          else Z80.step t.cpu
+      in
       incr instr_count;
-      ignore (Vdp.advance t.vdp ~cycles:used);
-      budget := !budget - used
+      ignore (Vdp.advance t.vdp ~cycles:used)
     done;
     t.frames <- t.frames + 1
   done

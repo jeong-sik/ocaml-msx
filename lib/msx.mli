@@ -140,7 +140,10 @@ val port_out : t -> int -> int -> unit
 (** Z80 이 보는 I/O 포트를 직접 읽고 쓴다 — 키보드·PSG 계약 테스트용. *)
 
 val step : t -> frames:int -> unit
-(** [frames] 프레임만큼 진행. 한 프레임 = 262 라인 × 228 사이클. *)
+(** [frames] 프레임만큼 진행. 한 프레임 = 262 라인 × 228 사이클. 프레임
+    N 은 CPU 의 누적 T-state 가 N × 59736 에 닿는 명령에서 끝난다: 마지막
+    명령이 넘긴 사이클은 다음 프레임에서 빠지므로 프레임 경계가 밀리지
+    않는다. *)
 
 val frame_number : t -> int
 (** Completed frames since creation; preserved by save states. *)

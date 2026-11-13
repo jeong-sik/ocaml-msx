@@ -65,6 +65,7 @@ let create ~m1_wait ~read ~write ~port_in ~port_out =
 let halted z = z.halted
 let set_pc z v = z.pc <- m16 v
 let t_states z = z.t
+let charge z n = z.t <- z.t + n
 let dump_pc z = z.pc
 let dump_a z = z.a
 let set_af z v = z.a <- (v lsr 8) land 0xff; z.f <- v land 0xff

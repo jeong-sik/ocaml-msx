@@ -97,3 +97,8 @@
  (name z80_timing_test)
  (modules z80_timing_test)
  (libraries z80core))
+
+(test
+ (name frame_clock_test)
+ (modules frame_clock_test)
+ (libraries msx))
