@@ -10,7 +10,18 @@ let data t xs = List.iter (Vdp.io_write t ~port:0x98) xs
 let raw t a = Vdp.vram_read t a
 (* Page 0 with R#2 bits 4-0 set: those bits mask the display line
    (openMSX SDLRasterizer::drawDisplay), so the BIOS writes them as 1. *)
-let fresh mode = let t = Vdp.create () in reg t 0 mode; reg t 1 0x40; reg t 2 0x1f; t
+(* The display mode, blank and sprite-disable bits take effect where the
+   next line starts (openMSX syncAtNextLine); the CPU's planar addressing
+   and the command engine follow the mode from then. One line always
+   passes one line start; [fresh] starts at cycle 0 and only needs the 39
+   cycles to the first one, so its line count stays. *)
+let line_start = 39
+let settle t = ignore (Vdp.advance t ~cycles:228)
+let fresh mode =
+  let t = Vdp.create () in
+  reg t 0 mode; reg t 1 0x40; reg t 2 0x1f;
+  ignore (Vdp.advance t ~cycles:line_start);
+  t
 let xy t r x = reg t r (x land 255); reg t (r + 1) (x lsr 8)
 let command t ~cmd ~dx ~dy ~nx ~ny ~arg ~color =
   xy t 36 dx; xy t 38 dy; xy t 40 nx; xy t 42 ny;
@@ -46,7 +57,7 @@ let () =
   let third = Vdp.io_read t ~port:0x98 in
   check "read prefetch does not duplicate first byte" (first = 1 && second = 0x10 && third = 0x23);
   (* Mode switches preserve physical VRAM, not a mode-specific shadow. *)
-  reg t 0 0x06; seek t ~write:false 1;
+  reg t 0 0x06; settle t; seek t ~write:false 1;
   check "SCREEN5 sees SCREEN7 even-bank byte" (Vdp.io_read t ~port:0x98 = 0x23);
   let t = fresh 0x08 in white t;
   seek t ~write:true 0; data t [0x40];

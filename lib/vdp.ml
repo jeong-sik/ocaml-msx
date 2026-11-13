@@ -44,6 +44,12 @@ type t = {
      lines the display sits below its neutral place, -7..8 (openMSX
      scheduleLineCountReset reads getVerticalAdjust there). *)
   mutable v_shift : int;
+  (* R#0, R#1 and R#8 as the CPU last wrote them. Their display mode, blank
+     and sprite-disable bits reach [regs] only where the next line starts
+     ({!take_deferred}); their other bits apply at once. *)
+  mutable written_r0 : int;
+  mutable written_r1 : int;
+  mutable written_r8 : int;
   mutable int_pending : bool;
   mutable cmd_ce : bool;
   (* 전송 상태 — CMR 를 쓰면 진입한다. tx_* 는 걷는 모서리다: LMMC/HMMC 는
@@ -140,6 +146,9 @@ let create () =
     blink_on = false;
     blink_count = 0;
     v_shift = 0;
+    written_r0 = 0;
+    written_r1 = 0;
+    written_r8 = 0;
     int_pending = false;
     cmd_ce = false;
     tx = None;
@@ -236,6 +245,15 @@ let vertical_adjust t = adjust (t.regs.(18) lsr 4)
 
 let horizontal_retrace t =
   t.cycle_in_line < (if text_timing t then hr_cycles_text else hr_cycles_graphic)
+
+(* Where a line's processing starts: 144 ticks after its sync, in the left
+   erase (openMSX syncAtNextLine; R#18 moves it with the border, so it
+   stays put relative to the right border). This model's line starts at
+   the right border of the line above, 1282 ticks into it in the graphic
+   modes and 1254 in the text modes, so the point is 230 or 258 ticks in:
+   a write before tick 230 (cycle 38) is taken for this line, a later one
+   for the next. *)
+let line_start_cycle t = if text_timing t then 43 else 39
 
 let vertical_retrace t =
   let last = lines_per_frame t - 1 in
@@ -648,8 +666,25 @@ let step_blink t =
     end
   end
 
+(* Bits whose change waits for the next line start (openMSX
+   VDP::changeRegister calls syncAtNextLine for them): the display mode
+   (R#0 M3-M5, R#1 M1-M2), blank (R#1 BL) and sprite disable (R#8 SPD).
+   The new mode, and so the screen, the sprite engine, the command engine's
+   addressing and the CPU's planar addressing, all follow at that point. *)
+let deferred_bits r =
+  match r with
+  | 0 -> 0x0e
+  | 1 -> 0x58
+  | 8 -> 0x02
+  | _ -> 0
+
 let set_reg t r v =
-  t.regs.(r) <- v land 0xff;
+  let v = v land 0xff in
+  let deferred = deferred_bits r in
+  t.regs.(r) <- (t.regs.(r) land deferred) lor (v land lnot deferred);
+  if r = 0 then t.written_r0 <- v
+  else if r = 1 then t.written_r1 <- v
+  else if r = 8 then t.written_r8 <- v;
   if r = 44 then request_transfer t
   else if r = 13 then restart_blink t (v land 0xff)
   else if r = 46 then start_command t
@@ -1170,46 +1205,64 @@ let present t =
   t.shown_w <- w;
   t.shown_h <- h
 
+(* The deferred bits written so far take effect. *)
+let take_deferred t =
+  let take r written =
+    let m = deferred_bits r in
+    t.regs.(r) <- (t.regs.(r) land lnot m) lor (written land m)
+  in
+  take 0 t.written_r0;
+  take 1 t.written_r1;
+  take 8 t.written_r8
+
 let advance t ~cycles =
   let hit = ref false in
-  t.cycle_in_line <- t.cycle_in_line + cycles;
-  while t.cycle_in_line >= cycles_per_line do
-    t.cycle_in_line <- t.cycle_in_line - cycles_per_line;
-    let finished = t.line in
-    if finished < visible_lines t then render_line t finished;
-    (* 라인 인터럽트: 빔이 줄 (R#19 - R#23) mod 256 의 오른쪽 끝을 지날 때
-       S#1 bit0 — openMSX scheduleHScan. R#23 으로 스크롤해도 분할 위치는
-       화면에 고정된다. 줄 카운터는 표시 줄 0 부터 다음 카운터 리셋
-       (frame_start_line + 8) 직전까지 세므로 아래·위 테두리 줄도 맞으면
-       걸린다 (scheduleHScan: 리셋 뒤의 일치는 "never"). FH 는 IE1(R#0
-       bit4) 이 켜져 있을 때만 래치된다(openMSX execHScan: "if
-       (controlRegs[0] & 0x10)"). IE1 없이 세우면 IE1=0 인 게임이 매
-       프레임 S#1 읽기에서 1 을 본다. *)
-    if t.regs.(0) land 0x10 <> 0
-       && finished < line_count_reset t
-       && finished = (t.regs.(19) - t.regs.(23)) land 0xff
-    then begin
-      t.status1 <- t.status1 lor 1;
-      t.int_pending <- true;
-      hit := true
-    end;
-    t.line <- t.line + 1;
-    if t.line = visible_lines t then begin
-      t.status0 <- t.status0 lor 0x80;
-      t.int_pending <- true;
-      hit := true;
-      present t
-    end;
-    if t.line >= lines_per_frame t then begin
-      t.line <- 0;
-      t.pal <- t.regs.(9) land 0x02 <> 0
-    end;
-    if t.line = frame_start_line t then begin
-      t.even_odd <- not t.even_odd;
-      step_blink t
-    end;
-    if t.line = line_count_reset t then t.v_shift <- vertical_adjust t;
-    if t.line < visible_lines t then check_sprites t ~display_line:t.line
+  let remaining = ref cycles in
+  while !remaining > 0 do
+    let c = t.cycle_in_line in
+    let start = line_start_cycle t in
+    let step = min !remaining (cycles_per_line - c) in
+    if c < start && c + step >= start then take_deferred t;
+    t.cycle_in_line <- c + step;
+    remaining := !remaining - step;
+    if t.cycle_in_line = cycles_per_line then begin
+      t.cycle_in_line <- 0;
+      let finished = t.line in
+      if finished < visible_lines t then render_line t finished;
+      (* 라인 인터럽트: 빔이 줄 (R#19 - R#23) mod 256 의 오른쪽 끝을 지날 때
+         S#1 bit0 — openMSX scheduleHScan. R#23 으로 스크롤해도 분할 위치는
+         화면에 고정된다. 줄 카운터는 표시 줄 0 부터 다음 카운터 리셋
+         (frame_start_line + 8) 직전까지 세므로 아래·위 테두리 줄도 맞으면
+         걸린다 (scheduleHScan: 리셋 뒤의 일치는 "never"). FH 는 IE1(R#0
+         bit4) 이 켜져 있을 때만 래치된다(openMSX execHScan: "if
+         (controlRegs[0] & 0x10)"). IE1 없이 세우면 IE1=0 인 게임이 매
+         프레임 S#1 읽기에서 1 을 본다. *)
+      if t.regs.(0) land 0x10 <> 0
+         && finished < line_count_reset t
+         && finished = (t.regs.(19) - t.regs.(23)) land 0xff
+      then begin
+        t.status1 <- t.status1 lor 1;
+        t.int_pending <- true;
+        hit := true
+      end;
+      t.line <- t.line + 1;
+      if t.line = visible_lines t then begin
+        t.status0 <- t.status0 lor 0x80;
+        t.int_pending <- true;
+        hit := true;
+        present t
+      end;
+      if t.line >= lines_per_frame t then begin
+        t.line <- 0;
+        t.pal <- t.regs.(9) land 0x02 <> 0
+      end;
+      if t.line = frame_start_line t then begin
+        t.even_odd <- not t.even_odd;
+        step_blink t
+      end;
+      if t.line = line_count_reset t then t.v_shift <- vertical_adjust t;
+      if t.line < visible_lines t then check_sprites t ~display_line:t.line
+    end
   done;
   !hit
 
@@ -1290,10 +1343,13 @@ let write_state w t =
 let write_appended w t =
   State_codec.put_bool w t.blink_on;
   State_codec.put_int w t.blink_count;
-  State_codec.put_int w t.v_shift
+  State_codec.put_int w t.v_shift;
+  State_codec.put_int w t.written_r0;
+  State_codec.put_int w t.written_r1;
+  State_codec.put_int w t.written_r8
 
-(* Older states keep blinking off and take the vertical adjust from R#18,
-   which read_state has restored. *)
+(* Older states keep blinking off, take the vertical adjust from R#18,
+   which read_state has restored, and have no deferred bits waiting. *)
 let read_appended r t =
   if State_codec.version r >= 10 then begin
     t.blink_on <- State_codec.get_bool r;
@@ -1301,7 +1357,17 @@ let read_appended r t =
   end;
   t.v_shift <-
     (if State_codec.version r >= 11 then State_codec.get_int r ~min:(-7) ~max:8
-     else vertical_adjust t)
+     else vertical_adjust t);
+  if State_codec.version r >= 12 then begin
+    t.written_r0 <- State_codec.get_int r ~min:0 ~max:255;
+    t.written_r1 <- State_codec.get_int r ~min:0 ~max:255;
+    t.written_r8 <- State_codec.get_int r ~min:0 ~max:255
+  end
+  else begin
+    t.written_r0 <- t.regs.(0);
+    t.written_r1 <- t.regs.(1);
+    t.written_r8 <- t.regs.(8)
+  end
 
 let read_state r t =
   State_codec.fill_int_array r ~min:0 ~max:255 t.regs;

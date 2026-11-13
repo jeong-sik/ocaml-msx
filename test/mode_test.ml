@@ -16,6 +16,10 @@ let set_reg t r v =
   Msx.port_out t 0x99 v;
   Msx.port_out t 0x99 (0x80 lor r)
 
+(* The mode bits take effect where the next line starts (openMSX
+   syncAtNextLine); one frame passes many line starts. *)
+let settle t = Msx.step t ~frames:1
+
 (* (R#0, R#1) → 모드. R#1 은 화면 켬(bit6)을 함께 둔다 — 모드 비트만 본다. *)
 let cases =
   [ (0x00, 0x40, Msx.Graphic1, "GRAPHIC1")
@@ -36,18 +40,21 @@ let () =
     (fun (r0, r1, expected, name) ->
       set_reg t 0 r0;
       set_reg t 1 r1;
+      settle t;
       check (name ^ " decoded") (Msx.display_mode t = expected);
       check (name ^ " named") (Msx.display_mode_to_string (Msx.display_mode t) = name))
     cases;
   (* M1+M3 는 표에 없다: 코드 0x05 그대로. *)
   set_reg t 0 0x02;
   set_reg t 1 0x50;
+  settle t;
   check "M1+M3 is Undefined 0x05" (Msx.display_mode t = Msx.Undefined 0x05);
   check "Undefined names its code"
     (Msx.display_mode_to_string (Msx.display_mode t) = "UNDEFINED(0x05)");
   (* 다른 R#0/R#1 비트(IE·MAG·SIZE·BL)는 모드에 안 섞인다. *)
   set_reg t 0 0x12;
   set_reg t 1 0xe3;
+  settle t;
   check "non-mode bits ignored" (Msx.display_mode t = Msx.Graphic2);
 
   (* VRAM: 0x99 래치(write) 후 0x98 데이터 → vram_read 로 그 자리에서 읽힌다. *)

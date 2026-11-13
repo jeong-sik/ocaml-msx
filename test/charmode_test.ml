@@ -189,6 +189,9 @@ let () =
      0x10000 and R#2 bit 5 selects it; bit 6 is dropped. *)
   let g7 r2 =
     let t = vdp ~r0:0x0e ~r1:0x40 [ (2, r2) ] in
+    (* The CPU's planar addressing follows GRAPHIC 7 once the mode takes
+       effect, 39 cycles into the line (openMSX syncAtNextLine). *)
+    ignore (Vdp.advance t ~cycles:39);
     poke t 0x10000 0x1c;
     first_frame t;
     t

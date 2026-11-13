@@ -64,9 +64,11 @@ let screen5 ?(split = 256) () =
   reg t 2 0x1f;
   palette t 1 (7, 7, 7);
   palette t 2 (7, 0, 0);
-  seek t 0;
+  (* One seek a row: the mode is not in effect before the line start, and
+     outside GRAPHIC 4-7 the address counter does not carry into R#14. *)
   for row = 0 to 255 do
     let c = if row < split then 0x11 else 0x22 in
+    seek t (row * 128);
     for _ = 0 to 127 do Vdp.io_write t ~port:0x98 c done
   done;
   t
