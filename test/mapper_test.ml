@@ -92,9 +92,12 @@ let ascii16 () =
   check "ascii16 0x7000 low half is seg6" (win t 0x8000 = 6);
   check "ascii16 0x7000 high half is seg7" (win t 0xA000 = 7)
 
-(* A ROM whose code writes to the given register addresses via [ld (nn),a]. *)
+(* A 64KB ROM whose code writes to the given register addresses via
+   [ld (nn),a]. It starts with an "AB" header, as a MegaROM's segment 0 does:
+   a 64KB ROM without one is plain (openMSX RomFactory). *)
 let rom_with_writes addrs =
   let b = Bytes.of_string (synth 8) in
+  Bytes.blit_string "AB" 0 b 0 2;
   List.iteri
     (fun i addr ->
       let p = 0x100 + (i * 3) in
@@ -105,7 +108,7 @@ let rom_with_writes addrs =
   Bytes.to_string b
 
 let detection () =
-  check "flat for a 32KB rom" (Msx.guess_mapper (synth 4) = Msx.Flat);
+  check "plain for a 32KB rom" (Msx.guess_mapper (synth 4) = Msx.Plain (Mirrored Header));
   check "konami from 0x6000/0x8000/0xA000"
     (Msx.guess_mapper (rom_with_writes [ 0x6000; 0x8000; 0xa000 ]) = Msx.Konami);
   check "scc from 0x5000/0x9000/0xB000"
@@ -120,10 +123,12 @@ let detection () =
      = Msx.Ascii8_sram);
   check "ascii16 from 0x6000/0x7000"
     (Msx.guess_mapper (rom_with_writes [ 0x6000; 0x7000 ]) = Msx.Ascii16);
+  check "a 64KB rom without a header at its first byte is plain"
+    (Msx.guess_mapper (synth 8) = Msx.Plain (Mirrored Header));
   (* a flat 32KB cart reads through the flat path, not a bank register *)
   let t = machine () in
   Msx.load_cartridge t (synth 4);
-  check "a 32KB cart is Flat" (Msx.cart_mapper t = Msx.Flat)
+  check "a 32KB cart is plain" (Msx.cart_mapper t = Msx.Plain (Mirrored Header))
 
 (* Koei ASCII8 with battery RAM: a 256KB cart has 32 segments, so bank bit 0x20
    is the first above the segment range and selects SRAM. A store into an SRAM
@@ -146,6 +151,133 @@ let koei_sram () =
   Msx.mem_write t 0x7000 0x20;
   check "koei sram retained across bank switch" (win t 0x8000 = 0xab)
 
+(* Plain ROMs (openMSX RomPlain, type Mirrored). Each 8KB page of the file
+   holds its own index at offset 0x100; the "AB" header at file offset
+   [header] with routine pointers [ptrs] (INIT, STATEMENT, ...) decides where
+   the ROM starts. All four CPU pages are switched to slot 2 and each 8KB page
+   is read at +0x100. *)
+let plain_rom ~size ~header ptrs =
+  let b = Bytes.make size '\000' in
+  for p = 0 to (size / 0x2000) - 1 do
+    Bytes.set b ((p * 0x2000) + 0x100) (Char.chr p)
+  done;
+  Bytes.blit_string "AB" 0 b header 2;
+  List.iteri
+    (fun i ptr ->
+      Bytes.set b (header + 2 + (2 * i)) (Char.chr (ptr land 0xff));
+      Bytes.set b (header + 3 + (2 * i)) (Char.chr (ptr lsr 8)))
+    ptrs;
+  Bytes.to_string b
+
+let plain () =
+  let shows name rom expect =
+    let t = machine () in
+    Msx.load_cartridge t rom;
+    Msx.port_out t 0xA8 0xAA;
+    let got = List.init 8 (fun p -> Msx.mem_read t ((p * 0x2000) + 0x100)) in
+    check (name ^ " is plain") (Msx.cart_mapper t = Msx.Plain (Mirrored Header));
+    check
+      (Printf.sprintf "%s: pages %s" name (String.concat "," (List.map string_of_int got)))
+      (got = expect)
+  in
+  let at_4000 = [ 2; 3; 0; 1; 2; 3; 0; 1 ] and at_8000 = [ 0; 1; 2; 3; 0; 1; 2; 3 ] in
+  shows "8KB at 0x4000" (plain_rom ~size:0x2000 ~header:0 [ 0x4010 ]) [ 0; 0; 0; 0; 0; 0; 0; 0 ];
+  shows "16KB at 0x4000" (plain_rom ~size:0x4000 ~header:0 [ 0x4010 ]) [ 0; 1; 0; 1; 0; 1; 0; 1 ];
+  shows "32KB at 0x4000" (plain_rom ~size:0x8000 ~header:0 [ 0x4010 ]) at_4000;
+  shows "32KB at 0x8000" (plain_rom ~size:0x8000 ~header:0 [ 0x8010 ]) at_8000;
+  (* A pointer counts from its header's place in the file: a header at file
+     offset 0x4000 pointing into 0x8000 votes for the file starting at 0x4000. *)
+  shows "32KB, header at 0x4000 into 0x8000" (plain_rom ~size:0x8000 ~header:0x4000 [ 0x8010 ]) at_4000;
+  (* One vote each for 0x0000 and 0x4000: 0x4000 wins the tie. One each for
+     0x0000 and 0x8000: 0x0000 wins. A 24KB ROM tells the two apart: from
+     0x0000 page 3 shows 3 land 2 = 2; from 0x8000 page 1 shows -3 land 2 = 0. *)
+  shows "32KB, tie 0x0000/0x4000" (plain_rom ~size:0x8000 ~header:0 [ 0x0010; 0x4020 ]) at_4000;
+  shows "24KB, tie 0x0000/0x8000"
+    (plain_rom ~size:0x6000 ~header:0 [ 0x0010; 0x8020 ])
+    [ 0; 1; 2; 2; 0; 0; 2; 2 ];
+  shows "24KB at 0x8000" (plain_rom ~size:0x6000 ~header:0 [ 0x8020 ]) [ 0; 0; 2; 2; 0; 1; 2; 2 ];
+  (* The header sits at file offset 0x4000 and points into 0x4000: the file
+     starts at 0x0000. 48KB is six pages: page 6 shows 6 land 5 = 4. *)
+  shows "48KB at 0x0000" (plain_rom ~size:0xc000 ~header:0x4000 [ 0x4010 ]) [ 0; 1; 2; 3; 4; 5; 4; 5 ];
+  shows "64KB at 0x0000" (plain_rom ~size:0x10000 ~header:0x4000 [ 0x4010 ]) [ 0; 1; 2; 3; 4; 5; 6; 7 ]
+
+(* The other plain layouts: Normal leaves the pages outside the ROM empty
+   (openMSX RomPlain), Pages fills the named 16KB pages with the banks in
+   order, wrapping to the ROM (openMSX RomPageNN). An empty page reads
+   0xFF. *)
+let layouts () =
+  let pages t = List.init 8 (fun p -> Msx.mem_read t ((p * 0x2000) + 0x100)) in
+  let shows name layout rom expect =
+    let t = machine () in
+    Msx.load_cartridge ~mapper:(Msx.Plain layout) t rom;
+    Msx.port_out t 0xA8 0xAA;
+    let got = pages t in
+    check
+      (Printf.sprintf "%s: pages %s" name (String.concat "," (List.map string_of_int got)))
+      (got = expect)
+  in
+  let e = 0xff and r16 = plain_rom ~size:0x4000 ~header:0 [ 0x4010 ] in
+  let r32 = plain_rom ~size:0x8000 ~header:0 [ 0x4010 ] in
+  shows "Normal4000 16KB" (Normal At_4000) r16 [ e; e; 0; 1; e; e; e; e ];
+  shows "Normal 32KB from its header" (Normal Header) r32 [ e; e; 0; 1; 2; 3; e; e ];
+  shows "Normal4000 48KB" (Normal At_4000) (plain_rom ~size:0xc000 ~header:0 [ 0x4010 ])
+    [ e; e; 0; 1; 2; 3; 4; 5 ];
+  shows "Normal8000 16KB" (Normal At_8000) r16 [ e; e; e; e; 0; 1; e; e ];
+  (* From 0x8000 a 16KB ROM mirrors back: page 0 shows -4 land 1 = 0. *)
+  shows "Mirrored8000 16KB" (Mirrored At_8000) r16 [ 0; 1; 0; 1; 0; 1; 0; 1 ];
+  shows "Page2 16KB" (Pages Page2) r16 [ e; e; e; e; 0; 1; e; e ];
+  shows "Page12 32KB" (Pages Page12) r32 [ e; e; 0; 1; 2; 3; e; e ];
+  shows "Page23 32KB" (Pages Page23) r32 [ e; e; e; e; 0; 1; 2; 3 ];
+  shows "Page01 32KB" (Pages Page01) r32 [ 0; 1; 2; 3; e; e; e; e ];
+  (* Three pages from a 16KB ROM: banks 2-5 wrap to 0, 1, 0, 1. *)
+  shows "Page012 16KB" (Pages Page012) r16 [ 0; 1; 0; 1; 0; 1; e; e ];
+  (* openMSX guessRomType: a BASIC ROM of at most 16KB goes in page 2. *)
+  let basic ~size ~init ~at_init =
+    let b = Bytes.make size '\000' in
+    Bytes.blit_string "AB" 0 b 0 2;
+    Bytes.set b 2 (Char.chr (init land 0xff));
+    Bytes.set b 3 (Char.chr (init lsr 8));
+    Bytes.set b 8 '\x10';
+    Bytes.set b 9 '\x80';
+    if init <> 0 then Bytes.set b (init land (size - 1)) at_init;
+    Bytes.to_string b
+  in
+  check "a 16KB BASIC ROM is Page2"
+    (Msx.guess_mapper (basic ~size:0x4000 ~init:0 ~at_init:'\xc9') = Msx.Plain (Pages Page2));
+  check "a BASIC ROM whose INIT is a RET in page 2 is Page2"
+    (Msx.guess_mapper (basic ~size:0x4000 ~init:0x8020 ~at_init:'\xc9')
+     = Msx.Plain (Pages Page2));
+  check "a BASIC ROM whose INIT runs code is Mirrored"
+    (Msx.guess_mapper (basic ~size:0x4000 ~init:0x8020 ~at_init:'\x3e')
+     = Msx.Plain (Mirrored Header));
+  check "a 32KB BASIC ROM is Mirrored"
+    (Msx.guess_mapper (basic ~size:0x8000 ~init:0 ~at_init:'\xc9')
+     = Msx.Plain (Mirrored Header));
+  (* A saved machine keeps the layout. *)
+  let t = machine () in
+  Msx.load_cartridge ~mapper:(Msx.Plain (Normal At_4000)) t r16;
+  match Msx.restore ~state:(Msx.serialize t) with
+  | Error m -> check ("restore: " ^ m) false
+  | Ok u ->
+    Msx.port_out u 0xA8 0xAA;
+    check "restored layout" (Msx.cart_mapper u = Msx.Plain (Normal At_4000));
+    check "restored pages" (pages u = [ e; e; 0; 1; e; e; e; e ])
+
+(* A MegaROM is no plain ROM: outside 0x4000-0xBFFF the ASCII mappers show
+   an empty bus, not a mirror of the file (openMSX RomAscii8kB, RomAscii16kB,
+   RomAscii8_8 reset). *)
+let megarom_outside () =
+  List.iter
+    (fun (name, mapper) ->
+      let t = machine () in
+      Msx.load_cartridge ~mapper t (synth 8);
+      Msx.port_out t 0xA8 0xAA;
+      List.iter
+        (fun a ->
+          check (Printf.sprintf "%s: 0x%04x reads 0xFF" name a) (win t a = 0xff))
+        [ 0x0000; 0x2000; 0xc000; 0xe000 ])
+    [ ("ascii8", Msx.Ascii8); ("ascii16", Msx.Ascii16); ("koei", Msx.Ascii8_sram) ]
+
 let () =
   konami ();
   konami_scc ();
@@ -153,6 +285,9 @@ let () =
   ascii16 ();
   koei_sram ();
   detection ();
+  plain ();
+  layouts ();
+  megarom_outside ();
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1

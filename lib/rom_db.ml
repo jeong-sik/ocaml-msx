@@ -1,9 +1,11 @@
 (* A reader for openMSX's softwaredb.xml that keeps only what picks a
-   mapper: per <dump>, the type of its <rom>/<megarom> and the SHA-1 in its
-   <hash>. The rules follow openMSX RomDatabase.cc DBParser: a <rom> with
-   no <type> is "Mirrored", a <megarom> has to name one, a dump without a
-   usable hash is dropped. Everything else (titles, remarks, <original>)
-   is skipped over without being read. *)
+   mapper: per <dump>, the type and start of its <rom>/<megarom> and the
+   SHA-1 in its <hash>. The rules follow openMSX RomDatabase.cc DBParser: a
+   <rom> with no <type> is "Mirrored", a <megarom> has to name one, a
+   "Mirrored" or "Normal" type with a <start> of the form 0xNNNN becomes
+   that type with NNNN appended, a dump without a usable hash is dropped.
+   Everything else (titles, remarks, <original>) is skipped over without
+   being read. *)
 
 type kind = Mapper of Msx.cart_mapper | Not_emulated of string
 
@@ -13,22 +15,46 @@ let entries t = t.entries
 let skipped t = t.skipped
 let sha1_hex_len = 40
 
+let plain_name : Msx.plain_layout -> string = function
+  | Mirrored Header -> "plain"
+  | Mirrored At_0000 -> "mirrored0000"
+  | Mirrored At_4000 -> "mirrored4000"
+  | Mirrored At_8000 -> "mirrored8000"
+  | Mirrored At_c000 -> "mirroredc000"
+  | Normal Header -> "normal"
+  | Normal At_0000 -> "normal0000"
+  | Normal At_4000 -> "normal4000"
+  | Normal At_8000 -> "normal8000"
+  | Normal At_c000 -> "normalc000"
+  | Pages Page0 -> "page0"
+  | Pages Page1 -> "page1"
+  | Pages Page01 -> "page01"
+  | Pages Page2 -> "page2"
+  | Pages Page12 -> "page12"
+  | Pages Page012 -> "page012"
+  | Pages Page3 -> "page3"
+  | Pages Page23 -> "page23"
+  | Pages Page123 -> "page123"
+  | Pages Page0123 -> "page0123"
+
 let mapper_name : Msx.cart_mapper -> string = function
-  | Flat -> "plain"
+  | Plain layout -> plain_name layout
   | Ascii8 -> "ascii8"
   | Ascii16 -> "ascii16"
   | Konami -> "konami"
   | Konami_scc -> "konami-scc"
   | Ascii8_sram -> "koei"
 
-let mapper_of_name = function
-  | "plain" -> Some Msx.Flat
-  | "ascii8" -> Some Msx.Ascii8
-  | "ascii16" -> Some Msx.Ascii16
-  | "konami" -> Some Msx.Konami
-  | "konami-scc" -> Some Msx.Konami_scc
-  | "koei" -> Some Msx.Ascii8_sram
-  | _ -> None
+let all_mappers : Msx.cart_mapper list =
+  let starts : Msx.plain_start list = [ Header; At_0000; At_4000; At_8000; At_c000 ] in
+  List.map (fun s -> Msx.Plain (Mirrored s)) starts
+  @ List.map (fun s -> Msx.Plain (Normal s)) starts
+  @ List.map
+      (fun p -> Msx.Plain (Pages p))
+      [ Page0; Page1; Page01; Page2; Page12; Page012; Page3; Page23; Page123; Page0123 ]
+  @ [ Ascii8; Ascii16; Konami; Konami_scc; Ascii8_sram ]
+
+let mapper_of_name name = List.find_opt (fun m -> mapper_name m = name) all_mappers
 
 (* openMSX RomInfo.cc names and aliases, lowercased, for the types this
    emulator has. KoeiSRAM8 and KoeiSRAM32 both land on the one Koei mapper,
@@ -40,12 +66,26 @@ let kind_of_name name =
   | "konami" | "konami4" | "3" -> Mapper Konami
   | "konamiscc" | "scc" | "konami5" | "2" -> Mapper Konami_scc
   | "koeisram8" | "koeisram32" -> Mapper Ascii8_sram
-  | "mirrored" | "mirrored0000" | "mirrored4000" | "mirrored8000" | "mirroredc000"
-  | "normal" | "normal0000" | "normal4000" | "normal8000" | "normalc000"
-  | "page0" | "page1" | "page2" | "page3" | "page01" | "page12" | "page23"
-  | "page012" | "page123" | "page0123"
-  | "64kb" | "plain" | "0x0000" | "0x4000" | "0x8000" | "0xc000" | "rombas" ->
-    Mapper Flat
+  | "mirrored" | "64kb" | "plain" -> Mapper (Plain (Mirrored Header))
+  | "mirrored0000" -> Mapper (Plain (Mirrored At_0000))
+  | "mirrored4000" -> Mapper (Plain (Mirrored At_4000))
+  | "mirrored8000" -> Mapper (Plain (Mirrored At_8000))
+  | "mirroredc000" -> Mapper (Plain (Mirrored At_c000))
+  | "normal" -> Mapper (Plain (Normal Header))
+  | "normal0000" | "0x0000" -> Mapper (Plain (Normal At_0000))
+  | "normal4000" | "0x4000" -> Mapper (Plain (Normal At_4000))
+  | "normal8000" | "0x8000" | "rombas" -> Mapper (Plain (Normal At_8000))
+  | "normalc000" | "0xc000" -> Mapper (Plain (Normal At_c000))
+  | "page0" -> Mapper (Plain (Pages Page0))
+  | "page1" -> Mapper (Plain (Pages Page1))
+  | "page01" -> Mapper (Plain (Pages Page01))
+  | "page2" -> Mapper (Plain (Pages Page2))
+  | "page12" -> Mapper (Plain (Pages Page12))
+  | "page012" -> Mapper (Plain (Pages Page012))
+  | "page3" -> Mapper (Plain (Pages Page3))
+  | "page23" -> Mapper (Plain (Pages Page23))
+  | "page123" -> Mapper (Plain (Pages Page123))
+  | "page0123" -> Mapper (Plain (Pages Page0123))
   | _ -> Not_emulated name
 
 exception Malformed of string
@@ -88,9 +128,21 @@ let text s i =
   let j = match String.index_from_opt s i '<' with Some j -> j | None -> String.length s in
   String.trim (String.sub s i (j - i))
 
-(* The <rom> or <megarom> being read. A <type> or <hash> outside one is
-   not read. *)
-type rom = { mutable typ : string; mutable hash : string option }
+(* The <rom> or <megarom> being read. A <type>, <start> or <hash> outside
+   one is not read. *)
+type rom = { mutable typ : string; mutable start : string; mutable hash : string option }
+
+(* openMSX DBParser: "Mirrored" or "Normal" with a start of six characters
+   from "0x" takes the four after "0x" as a suffix ("Normal" + "4000"). *)
+let start_prefix = "0x"
+let start_len = 6
+
+let typed_name r =
+  if (r.typ = "Mirrored" || r.typ = "Normal")
+     && String.length r.start = start_len
+     && String.starts_with ~prefix:start_prefix r.start
+  then r.typ ^ String.sub r.start 2 (start_len - 2)
+  else r.typ
 
 let parse xml =
   let table = Hashtbl.create 8192 in
@@ -99,9 +151,10 @@ let parse xml =
   and rom = ref None in
   let start_tag name i =
     match (name, !rom) with
-    | "rom", None -> rom := Some { typ = "Mirrored"; hash = None }
-    | "megarom", None -> rom := Some { typ = ""; hash = None }
+    | "rom", None -> rom := Some { typ = "Mirrored"; start = ""; hash = None }
+    | "megarom", None -> rom := Some { typ = ""; start = ""; hash = None }
     | "type", Some r -> r.typ <- text xml i
+    | "start", Some r -> r.start <- text xml i
     | "hash", Some r ->
       (* openMSX skips a bad hash and keeps what the dump had. *)
       Option.iter (fun h -> r.hash <- Some h) (hash_of_text (text xml i))
@@ -110,7 +163,7 @@ let parse xml =
   let end_tag name =
     match (name, !rom) with
     | ("rom" | "megarom"), Some r ->
-      dump := Option.map (fun h -> (kind_of_name r.typ, h)) r.hash;
+      dump := Option.map (fun h -> (kind_of_name (typed_name r), h)) r.hash;
       rom := None
     | "dump", _ ->
       (match !dump with

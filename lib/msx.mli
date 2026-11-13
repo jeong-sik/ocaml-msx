@@ -36,10 +36,29 @@ type machine = {
 
 type t
 
-(** MegaROM cartridge mapper. [Flat] is a plain 16/32KB cart; the others bank
-    8KB/16KB windows the way the named hardware does (openMSX RomKonami /
-    RomKonamiSCC / RomAscii8 / RomAscii16). SCC sound is not modelled. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
+(** Where a plain ROM starts: at the 16KB page its "AB" header's routine
+    pointers fall in (openMSX RomPlain::guessLocation), or at a fixed
+    address. *)
+type plain_start = Header | At_0000 | At_4000 | At_8000 | At_c000
+
+(** The 16KB pages openMSX RomPageNN fills, named as its ROM types are.
+    [Page01] fills pages 0 and 1; openMSX 21.0 maps page 0 only there. *)
+type plain_pages =
+  | Page0 | Page1 | Page01 | Page2 | Page12 | Page012 | Page3 | Page23 | Page123
+  | Page0123
+
+(** How a plain ROM fills its slot. [Mirrored] places it from its start and
+    repeats it over the rest of the 64KB; [Normal] leaves the rest unmapped
+    (openMSX RomPlain). [Pages] fills the named pages, lowest first, with the
+    ROM's 8KB banks in order and leaves the others unmapped (openMSX
+    RomPageNN). An unmapped page reads 0xFF. *)
+type plain_layout = Mirrored of plain_start | Normal of plain_start | Pages of plain_pages
+
+(** Cartridge mapper. [Plain] is a ROM of up to 64KB with no banking; the
+    others bank 8KB/16KB windows the way the named hardware does (openMSX
+    RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16). SCC sound is not
+    modelled. *)
+type cart_mapper = Plain of plain_layout | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
 
 val create : machine:machine -> t
 
@@ -57,11 +76,16 @@ val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
     reset linear so the ROM boots from segment 0. *)
 
 val cart_mapper : t -> cart_mapper
-(** The mapper the plugged-in cart is using ([Flat] when none/plain). *)
+(** The mapper the plugged-in cart is using ([Plain (Mirrored Header)] when
+    none is plugged in). *)
 
 val guess_mapper : string -> cart_mapper
-(** Guess a ROM's mapper by counting its bank-register writes. [Flat] for a ROM
-    of 32KB or less. A heuristic — the caller can override with
+(** Guess a ROM's mapper by counting its bank-register writes. [Plain] for a
+    ROM under 64KB, or a 64KB one without an "AB" header at its first byte
+    (openMSX RomFactory). The plain layout is [Mirrored Header], except a
+    BASIC ROM of at most 16KB, whose TEXT pointer is in 0x8000-0xBFFF and
+    whose INIT is 0 or points at a RET there: [Pages Page2] (openMSX
+    guessRomType). A heuristic — the caller can override with
     [load_cartridge ~mapper]. *)
 
 val palette_entries : t -> (int * int * int) array
