@@ -194,3 +194,8 @@
  (name text2_test)
  (modules text2_test)
  (libraries vdpcore))
+
+(test
+ (name vdp_vr_test)
+ (modules vdp_vr_test)
+ (libraries vdpcore))
