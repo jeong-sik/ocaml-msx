@@ -49,6 +49,38 @@ let konami () =
   Msx.mem_write t 0x4000 3;
   check "konami 0x4000 write is inert" (win t 0x4000 = 0)
 
+(* Hai no Majutsushi (openMSX RomMajutsushi): Konami banking, with writes
+   to 0x5000-0x5FFF going to a DAC instead of a bank register. Konami SCC
+   decodes only 0x5000/0x7000/0x9000/0xB000, so a write to 0xA000 tells
+   the two apart. *)
+let majutsushi () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Majutsushi t (synth 8);
+  show_cart t;
+  check "majutsushi boots linear 0xA000=seg3" (win t 0xA000 = 3);
+  Msx.mem_write t 0xA000 5;
+  check "majutsushi 0xA000 selects seg5" (win t 0xA000 = 5);
+  Msx.mem_write t 0x6000 6;
+  check "majutsushi 0x6000 selects seg6" (win t 0x6000 = 6);
+  Msx.mem_write t 0x8000 7;
+  check "majutsushi 0x8000 selects seg7" (win t 0x8000 = 7);
+  Msx.mem_write t 0x5000 4;
+  Msx.mem_write t 0x5fff 4;
+  check "majutsushi DAC writes select nothing"
+    (win t 0x4000 = 0 && win t 0x6000 = 6 && win t 0x8000 = 7 && win t 0xA000 = 5);
+  (* RomKonami's block mask 31 carries over: 13 of 8 is past the end and
+     reads 0xFF (blocks - 1 would give 5); 35 of 8 -> 3. *)
+  Msx.mem_write t 0xA000 13;
+  check "majutsushi 13 of 8 is unmapped" (win t 0xA000 = 0xff);
+  Msx.mem_write t 0xA000 35;
+  check "majutsushi 35 of 8 -> 3" (win t 0xA000 = 3);
+  match Msx.restore ~state:(Msx.serialize t) with
+  | Error e -> check ("majutsushi restore: " ^ e) false
+  | Ok u ->
+    check "majutsushi survives a save" (Msx.cart_mapper u = Msx.Majutsushi);
+    show_cart u;
+    check "majutsushi banks survive a save" (win u 0xA000 = 3 && win u 0x6000 = 6)
+
 let konami_scc () =
   let t = machine () in
   Msx.load_cartridge ~mapper:Msx.Konami_scc t (synth 8);
@@ -435,6 +467,7 @@ let () =
   ascii16_sram ();
   generic ();
   konami ();
+  majutsushi ();
   out_of_range ();
   koei_windows ();
   konami_scc ();

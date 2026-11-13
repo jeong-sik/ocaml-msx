@@ -124,6 +124,7 @@ let () =
       | "crossblaim" -> Some Msx.Cross_blaim
       | "wonderkid" -> Some Msx.Wonder_kid
       | "superloderunner" -> Some Msx.Super_lode_runner
+      | "majutsushi" -> Some Msx.Majutsushi
       | "" -> None
       | other -> Printf.ksprintf failwith "unknown --cart-mapper %s" other
     in
