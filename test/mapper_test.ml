@@ -211,7 +211,37 @@ let koei_windows () =
   Msx.mem_write t 0x7000 7;
   check "koei 24 segments: bank 7 is rom" (win t 0x8000 = 7)
 
+(* openMSX RomGeneric8kB / RomGeneric16kB: a write anywhere in a window
+   selects that window's bank; the banks start at 0-3 (8kB) and 0,1
+   (16kB). *)
+let generic () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Generic8 t (synth 8);
+  show_cart t;
+  List.iteri
+    (fun i a -> check (Printf.sprintf "generic8 reset 0x%04X=seg%d" a i) (win t a = i))
+    [ 0x4000; 0x6000; 0x8000; 0xA000 ];
+  List.iter
+    (fun (reg, seg, a) ->
+      Msx.mem_write t reg seg;
+      check (Printf.sprintf "generic8 write 0x%04X selects seg%d" reg seg) (win t a = seg))
+    [ (0x4000, 5, 0x4000); (0x7fff, 6, 0x6000); (0x9234, 7, 0x8000); (0xa001, 4, 0xa000) ];
+  check "generic8 window 0 kept" (win t 0x4000 = 5);
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Generic16 t (synth 8);
+  show_cart t;
+  List.iteri
+    (fun i a -> check (Printf.sprintf "generic16 reset 0x%04X=seg%d" a i) (win t a = i))
+    [ 0x4000; 0x6000; 0x8000; 0xA000 ];
+  Msx.mem_write t 0x5555 3;
+  check "generic16 0x4000-0x7FFF write selects bank 3 low" (win t 0x4000 = 6);
+  check "generic16 bank 3 high half" (win t 0x6000 = 7);
+  Msx.mem_write t 0xbfff 2;
+  check "generic16 0x8000-0xBFFF write selects bank 2" (win t 0x8000 = 4 && win t 0xA000 = 5);
+  check "generic16 5 of 4 banks -> 1" (Msx.mem_write t 0x8000 5; win t 0x8000 = 2)
+
 let () =
+  generic ();
   konami ();
   out_of_range ();
   koei_windows ();

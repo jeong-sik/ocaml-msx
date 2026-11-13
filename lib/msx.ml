@@ -84,8 +84,19 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    segments per window and swaps them when the running code writes a bank
    register. [Flat] is the plain 16/32KB cart with no banking. The four here are
    the common ones (openMSX RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16);
-   the SCC sound chip is not modelled, only its banking. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
+   the SCC sound chip is not modelled, only its banking. [Generic8] and
+   [Generic16] (openMSX RomGeneric8kB / RomGeneric16kB, the database's "8kB"
+   or "GenericKonami" and "16kB") take a bank from a write anywhere in the
+   window it selects. *)
+type cart_mapper =
+  | Flat
+  | Konami
+  | Konami_scc
+  | Ascii8
+  | Ascii16
+  | Ascii8_sram
+  | Generic8
+  | Generic16
 
 (* WD279x 근사 상태. 즉시-완료 모델: 명령을 받으면 상태 읽기 한 번 안에
    seek/read 준비를 끝낸다 — 실기 타이밍의 근사이고, 로더가 상태 비트를
@@ -195,8 +206,8 @@ let rom_or_empty = function "" -> Bytes.make 0x4000 '\000' | s -> Bytes.of_strin
    Rom8kBBlocks / Rom16kBBlocks). load_cartridge pads the image with 0xFF
    to whole blocks, as RomBlocks does. *)
 let cart_block_size = function
-  | Ascii16 -> 0x4000
-  | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram -> 0x2000
+  | Ascii16 | Generic16 -> 0x4000
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram | Generic8 -> 0x2000
 
 (* What a block number past the end of the ROM wraps with: openMSX
    RomBlocks::setRom keeps a block below nrBlocks, masks a larger one with
@@ -206,16 +217,20 @@ let konami_block_mask = 31
 let unmapped_read = 0xff
 
 (* The ROM byte at [off] (0..0x1FFF) of window [w] (0..3, one per 8KB of
-   0x4000-0xBFFF). ASCII16 shows one 16KB bank across two windows. *)
+   0x4000-0xBFFF). A 16KB mapper shows one bank across two windows. *)
 let cart_rom_read m w off =
   let size = cart_block_size m.cart_mapper in
   let blocks = Bytes.length m.cart / size in
   let bank, within =
     match m.cart_mapper with
-    | Ascii16 -> (m.cart_banks.(w lsr 1), ((w land 1) * 0x2000) + off)
-    | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram -> (m.cart_banks.(w), off)
+    | Ascii16 | Generic16 -> (m.cart_banks.(w lsr 1), ((w land 1) * 0x2000) + off)
+    | Flat | Konami | Konami_scc | Ascii8 | Ascii8_sram | Generic8 -> (m.cart_banks.(w), off)
   in
-  let mask = match m.cart_mapper with Konami -> konami_block_mask | _ -> blocks - 1 in
+  let mask =
+    match m.cart_mapper with
+    | Konami -> konami_block_mask
+    | Flat | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram | Generic8 | Generic16 -> blocks - 1
+  in
   let block = if bank < blocks then bank else bank land mask in
   if block < blocks then Char.code (Bytes.get m.cart ((block * size) + within))
   else unmapped_read
@@ -253,6 +268,8 @@ let cart_bank_write m a v =
      | 0x6000 -> m.cart_banks.(0) <- v
      | 0x7000 -> m.cart_banks.(1) <- v
      | _ -> ())
+  | Generic8 -> m.cart_banks.((a lsr 13) - 2) <- v
+  | Generic16 -> m.cart_banks.((a lsr 14) - 1) <- v
 
 (* Guess a mapper from the ROM by looking at where its code writes bank
    registers ([ld (nn),a]). Only for ROMs over 32KB; smaller carts sit flat.
@@ -870,19 +887,21 @@ let load_cartridge ?mapper t rom =
   t.cart <-
     (match t.cart_mapper with
      | Flat -> Bytes.of_string rom
-     | Konami | Konami_scc | Ascii8 | Ascii8_sram | Ascii16 ->
+     | Konami | Konami_scc | Ascii8 | Ascii8_sram | Ascii16 | Generic8 | Generic16 ->
        let size = cart_block_size t.cart_mapper in
        let len = String.length rom in
        let padded = Bytes.make ((len + size - 1) / size * size) '\xff' in
        Bytes.blit_string rom 0 padded 0 len;
        padded);
-  (* The banks power up as openMSX's reset leaves them: Konami and Konami
-     SCC show blocks 0-3 (RomKonami/RomKonamiSCC bankSwitch(i, i - 2)),
-     ASCII8 and ASCII16 show block 0 in every window (setRom(i, 0)). Block 0
-     at 0x4000 holds the "AB" header either way. *)
+  (* The banks power up as openMSX's reset leaves them: Konami, Konami SCC
+     and Generic 8kB show blocks 0-3 (bankSwitch(i, i - 2) / setRom(i,
+     i - 2)), Generic 16kB blocks 0 and 1, ASCII8 and ASCII16 block 0 in
+     every window (setRom(i, 0)). Block 0 at 0x4000 holds the "AB" header
+     either way. *)
   Array.blit
     (match t.cart_mapper with
-     | Flat | Konami | Konami_scc -> [| 0; 1; 2; 3 |]
+     | Flat | Konami | Konami_scc | Generic8 -> [| 0; 1; 2; 3 |]
+     | Generic16 -> [| 0; 1; 0; 0 |]
      | Ascii8 | Ascii8_sram | Ascii16 -> [| 0; 0; 0; 0 |])
     0 t.cart_banks 0 4;
   (* A Koei cart gets 32KB of battery RAM (covers KoeiSRAM8 and KoeiSRAM32).
@@ -2109,10 +2128,13 @@ let frame_dims t = Vdp.frame_dims t.vdp
 
 let frame_rgb t = Vdp.frame_rgb t.vdp
 
+(* State codes; the reader bounds them by Generic16's, the highest. *)
 let mapper_code = function
   | Flat -> 0 | Konami -> 1 | Konami_scc -> 2 | Ascii8 -> 3 | Ascii16 -> 4 | Ascii8_sram -> 5
+  | Generic8 -> 6 | Generic16 -> 7
 let mapper_of_code = function
   | 0 -> Flat | 1 -> Konami | 2 -> Konami_scc | 3 -> Ascii8 | 4 -> Ascii16 | 5 -> Ascii8_sram
+  | 6 -> Generic8 | 7 -> Generic16
   | _ -> State_codec.fail "invalid cartridge mapper"
 
 let serialize t =
@@ -2190,7 +2212,7 @@ let restore_with_reader reader state =
     if sram_size <> 0 && (sram_size mod 8192 <> 0 || sram_size land (sram_size - 1) <> 0) then
       State_codec.fail "invalid cartridge SRAM size";
     t.disk <- State_codec.get_bytes r;
-    t.cart_mapper <- mapper_of_code (State_codec.get_int r ~min:0 ~max:5);
+    t.cart_mapper <- mapper_of_code (State_codec.get_int r ~min:0 ~max:(mapper_code Generic16));
     State_codec.fill_int_array r ~min:0 ~max:255 t.cart_banks;
     State_codec.fill_int_array r ~min:0 ~max:63 t.mapper;
     State_codec.fill_int_array r ~min:0 ~max:255 t.psg;
