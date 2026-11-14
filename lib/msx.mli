@@ -47,9 +47,9 @@ val name : t -> string
 
 
 val fdc_recent_calls : unit -> (int * int * int * int) array
-(** Recent FDC port touches (kind, port, value, caller pc), newest last, ring
-    of 256. kind 0 = read, 1 = write. Boot diagnosis for loaders that program
-    the WD279x directly instead of calling the disk BIOS entries. *)
+(** Recent accesses to the FDC window (kind, address 0x7FF8-0x7FFF, value,
+    caller pc), newest last, ring of 256. kind 0 = read, 1 = write. Boot
+    diagnosis for loaders that program the WD2793 directly. *)
 
 val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
@@ -110,8 +110,8 @@ val boot_disk : t -> (unit, string) result
     cart-INIT path reboots mid-boot (see the implementation note). *)
 
 val set_fdc_trace : bool -> unit
-(** FDC sector reads, data pump bytes and status-poll changes to stderr. Off
-    by default. *)
+(** Each write to the FDC window, with the last 64 instruction PCs, to
+    stderr. Off by default. *)
 
 val set_ppi_trace : bool -> unit
 (** Slot select (0xA8) and mapper (0xFC-0xFF) writes to stderr. Off by
