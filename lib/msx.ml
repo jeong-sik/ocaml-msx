@@ -432,6 +432,23 @@ let fdc_recent_calls () =
    RAM)이 서브0(sub ROM)로 뭉개져 "MEMORY NOT FOUND" 가 난다(실측). *)
 let slot3_sub m page = (m.slot3_sel lsr (page * 2)) land 3
 
+(* The RAM mapper, as openMSX MSXMemoryMapperBase has it. A register keeps
+   the bits that can name a segment, bit_ceil(segments) - 1, and reads back
+   with the bits above set: a 512KB mapper reads segment 3 as 0xE3. A
+   register past the last segment (only when the count is not a power of
+   two) folds with segments - 1. *)
+let ram_segments m = Bytes.length m.ram / 0x4000
+
+let mapper_mask m =
+  let n = ram_segments m in
+  let rec ceil p = if p >= n then p else ceil (p * 2) in
+  ceil 1 - 1
+
+let ram_offset m page off =
+  let n = ram_segments m in
+  let seg = m.mapper.(page) in
+  (if seg < n then seg else seg land (n - 1)) * 0x4000 + off
+
 let mem_read m addr =
   let a = addr land 0xffff in
   let page = a lsr 14 in
@@ -594,9 +611,7 @@ let mem_read m addr =
       | 0 -> Char.code (Bytes.get m.sub_rom (off land 0x3fff))
       | 1 -> 0xff
       | 2 ->
-        let seg = m.mapper.(page) in
-        let base = ((seg * 0x4000) + off) mod (Bytes.length m.ram) in
-        Char.code (Bytes.get m.ram base)
+        Char.code (Bytes.get m.ram (ram_offset m page off))
       | _ ->
         if page = 1 && Bytes.length m.disk > 0 && Bytes.length m.cart >= 0x4000
         then Char.code (Bytes.get m.cart (min off (Bytes.length m.cart - 1)))
@@ -670,9 +685,7 @@ let mem_write m addr v =
   else if slot = 3 && slot3_sub m page = 2 then begin
     (* 슬롯3 의 쓰기 면은 정본 배치에서 서브2(RAM 매퍼)뿐 — sub ROM(서브0)
        과 디스크 인터페이스(서브3)는 ROM/버스라 쓰기가 무시된다. *)
-    let seg = m.mapper.(page) in
-    let base = ((seg * 0x4000) + (a land 0x3fff)) mod (Bytes.length m.ram) in
-    Bytes.set m.ram base (Char.chr (v land 0xff))
+    Bytes.set m.ram (ram_offset m page (a land 0x3fff)) (Char.chr (v land 0xff))
   end
 
 (* PSG R#14 = 조이스틱 포트 입력. R#15 bit6 이 포트 선택(0 = 1번), 2번 포트는
@@ -733,7 +746,8 @@ let port_read m port =
       !bits
     end
   | 0xAA -> m.ppi_c
-  | 0xFC | 0xFD | 0xFE | 0xFF -> m.mapper.(port land 3)
+  | 0xFC | 0xFD | 0xFE | 0xFF ->
+    m.mapper.(port land 3) lor (lnot (mapper_mask m) land 0xff)
   | 0xA2 -> psg_read m
   | _ -> 0xff
 
@@ -763,7 +777,7 @@ let port_write m port v =
   | 0xA1 -> if m.psg_latch < 16 then m.psg.(m.psg_latch) <- v land 0xff
   | 0xFC | 0xFD | 0xFE | 0xFF ->
     mapper_writes.(port land 3) <- mapper_writes.(port land 3) + 1;
-    m.mapper.(port land 3) <- v land 0x3f
+    m.mapper.(port land 3) <- v land mapper_mask m
   | 0xB4 -> m.rtc_reg <- v land 0xff
   | 0xB5 -> rtc_write_reg m v
   | _ -> ()
@@ -2014,7 +2028,7 @@ let vram_hex t from len =
 (* RAM hex 덤프 — 페이지0 가 슬롯3(RAM) 로 스왑된 게임 코드를 읽는다.
    page0 에 보이는 세그먼트는 매퍼(mapper.(0)) 가 고른다. *)
 let ram_hex t from len =
-  let base = t.mapper.(0) * 0x4000 in
+  let base = ram_offset t 0 0 in
   for row = 0 to (len - 1) / 16 do
     Printf.eprintf "ram %04x:" (from + row * 16);
     for i = 0 to 15 do
