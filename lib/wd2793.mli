@@ -43,6 +43,11 @@ val write : t -> disk:Bytes.t -> time:int -> int -> int -> unit
     4 side (bit 0), 5 drive (bits 0-1: 0 or 2 = A, 1 = B, 3 = none; bit 7
     = motor). 6 and 7 take nothing. *)
 
+val image_written : t -> unit
+(** Something other than the controller wrote drive A's image (the disk
+    HLE): the controller drops the track it holds, so its next access
+    reads the new bytes. Software sees no disk change. *)
+
 val disk_changed : t -> unit
 (** A new image went into drive A: the controller drops the track it
     holds, and the next read of register 5 reports the change. *)

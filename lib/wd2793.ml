@@ -905,9 +905,12 @@ let write t ~disk ~time r v =
     drive_motor t disk time t.mux_motor
   | _ -> ()
 
-let disk_changed t =
+let image_written t =
   t.a.valid <- false;
-  t.a.dirty <- false;
+  t.a.dirty <- false
+
+let disk_changed t =
+  image_written t;
   t.a.changed <- true
 
 let restore_slowest = 0x03
