@@ -713,8 +713,15 @@ let rtc_write_reg m v =
     let bank = m.rtc_mode land 3 in
     m.rtc_regs.((bank * 13) + r) <- (v land 0x0f) land rtc_masks.(bank).(r)
 
+(* The printer port as the NMS 8250's S-3527 has it (openMSX MSXPrinterPort
+   with Philips_NMS_8250.xml): 0x90-0x97 all read the status, the unused
+   bits read 0 (measured on an NMS 8250), and bit 1 is BUSY. No printer is
+   plugged, so BUSY stays high: not ready. *)
+let printer_not_ready = 0x02
+
 let port_read m port =
   match port land 0xff with
+  | 0x90 | 0x91 | 0x92 | 0x93 | 0x94 | 0x95 | 0x96 | 0x97 -> printer_not_ready
   | 0xB4 -> m.rtc_reg land 0x0f
   | 0xB5 -> rtc_read_reg m
   | 0xD0 | 0xD1 | 0xD2 | 0xD3 -> fdc_read m port

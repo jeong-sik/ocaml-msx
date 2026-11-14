@@ -92,3 +92,8 @@
  (name state_fdc_test)
  (modules state_fdc_test)
  (libraries msx))
+
+(test
+ (name printer_port_test)
+ (modules printer_port_test)
+ (libraries msx))
