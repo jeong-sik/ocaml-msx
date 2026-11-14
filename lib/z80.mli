@@ -11,8 +11,8 @@ type t
 
 val create :
   m1_wait:int ->
-  read:(int -> int) ->
-  write:(int -> int -> unit) ->
+  read:(at:int -> int -> int) ->
+  write:(at:int -> int -> int -> unit) ->
   port_in:(at:int -> int -> int) ->
   port_out:(at:int -> int -> int -> unit) ->
   t
@@ -20,11 +20,14 @@ val create :
     0 은 맨 Z80 이고, MSX 는 1 을 넣는다 (openMSX Z80.hh
     WAIT_CYCLES). 접두 바이트(CB·ED·DD·FD)도 M1 이다.
 
-    포트 콜백의 [at] 은 명령 시작부터 포트에 닿는 사이클까지의 수다
-    (대기 포함). [m1_wait] 이 1 이면 IN A,(n)·OUT (n),A 는 9,
-    IN r,(C)·OUT (C),r 는 11, INI 계열은 12, OUTI 계열은 15 다
-    (openMSX CPUCore READ_PORT/WRITE_PORT). 늘 그 명령의 T-state 보다
-    작다. *)
+    모든 콜백의 [at] 은 명령 시작부터 그 접근이 버스에 닿는 사이클까지의
+    수다(대기 포함). 접근은 자기 머신 사이클의 1 사이클째에 닿는다:
+    앞서 끝난 머신 사이클과 내부 사이클의 합 + 1 (openMSX CPUCore 가
+    장치에 넘기는 T + cc). [m1_wait] 이 1 이면 opcode 는 1, LD A,(BC) 의
+    읽기는 6, LD (nn),A 의 쓰기는 12, PUSH 의 쓰기는 7·10, LD A,(IX+d) 의
+    읽기는 19, IN A,(n)·OUT (n),A 의 포트는 9, IN r,(C)·OUT (C),r 는 11,
+    INI 계열은 12, OUTI 계열은 15 다. 늘 그 명령의 T-state 보다 작다.
+    인터럽트 접수의 쓰기는 8·11 이고, IM 2 는 그 뒤 벡터를 14·17 에 읽는다. *)
 
 val step : t -> int
 (** 한 명령을 실행하고 그 명령이 쓴 T-state 를 반환. HALT 상태면 명령을

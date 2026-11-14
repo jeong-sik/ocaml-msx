@@ -793,8 +793,10 @@ let create ~machine =
   let sub = match machine.roms with _ :: _ :: x :: _ -> x | _ -> "" in
   let ram_kb = max 64 machine.ram_kb in
   let m_ref : t option ref = ref None in
-  let read a = match !m_ref with Some m -> mem_read m a | None -> 0xff in
-  let write a v =
+  (* No memory-mapped device here keeps time, so the access cycle is not
+     needed yet. *)
+  let read ~at:_ a = match !m_ref with Some m -> mem_read m a | None -> 0xff in
+  let write ~at:_ a v =
     match !m_ref with
     | Some m ->
       mem_write m a v;

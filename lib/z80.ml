@@ -36,8 +36,8 @@ type t = {
   (* Wait states added to every M1 (opcode fetch) cycle. 0 is the bare Z80
      the zexall and trace harnesses measure; an MSX inserts 1. *)
   m1_wait : int;
-  rb : int -> int;
-  wb : int -> int -> unit;
+  rb : at:int -> int -> int;
+  wb : at:int -> int -> int -> unit;
   pin : at:int -> int -> int;
   pout : at:int -> int -> int -> unit;
 }
@@ -87,23 +87,50 @@ let dump_sp z = z.sp
 let dt = ref 0
 let add_t n = dt := !dt + n
 
-(* The port cycle of each I/O instruction, counted from the instruction
-   start on a bare Z80. The table charges an instruction's cycles when it
-   ends, so [!dt] at the port holds just the M1 wait states so far. With one
-   wait per M1 these are openMSX Z80.hh CC_IN_A_N_2 = 5+3+1, CC_IN_R_C_1 =
-   5+5+1, CC_INI_1 = 5+6+1 and CC_OUTI_2 = 5+6+3+1. *)
-let io_n = 8 (* IN A,(n), OUT (n),A: M1 4, n 3, then the port *)
-let io_c = 9 (* IN r,(C), OUT (C),r: two M1s, then the port *)
-let io_ini = 10 (* INI and kin: two M1s, one more cycle, then the port *)
-let io_outi = 13 (* OUTI and kin: two M1s, one cycle, (HL) 3, the port *)
-let io_at bare = !dt + bare
+(* Where the current instruction is on the bus. [mpos] counts the bare
+   T-states of the machine cycles it has finished, internal cycles
+   included, and [waits] the M1 wait states so far. They are kept apart
+   from [!dt] so that where the table charges its cycles cannot move an
+   access. A device sees an access one cycle into its machine cycle
+   (openMSX CPUCore hands it T + cc, e.g. Z80.hh CC_LD_A_SS_1 = 5+1,
+   CC_LD_NN_A_2 = 5+3+3+1, CC_PUSH_1 = 6+1). *)
+let mpos = ref 0
+let waits = ref 0
+let idle n = mpos := !mpos + n
+let bus_at () = !waits + !mpos + 1
 
-(* R 은 명령당 한 번만 오른다 (operand fetch 는 세지 않는다) —
-   step 에서 증가. *)
-let fetch z =
-  let v = z.rb z.pc in
+(* An opcode or prefix fetch (M1, 4 bare cycles). *)
+let fetch_op z =
+  let v = z.rb ~at:(bus_at ()) z.pc in
   z.pc <- m16 (z.pc + 1);
+  idle 4;
   v
+
+(* An operand byte at PC (a 3-cycle read). *)
+let fetch z =
+  let v = z.rb ~at:(bus_at ()) z.pc in
+  z.pc <- m16 (z.pc + 1);
+  idle 3;
+  v
+
+let rd z a =
+  let v = z.rb ~at:(bus_at ()) a in
+  idle 3;
+  v
+
+let wr z a v =
+  z.wb ~at:(bus_at ()) a v;
+  idle 3
+
+(* I/O machine cycles take 4 (one wait the Z80 inserts itself). *)
+let port_in z p =
+  let v = z.pin ~at:(bus_at ()) p in
+  idle 4;
+  v
+
+let port_out z p v =
+  z.pout ~at:(bus_at ()) p v;
+  idle 4
 
 let imm8 z = fetch z
 
@@ -116,19 +143,24 @@ let disp8 z =
   let d = imm8 z in
   if d >= 0x80 then d - 256 else d
 
-let rd16 z addr = (z.rb (m16 (addr + 1)) lsl 8) lor z.rb addr
+let rd16 z addr =
+  let lo = rd z addr in
+  let hi = rd z (m16 (addr + 1)) in
+  (hi lsl 8) lor lo
+
+let wr16 z addr v =
+  wr z addr (v land 0xff);
+  wr z (m16 (addr + 1)) (v lsr 8)
 
 let push z v =
   (* 하위 바이트가 낮은 주소에 — Z80 16비트 메모리 규약 (little-endian). *)
   z.sp <- m16 (z.sp - 2);
-  z.wb z.sp (v land 0xff);
-  z.wb (m16 (z.sp + 1)) (v lsr 8)
+  wr16 z z.sp v
 
 let pop z =
-  let lo = z.rb z.sp in
-  let hi = z.rb (m16 (z.sp + 1)) in
+  let v = rd16 z z.sp in
   z.sp <- m16 (z.sp + 2);
-  (hi lsl 8) lor lo
+  v
 
 let parity v =
   let n = ref (v land 0xff) in
@@ -145,13 +177,17 @@ type idx = No | IXp | IYp
 
 let idx_reg z = function IXp -> z.ix | IYp -> z.iy | No -> assert false
 
-(* (HL) 계열 피연산자의 실효 주소. 접두어가 있으면 변위 fetch 가
-   일어난다 — 호출 순서가 인코딩 순서와 같아야 한다. *)
-let ea z = function
-  | No -> (z.h lsl 8) lor z.l
-  | p -> m16 (idx_reg z p + disp8 z)
-
 let hl16 z = (z.h lsl 8) lor z.l
+
+(* (HL) 계열 피연산자의 실효 주소. 접두어가 있으면 변위 fetch 가
+   일어난다 — 호출 순서가 인코딩 순서와 같아야 한다. (IX+d) 는 변위 뒤
+   내부 5 사이클을 지나 메모리에 닿는다 (19 = 4+4+3+5+3). *)
+let operand_addr z = function
+  | No -> hl16 z
+  | p ->
+    let a = m16 (idx_reg z p + disp8 z) in
+    idle 5;
+    a
 
 let cond z = function
   | 0 -> z.f land 0x40 = 0
@@ -176,7 +212,7 @@ let rget z i p =
   | 3, _ -> z.e
   | 4, _ -> z.h
   | 5, _ -> z.l
-  | 6, _ -> z.rb (ea z p)
+  | 6, _ -> rd z (operand_addr z p)
   | 7, _ -> z.a
   | _ -> assert false
 
@@ -192,7 +228,7 @@ let rset z i v p =
   | 3, _ -> z.e <- v
   | 4, _ -> z.h <- v
   | 5, _ -> z.l <- v
-  | 6, _ -> z.wb (ea z p) v
+  | 6, _ -> wr z (operand_addr z p) v
   | 7, _ -> z.a <- v
   | _ -> assert false
 
@@ -350,23 +386,33 @@ let io_block_flags z =
    final opcode of DD CB d op are plain reads (openMSX CPUCore incR). *)
 let inc_r z =
   z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
+  waits := !waits + z.m1_wait;
   add_t z.m1_wait
+
+(* The next opcode after a prefix: its own M1. *)
+let next_op z =
+  let op = fetch_op z in
+  inc_r z;
+  op
 
 let rec exec z op p =
   match op with
   (* 접두어는 dispatch 와 실제 실행에 각각 R 을 올린다 (2). *)
-  | 0xDD -> inc_r z; exec z (fetch z) IXp
-  | 0xFD -> inc_r z; exec z (fetch z) IYp
+  | 0xDD -> exec z (next_op z) IXp
+  | 0xFD -> exec z (next_op z) IYp
   | 0xCB ->
     (* DDCB/FDCB 은 [CB d op]: 변위를 먼저 읽고 opcode 가 나중. 그 op 는
        M1 이 아니라 메모리 읽기라 R 을 올리지 않는다: DD CB d op 의 R 은
-       2 다 (Sean Young, "The Undocumented Z80 Documented" 6.1). *)
+       2 다 (Sean Young, "The Undocumented Z80 Documented" 6.1). 그 읽기는
+       5 사이클이라 (IX+d) 는 내부 2 사이클 뒤에 읽힌다 (23 = 4+4+3+5+4+3). *)
     (match p with
-     | No -> inc_r z; cb_exec z (fetch z) No None
+     | No -> cb_exec z (next_op z) No None
      | IXp | IYp ->
        let a = m16 (idx_reg z p + disp8 z) in
-       cb_exec z (fetch z) p (Some a))
-  | 0xED -> inc_r z; ed_exec z (fetch z)
+       let op = fetch z in
+       idle 2;
+       cb_exec z op p (Some a))
+  | 0xED -> ed_exec z (next_op z)
   | _ -> main_exec z op p
 
 and cb_exec z op p dd_addr =
@@ -379,15 +425,18 @@ and cb_exec z op p dd_addr =
     match p with
     | No ->
       if r = 6 then
-        let a = ea z No in
-        (z.rb a, (fun nv -> z.wb a nv), Some (((a + 1) lsr 8) land 0x28))
+        let a = hl16 z in
+        (* The read takes 4 (3 + 1 internal) before the write: SET b,(HL)
+           15 = 4+4+4+3. *)
+        (rd z a, (fun nv -> idle 1; wr z a nv), Some (((a + 1) lsr 8) land 0x28))
       else
         (rget z r No, (fun nv -> rset z r nv No), None)
     | IXp | IYp ->
       let a = match dd_addr with Some a -> a | None -> assert false in
-      ( z.rb a,
+      ( rd z a,
         (fun nv ->
-           z.wb a nv;
+           idle 1;
+           wr z a nv;
            if r <> 6 then rset z r nv No),
         Some (((a + 1) lsr 8) land 0x28) )
   in
@@ -426,15 +475,14 @@ and ed_exec z op =
   match op with
   | 0x40 | 0x48 | 0x50 | 0x58 | 0x60 | 0x68 | 0x70 | 0x78 ->
     (* IN r,(C) — 0x70 은 IN F,(C): 플래그만 갱신. *)
-    let v = z.pin ~at:(io_at io_c) ((z.b lsl 8) lor z.c) in
+    let v = port_in z ((z.b lsl 8) lor z.c) in
     (* F3/F5 와 C 는 불변 — S/Z/PV/H/N 만 갱신. *)
     z.f <- (z.f land 0x29) lor (v land 0x80) lor (if v = 0 then 0x40 else 0)
            lor parity v;
     if y <> 6 then rset z y v No;
     add_t 12
   | 0x41 | 0x49 | 0x51 | 0x59 | 0x61 | 0x69 | 0x71 | 0x79 ->
-    z.pout ~at:(io_at io_c) ((z.b lsl 8) lor z.c)
-      (if op = 0x71 then 0 else rget z y No);
+    port_out z ((z.b lsl 8) lor z.c) (if op = 0x71 then 0 else rget z y No);
     add_t 12
   | 0x42 | 0x52 | 0x62 | 0x72 ->
     let src = pget z ((op lsr 4) land 3) No in
@@ -446,9 +494,7 @@ and ed_exec z op =
     add_t 15
   | 0x43 | 0x53 | 0x63 | 0x73 ->
     let a = imm16 z in
-    let v = pget z ((op lsr 4) land 3) No in
-    z.wb a (v land 0xff);
-    z.wb (m16 (a + 1)) (v lsr 8);
+    wr16 z a (pget z ((op lsr 4) land 3) No);
     add_t 20
   | 0x4B | 0x5B | 0x6B | 0x7B ->
     (* LD rr,(nn) — 저장(0x43 계열)의 읽기 방향. *)
@@ -487,7 +533,7 @@ and ed_exec z op =
     add_t 9
   | 0x67 | 0x6F ->
     let addr = hl16 z in
-    let v = z.rb addr in
+    let v = rd z addr in
     (* ED 67 = RRD: A_lo ← (HL)_hi, (HL) ← ((HL)_lo A_lo) 니블 우회전.
        ED 6F = RLD: A_lo ← (HL)_lo, (HL) ← ((HL)_hi A_lo) 니블 좌회전. *)
     let a' =
@@ -498,15 +544,17 @@ and ed_exec z op =
       if op = 0x67 then ((v lsr 4) lor ((z.a land 0x0f) lsl 4))
       else (((v lsl 4) land 0xff) lor (z.a land 0x0f))
     in
-    z.wb addr v';
+    (* 18 = 4+4+3+4+3: four internal cycles before the write. *)
+    idle 4;
+    wr z addr v';
     z.a <- a';
     z.f <- sz53 a' lor parity a' lor (z.f land 1);
     add_t 18
   | 0xA0 | 0xA8 | 0xB0 | 0xB8 ->
     let src = hl16 z in
     let dst = (z.d lsl 8) lor z.e in
-    let value = z.rb src in
-    z.wb dst value;
+    let value = rd z src in
+    wr z dst value;
     let bc = m16 (((z.b lsl 8) lor z.c) - 1) in
     z.b <- bc lsr 8;
     z.c <- bc land 0xff;
@@ -527,7 +575,7 @@ and ed_exec z op =
     end else add_t 16
   | 0xA1 | 0xA9 | 0xB1 | 0xB9 ->
     let addr = hl16 z in
-    let v = z.rb addr in
+    let v = rd z addr in
     let res = m8 (z.a - v) in
     (* 관측 규칙 (오라클 128케이스): H = borrow(A_lo - v_lo).
        F3/F5 = result - H 의 bit3/bit1. *)
@@ -554,8 +602,10 @@ and ed_exec z op =
   | 0xA2 | 0xAA | 0xB2 | 0xBA ->
     let addr = hl16 z in
     let port = (z.b lsl 8) lor z.c in
-    let v = z.pin ~at:(io_at io_ini) port in
-    z.wb addr v;
+    (* INI 16 = 4+5+4+3: one internal cycle before the port. *)
+    idle 1;
+    let v = port_in z port in
+    wr z addr v;
     z.b <- m8 (z.b - 1);
     io_block_flags z;
     let dir = if op land 0x08 = 0 then 1 else -1 in
@@ -569,9 +619,11 @@ and ed_exec z op =
   | 0xA3 | 0xAB | 0xB3 | 0xBB ->
     let addr = hl16 z in
     let port = (z.b lsl 8) lor z.c in
-    let v = z.rb addr in
+    (* OUTI 16 = 4+5+3+4: one internal cycle before the read. *)
+    idle 1;
+    let v = rd z addr in
     z.b <- m8 (z.b - 1);
-    z.pout ~at:(io_at io_outi) port v;
+    port_out z port v;
     io_block_flags z;
     let dir = if op land 0x08 = 0 then 1 else -1 in
     let hl' = m16 (addr + dir) in
@@ -624,6 +676,8 @@ and main_exec z op p =
       let t = z.f in z.f <- z.f2; z.f2 <- t;
       add_t 4
     | 0x10 ->
+      (* DJNZ's M1 takes 5 (13 = 5+3+5). *)
+      idle 1;
       let d = disp8 z in
       z.b <- m8 (z.b - 1);
       if z.b <> 0 then begin
@@ -646,27 +700,25 @@ and main_exec z op p =
     | 0x09 | 0x19 | 0x29 | 0x39 ->
       pset z 2 (add16 z (pget z 2 p) (pget z (op lsr 4) p) false) p;
       add_t (if p <> No then 15 else 11)
-    | 0x02 -> z.wb ((z.b lsl 8) lor z.c) z.a; add_t 7
-    | 0x12 -> z.wb ((z.d lsl 8) lor z.e) z.a; add_t 7
+    | 0x02 -> wr z ((z.b lsl 8) lor z.c) z.a; add_t 7
+    | 0x12 -> wr z ((z.d lsl 8) lor z.e) z.a; add_t 7
     | 0x22 ->
       let a = imm16 z in
-      let v = pget z 2 p in
-      z.wb a (v land 0xff);
-      z.wb (m16 (a + 1)) (v lsr 8);
+      wr16 z a (pget z 2 p);
       add_t (if p <> No then 20 else 16)
     | 0x32 ->
       let a = imm16 z in
-      z.wb a z.a;
+      wr z a z.a;
       add_t 13
-    | 0x0A -> z.a <- z.rb ((z.b lsl 8) lor z.c); add_t 7
-    | 0x1A -> z.a <- z.rb ((z.d lsl 8) lor z.e); add_t 7
+    | 0x0A -> z.a <- rd z ((z.b lsl 8) lor z.c); add_t 7
+    | 0x1A -> z.a <- rd z ((z.d lsl 8) lor z.e); add_t 7
     | 0x2A ->
       let a = imm16 z in
       pset z 2 (rd16 z a) p;
       add_t (if p <> No then 20 else 16)
     | 0x3A ->
       let a = imm16 z in
-      z.a <- z.rb a;
+      z.a <- rd z a;
       add_t 13
     | 0x03 | 0x13 | 0x23 | 0x33 ->
       let i = op lsr 4 in
@@ -679,12 +731,10 @@ and main_exec z op p =
     | 0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x34 | 0x3C ->
       let read_v, write_v =
         match y, p with
-        | 6, No ->
-          let a = hl16 z in
-          (z.rb a, fun nv -> z.wb a nv)
-        | 6, IXp | 6, IYp ->
-          let a = m16 (idx_reg z p + disp8 z) in
-          (z.rb a, fun nv -> z.wb a nv)
+        | 6, _ ->
+          (* The read takes 4 before the write (11 = 4+4+3). *)
+          let a = operand_addr z p in
+          (rd z a, fun nv -> idle 1; wr z a nv)
         | _ -> (rget z y p, fun nv -> rset z y nv p)
       in
       let nv, nf = inc8 read_v z.f in
@@ -695,12 +745,10 @@ and main_exec z op p =
     | 0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x35 | 0x3D ->
       let read_v, write_v =
         match y, p with
-        | 6, No ->
-          let a = hl16 z in
-          (z.rb a, fun nv -> z.wb a nv)
-        | 6, IXp | 6, IYp ->
-          let a = m16 (idx_reg z p + disp8 z) in
-          (z.rb a, fun nv -> z.wb a nv)
+        | 6, _ ->
+          (* The read takes 4 before the write (11 = 4+4+3). *)
+          let a = operand_addr z p in
+          (rd z a, fun nv -> idle 1; wr z a nv)
         | _ -> (rget z y p, fun nv -> rset z y nv p)
       in
       let nv, nf = dec8 read_v z.f in
@@ -714,10 +762,15 @@ and main_exec z op p =
     | 0x36 ->
       (* LD (HL),n / LD (IX+d),n: 변위를 먼저 읹고 그 다음 데이터. *)
       (match p with
-       | No -> z.wb (hl16 z) (imm8 z)
+       | No ->
+         let n = imm8 z in
+         wr z (hl16 z) n
        | q ->
-         let a = ea z q in
-         z.wb a (imm8 z));
+         (* 19 = 4+4+3+5+3: d, n, two internal cycles, the write. *)
+         let a = m16 (idx_reg z q + disp8 z) in
+         let n = imm8 z in
+         idle 2;
+         wr z a n);
       add_t (if p <> No then 19 else 10)
     | 0x07 | 0x0F | 0x17 | 0x1F ->
       (* S,Z,PV 불변. F3/F5 는 결과의 bit3/5 로, H=N=0, C=회전비트. *)
@@ -738,6 +791,8 @@ and main_exec z op p =
              lor (if c = 1 then 0x10 else 0);
       add_t 4
     | 0xC0 | 0xC8 | 0xD0 | 0xD8 | 0xE0 | 0xE8 | 0xF0 | 0xF8 ->
+      (* RET cc's M1 takes 5 (11 = 5+3+3). *)
+      idle 1;
       if cond z y then begin
         z.pc <- pop z;
         add_t 11
@@ -746,6 +801,8 @@ and main_exec z op p =
       pset z ((op lsr 4) land 3) (pop z) p;
       add_t (if op = 0xE1 && p <> No then 14 else 10)
     | 0xC5 | 0xD5 | 0xE5 ->
+      (* PUSH's M1 takes 5 (11 = 5+3+3). *)
+      idle 1;
       push z (pget z ((op lsr 4) land 3) p);
       add_t (if op = 0xE5 && p <> No then 15 else 11)
     (* AF 는 pget/pset 의 짝이 아니다 — 전용. *)
@@ -755,6 +812,7 @@ and main_exec z op p =
       z.f <- v land 0xff;
       add_t 10
     | 0xF5 ->
+      idle 1;
       push z ((z.a lsl 8) lor z.f);
       add_t 11
     | 0xC2 | 0xCA | 0xD2 | 0xDA | 0xE2 | 0xEA | 0xF2 | 0xFA ->
@@ -774,24 +832,27 @@ and main_exec z op p =
     | 0xFE -> alu_cp z (imm8 z); add_t 7
     | 0xC9 -> z.pc <- pop z; add_t 10
     | 0xCD ->
+      (* 17 = 4+3+4+3+3: the address high byte read takes 4. *)
       let a = imm16 z in
+      idle 1;
       push z z.pc;
       z.pc <- a;
       add_t 17
     | 0xC4 | 0xCC | 0xD4 | 0xDC | 0xE4 | 0xEC | 0xF4 | 0xFC ->
       let a = imm16 z in
       if cond z y then begin
+        idle 1;
         push z z.pc;
         z.pc <- a;
         add_t 17
       end else add_t 10
     | 0xD3 ->
       let port = imm8 z in
-      z.pout ~at:(io_at io_n) port z.a;
+      port_out z port z.a;
       add_t 11
     | 0xDB ->
       let port = imm8 z in
-      z.a <- z.pin ~at:(io_at io_n) port;
+      z.a <- port_in z port;
       add_t 11
     | 0xD9 ->
       let t = z.b in z.b <- z.b2; z.b2 <- t;
@@ -802,10 +863,10 @@ and main_exec z op p =
       let t = z.l in z.l <- z.l2; z.l2 <- t;
       add_t 4
     | 0xE3 ->
+      (* 19 = 4+3+4+3+5: the second read takes 4 before the writes. *)
       let spv = rd16 z z.sp in
-      let v = pget z 2 p in
-      z.wb z.sp (v land 0xff);
-      z.wb (m16 (z.sp + 1)) (v lsr 8);
+      idle 1;
+      wr16 z z.sp (pget z 2 p);
       pset z 2 spv p;
       add_t (if p <> No then 23 else 19)
     | 0xE9 -> z.pc <- pget z 2 p; add_t (if p <> No then 14 else 4)
@@ -825,6 +886,8 @@ and main_exec z op p =
     add_t 4
     | 0xF9 -> z.sp <- pget z 2 p; add_t (if p <> No then 10 else 6)
     | 0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF ->
+      (* RST's M1 takes 5 (11 = 5+3+3). *)
+      idle 1;
       push z z.pc;
       z.pc <- op land 0x38;
       add_t 11
@@ -832,12 +895,15 @@ and main_exec z op p =
 
 let step z =
   dt := 0;
-  inc_r z;
-  if z.halted then
+  mpos := 0;
+  waits := 0;
+  if z.halted then begin
     (* HALT 는 NOP 을 되풀이한다: M1 마다 R 이 오른다 (openMSX advanceHalt). *)
+    inc_r z;
     add_t 4
+  end
   else begin
-    let op = fetch z in
+    let op = next_op z in
     exec z op No;
     (* 이 명령이 EI 였으면 그 명령 자체는 INT 를 못 받는다 —
        다음 step 에서 플래그를 소비한다. *)
@@ -859,6 +925,10 @@ let interrupt z =
   else begin
     (* The acknowledge cycle is an M1: R counts it. *)
     z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
+    (* The acknowledge M1 takes 7, wait states included; the pushes then
+       write at 8 and 11 (openMSX CC_PUSH_1 + EE_IRQ1_1). *)
+    waits := 0;
+    mpos := 7;
     let cycles =
     match z.im with
      | 0 | 1 ->
@@ -871,11 +941,11 @@ let interrupt z =
           읽어 그곳으로 call 한다. I<<8|0xFF 로 곧장 점프하면 게임이
           c7xx 워크에이어에 심는 벡터 테이블(룬마스터 1 의 디스크
           인터럽트)을 읽지 않는다 — 인터럽트 사슬이 죽는다. *)
+       (* openMSX irq2 pushes PC first, then reads the vector
+          (CC_IRQ2_2 = 7+3+3+1). *)
        let vec = ((z.i lsl 8) lor 0xff) land 0xffff in
-       let lo = z.rb vec in
-       let hi = z.rb (m16 (vec + 1)) in
        push z z.pc;
-       z.pc <- (hi lsl 8) lor lo;
+       z.pc <- rd16 z vec;
        irq_cycles_vector
     in
     z.iff1 <- false;

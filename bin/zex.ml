@@ -45,7 +45,7 @@ let bdos () =
 let () =
   cpu :=
     Some
-      (Z80.create ~m1_wait:0 ~read:mem_read ~write:mem_write
+      (Z80.create ~m1_wait:0 ~read:(fun ~at:_ a -> mem_read a) ~write:(fun ~at:_ a v -> mem_write a v)
          ~port_in:(fun ~at:_ _ ->
            bdos ();
            0xff)
@@ -67,7 +67,7 @@ let run_test path =
   (* CPU 는 상태를 들고 있으므로 새 하네스 인스턴스를 만든다. *)
   cpu :=
     Some
-      (Z80.create ~m1_wait:0 ~read:mem_read ~write:mem_write
+      (Z80.create ~m1_wait:0 ~read:(fun ~at:_ a -> mem_read a) ~write:(fun ~at:_ a v -> mem_write a v)
          ~port_in:(fun ~at:_ _ ->
            bdos ();
            0xff)
