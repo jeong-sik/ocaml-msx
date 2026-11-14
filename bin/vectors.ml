@@ -8,8 +8,8 @@ let run ~prog ~af ~bc ~de ~hl ~sp =
   List.iteri (fun i b -> Bytes.set mem (0x100 + i) (Char.chr b)) prog;
   let z =
     Z80.create ~m1_wait:0
-      ~read:(fun a -> Char.code (Bytes.get mem (a land 0xffff)))
-      ~write:(fun a v -> Bytes.set mem (a land 0xffff) (Char.chr (v land 0xff)))
+      ~read:(fun ~at:_ a -> Char.code (Bytes.get mem (a land 0xffff)))
+      ~write:(fun ~at:_ a v -> Bytes.set mem (a land 0xffff) (Char.chr (v land 0xff)))
       ~port_in:(fun ~at:_ _ -> 0xff)
       ~port_out:(fun ~at:_ _ _ -> ())
   in
