@@ -101,7 +101,7 @@
 (test
  (name fdc_geometry_test)
  (modules fdc_geometry_test)
- (libraries msx))
+ (libraries fdccore))
 
 (test
  (name core_purity_test)
