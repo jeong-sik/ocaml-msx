@@ -39,7 +39,7 @@ let () =
     Msx.step t ~frames:3;
     check "restored v1 machine keeps running" (Msx.frame_number t = f0 + 3);
     let s2 = Msx.serialize t in
-    check "re-serialized as current version" (String.sub s2 0 11 = "OCAML-MSX\000\014");
+    check "re-serialized as current version" (String.sub s2 0 11 = "OCAML-MSX\000\015");
     (match Msx.restore ~state:s2 with
      | Ok t2 -> check "v2 round trip is stable" (Msx.serialize t2 = s2)
      | Error e -> failwith ("v2 round trip: " ^ e));
@@ -48,9 +48,9 @@ let () =
     check "corrupt v1 still rejected"
       (match Msx.restore ~state:(Bytes.to_string tampered) with Error _ -> true | Ok _ -> false);
     let future = Bytes.of_string s2 in
-    Bytes.set future 10 '\x0f';
+    Bytes.set future 10 '\x10';
     check "unknown format number is named"
       (match Msx.restore ~state:(Bytes.to_string future) with
-       | Error e -> e = "MSX state saved as format 15; this build reads formats 1-14"
+       | Error e -> e = "MSX state saved as format 16; this build reads formats 1-15"
        | Ok _ -> false);
     print_endline "state v1 compat: ok"

@@ -152,3 +152,8 @@
  (name frame_phase_test)
  (modules frame_phase_test)
  (libraries vdpcore state_codec))
+
+(test
+ (name fh_poll_test)
+ (modules fh_poll_test)
+ (libraries vdpcore state_codec))
