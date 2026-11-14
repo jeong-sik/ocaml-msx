@@ -30,4 +30,4 @@
  (public_name ocaml-msx.msx)
  (wrapped false)
  (modules msx disk_fat12)
- (libraries z80core vdpcore state_codec))
+ (libraries z80core vdpcore fdccore state_codec))
