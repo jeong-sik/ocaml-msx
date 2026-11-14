@@ -4,8 +4,8 @@
    읽지 않는다. *)
 
 let ram = Bytes.make 0x10000 '\000'
-let read a = Char.code (Bytes.get ram a)
-let write a v = Bytes.set ram a (Char.chr (v land 0xff))
+let read ~at:_ a = Char.code (Bytes.get ram a)
+let write ~at:_ a v = Bytes.set ram a (Char.chr (v land 0xff))
 let pin ~at:_ _ = 0xff
 let pout ~at:_ _ _ = ()
 

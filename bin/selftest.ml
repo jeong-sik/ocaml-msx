@@ -30,7 +30,7 @@ let bdos () =
 let () =
   cpu :=
     Some
-      (Z80.create ~m1_wait:0 ~read:mem_read ~write:mem_write
+      (Z80.create ~m1_wait:0 ~read:(fun ~at:_ a -> mem_read a) ~write:(fun ~at:_ a v -> mem_write a v)
          ~port_in:(fun ~at:_ _ ->
            bdos ();
            0xff)
@@ -68,7 +68,7 @@ let () =
   let prog2 = [ 0x21; 0x34; 0x12; 0x7e; 0x3c; 0xc3; 0x00; 0x00 ] in
   List.iteri (fun i b -> Bytes.set mem (0x100 + i) (Char.chr b)) prog2;
   let cpu2 =
-    Z80.create ~m1_wait:0 ~read:mem_read ~write:mem_write
+    Z80.create ~m1_wait:0 ~read:(fun ~at:_ a -> mem_read a) ~write:(fun ~at:_ a v -> mem_write a v)
       ~port_in:(fun ~at:_ _ -> 0xff)
       ~port_out:(fun ~at:_ _ _ -> finished := true)
   in
