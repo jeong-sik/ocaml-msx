@@ -2185,7 +2185,8 @@ let serialize t =
   Scc.write_state w t.scc;
   (* v10: VDP R#13 blinking; v11: latched R#18 vertical adjust; v12: R#0/R#1/R#8
      bits waiting for the next line start; v13: VDP command progress; v14: VDP
-     frame start and line counter reset. *)
+     frame start and line counter reset; v15: whether the last VDP line was
+     counted. *)
   Vdp.write_appended w t.vdp;
   State_codec.finish w
 

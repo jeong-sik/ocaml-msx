@@ -193,8 +193,8 @@ let () =
      display line 0 stays where that build put it, lines_per_frame lines
      on. Saved on the reset line itself, the reset has happened. *)
   let as_v13 s =
-    let header = String.length "OCAML-MSX\000\014" + 16 in
-    let payload = String.sub s header (String.length s - header - (3 * 8)) in
+    let header = String.length "OCAML-MSX\000\015" + 16 in
+    let payload = String.sub s header (String.length s - header - (3 * 8) - 1) in
     "OCAML-MSX\000\013" ^ Digest.string payload ^ payload
   in
   List.iter
@@ -217,13 +217,14 @@ let () =
   let t = Vdp.create () in
   seek t 240 0;
   let s = save t in
-  let header = String.length "OCAML-MSX\000\014" + 16 in
+  let header = String.length "OCAML-MSX\000\015" + 16 in
   let payload = Bytes.of_string (String.sub s header (String.length s - header)) in
-  let n = Bytes.length payload in
+  (* The vertical event's two ints come before the v15 flag byte. *)
+  let n = Bytes.length payload - 1 in
   Bytes.set_int64_be payload (n - 16) 1L;
   Bytes.set_int64_be payload (n - 8) 230L;
   let payload = Bytes.to_string payload in
-  let forged = "OCAML-MSX\000\014" ^ Digest.string payload ^ payload in
+  let forged = "OCAML-MSX\000\015" ^ Digest.string payload ^ payload in
   check "a reset behind the beam is refused"
     (match restore forged with
      | _ -> false

@@ -55,6 +55,9 @@ type t = {
      starts are [lines_per_frame] lines apart whatever the display does. *)
   mutable frame_start : int;
   mutable vertical : vertical;
+  (* [counting_display] for the line that ended last: whether that line
+     could match R#19. S#1 FH reads from it while IE1 is off. *)
+  mutable counted_last : bool;
   (* R#13 blinking (openMSX blinkState / blinkCount): [blink_on] is the
      ON period, which shows the R#12 colours in TEXT2 and the even page in
      the bitmap modes; [blink_count] is the frames left in this period, 0
@@ -255,6 +258,7 @@ let create () =
     pal = false;
     frame_start = 0;
     vertical = Before_frame_start;
+    counted_last = true;
     blink_on = false;
     blink_count = 0;
     v_shift = 0;
@@ -576,6 +580,17 @@ let display_area t =
   let visible = visible_lines t in
   if t.cycle_in_line < display_edge_cycle then t.line > 0 && t.line <= visible
   else t.line < visible
+
+(* With IE1 off FH is not latched. S#1 bit 0 reads 1 from the line
+   interrupt point, the right border of line (R#19 - R#23) mod 256, to the
+   left border of the line below (openMSX peekStatusReg, "line int
+   disabled"): here the first [display_edge_cycle] cycles of the line after
+   the matching one. R#19 and R#23 count as they are at the read, as
+   openMSX moves the match point when either is written. *)
+let polled_fh t =
+  t.counted_last
+  && t.line - 1 = (t.regs.(19) - t.regs.(23)) land 0xff
+  && t.cycle_in_line < display_edge_cycle
 
 (* openMSX VDPAccessSlots::getTab for the bitmap modes. *)
 let slot_table t =
@@ -1132,7 +1147,8 @@ let io_read t ~port =
         t.int_pending <- false;
         x
       | 1 ->
-        let x = t.status1 in
+        let polled = t.regs.(0) land 0x10 = 0 && polled_fh t in
+        let x = t.status1 lor (if polled then 1 else 0) in
         t.status1 <- 0;
         x
       | 2 ->
@@ -1637,8 +1653,9 @@ let advance t ~cycles =
          bit4) 이 켜져 있을 때만 래치된다(openMSX execHScan: "if
          (controlRegs[0] & 0x10)"). IE1 없이 세우면 IE1=0 인 게임이 매
          프레임 S#1 읽기에서 1 을 본다. *)
+      t.counted_last <- counting_display t;
       if t.regs.(0) land 0x10 <> 0
-         && counting_display t
+         && t.counted_last
          && finished = (t.regs.(19) - t.regs.(23)) land 0xff
       then begin
         t.status1 <- t.status1 lor 1;
@@ -1744,7 +1761,9 @@ let write_appended w t =
   (match t.vertical with
    | Before_frame_start -> State_codec.put_int w 0; State_codec.put_int w 0
    | Before_reset at -> State_codec.put_int w 1; State_codec.put_int w at
-   | Before_display at -> State_codec.put_int w 2; State_codec.put_int w at)
+   | Before_display at -> State_codec.put_int w 2; State_codec.put_int w at);
+  (* v15: whether the line that ended last was counted. *)
+  State_codec.put_bool w t.counted_last
 
 (* States before v14 kept display line 0 [lines_per_frame] lines apart and
    flipped EO 7 lines late. Their line counts the same way, so the frame
@@ -1814,7 +1833,11 @@ let read_appended r t =
   end
   else if t.line < lines_per_frame t then derive_vertical t
   else State_codec.fail "invalid VDP line";
-  if not (vertical_consistent t) then State_codec.fail "invalid VDP vertical state"
+  if not (vertical_consistent t) then State_codec.fail "invalid VDP vertical state";
+  (* Before v15 the flag follows the restored counter state, which differs
+     only on the line right after a counter reset. *)
+  t.counted_last <-
+    (if State_codec.version r >= 15 then State_codec.get_bool r else counting_display t)
 
 let read_state r t =
   State_codec.fill_int_array r ~min:0 ~max:255 t.regs;
