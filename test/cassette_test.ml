@@ -194,6 +194,32 @@ let () =
     motor restored true;
     check "saved with the motor off" (levels restored 16 = original)
 
+(* Port C high as an input: the motor pins keep what they last drove and
+   latch writes do not reach them (openMSX I8255::outputPortC). *)
+let () =
+  let m = Msx.create ~machine:{ Msx.ram_kb = 64; vram_kb = 128; roms = [ ""; ""; "" ] } in
+  let r14 m = Msx.port_out m 0xA0 14; Msx.port_in m 0xA2 land 0x80 <> 0 in
+  let levels m n = List.init n (fun _ -> Msx.step m ~frames:1; r14 m) in
+  let both l = List.mem true l && List.mem false l in
+  (match Msx.insert_cassette m binary with Ok () -> () | Error e -> failwith e);
+  Msx.port_out m 0xAA 0x00;
+  Msx.port_out m 0xAB 0x8A (* mode 0, port C high an input *);
+  Msx.port_out m 0xAA 0x10 (* the latch says motor off *);
+  Msx.step m ~frames:121;
+  let state = Msx.serialize m in
+  let running = levels m 16 in
+  check "C high input: the motor keeps running" (both running);
+  (match Msx.restore ~state with
+   | Error e -> failwith ("restore: " ^ e)
+   | Ok restored -> check "the pins survive a save" (levels restored 16 = running));
+  Msx.port_out m 0xAB 0x82 (* an output again: the latch drives the pins *);
+  let held = levels m 16 in
+  check "C high output: the latch stops the motor" (List.for_all (( = ) (List.hd held)) held);
+  Msx.port_out m 0xAB 0x8A;
+  Msx.port_out m 0xAB 0x08 (* bit 4 reset: the latch says motor on *);
+  let held = levels m 16 in
+  check "C high input: a bit reset does not start it" (List.for_all (( = ) (List.hd held)) held)
+
 let () =
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
