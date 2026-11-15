@@ -15,6 +15,44 @@ let cart_mapper = ref ""
 let tap_space : int list ref = ref []
 let tap_keys : (int * Msx.key) list ref = ref []
 let tap_key_spec = ref ""
+let cas = ref ""
+
+(* --type F:TEXT presses each character for [type_hold] frames, one
+   character every [type_period] frames from frame F. A shifted character
+   presses SHIFT with its key (international layout); CR or LF is RETURN.
+   The BIOS reads the keyboard every third interrupt, 3.6 frames apart at
+   50 Hz, so a press and a release each last longer than that. *)
+let type_period = 10
+let type_hold = 5
+let typed : (int * Msx.key * bool) list ref = ref []
+
+let shifted =
+  [ ('!', '1'); ('@', '2'); ('#', '3'); ('$', '4'); ('%', '5'); ('^', '6');
+    ('&', '7'); ('*', '8'); ('(', '9'); (')', '0'); ('_', '-'); ('+', '=');
+    ('|', '\\'); ('{', '['); ('}', ']'); (':', ';'); ('"', '\''); ('~', '`');
+    ('<', ','); ('>', '.'); ('?', '/') ]
+
+let keys_of_char = function
+  | '\r' | '\n' -> [ Msx.Return ]
+  | c -> (
+    match List.assoc_opt c shifted with
+    | Some base -> [ Msx.Shift; Msx.Char base ]
+    | None -> [ Msx.Char c ])
+
+let parse_type spec =
+  match String.index_opt spec ':' with
+  | None -> Printf.ksprintf failwith "bad --type %s: expected F:TEXT" spec
+  | Some i ->
+    let start = int_of_string (String.sub spec 0 i) in
+    let text = String.sub spec (i + 1) (String.length spec - i - 1) in
+    List.concat
+      (List.mapi
+         (fun n c ->
+           let f = start + (n * type_period) in
+           let keys = keys_of_char c in
+           List.map (fun k -> (f, k, true)) keys
+           @ List.map (fun k -> (f + type_hold, k, false)) keys)
+         (List.of_seq (String.to_seq text)))
 
 let key_of_name = function
   | "up" -> Msx.Up | "down" -> Msx.Down
@@ -69,6 +107,10 @@ let () =
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
       ("--disk", Arg.Set_string disk, "PATH  플로피 이미지(.dsk) — 드라이브 A.");
+      ("--cas", Arg.Set_string cas, "PATH  카세트 이미지(.cas) — 감아 둔 채 넣는다.");
+      ( "--type",
+        Arg.String (fun spec -> typed := !typed @ parse_type spec),
+        "F:TEXT  프레임 F 부터 글자를 친다 (10프레임마다 한 글자, 5프레임 누름)" );
       ( "--disk-warm",
         Arg.Set disk_warm,
         "  720프레임 워밍업 뒤 Disk ROM 2차 호출 재생 (게임 화면 경로)" );
@@ -115,6 +157,10 @@ let () =
     in
     Msx.load_cartridge ?mapper t (read_file !cart)
   end;
+  (if !cas <> "" then
+     match Msx.insert_cassette t (read_file !cas) with
+     | Ok () -> ()
+     | Error e -> Printf.ksprintf failwith "--cas %s: %s" !cas e);
   if !disk <> "" then begin
     Msx.load_disk ~interface_rom:(not !disk_warm) ~real_rom:!disk_real t (read_file !disk);
     if !tap_key_spec <> "" then tap_keys := parse_tap_keys !tap_key_spec;
@@ -169,6 +215,11 @@ let () =
           if !ridx = f then ignore (Msx.set_key t k ~pressed:true);
           if !ridx = f + 5 then ignore (Msx.set_key t k ~pressed:false))
         !tap_keys;
+      List.iter
+        (fun (f, k, down) ->
+          if !ridx = f && not (Msx.set_key t k ~pressed:down) then
+            failwith "--type: a character has no key on the international layout")
+        !typed;
       ring.(!ridx land 63) <- Msx.dump_pc t;
       incr ridx;
       let dlo, dhi =
