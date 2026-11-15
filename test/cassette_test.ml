@@ -194,6 +194,23 @@ let () =
     motor restored true;
     check "saved with the motor off" (levels restored 16 = original)
 
+(* At power-on the port C high pins have driven nothing yet (openMSX
+   MSXPPI prevBits = 15): the motor is off although the latch is 0, until a
+   write drives the pins. *)
+let () =
+  let m = Msx.create ~machine:{ Msx.ram_kb = 64; vram_kb = 128; roms = [ ""; ""; "" ] } in
+  let r14 () = Msx.port_out m 0xA0 14; Msx.port_in m 0xA2 land 0x80 <> 0 in
+  let levels n = List.init n (fun _ -> Msx.step m ~frames:1; r14 ()) in
+  (match Msx.insert_cassette m binary with Ok () -> () | Error e -> failwith e);
+  check "power-on: the motor is off" (List.for_all Fun.id (levels 140));
+  Msx.port_out m 0xAB 0x82 (* the BIOS's mode word drives latch 0 *);
+  Msx.step m ~frames:121;
+  let pilot = levels 16 in
+  check "a mode word starts it" (List.mem true pilot && List.mem false pilot);
+  Msx.port_out m 0xAB 0x09 (* bit 4 set: the TAPIOF way to stop it *);
+  let held = levels 16 in
+  check "a bit set stops it" (List.for_all (( = ) (List.hd held)) held)
+
 (* Port C high as an input: the motor pins keep what they last drove and
    latch writes do not reach them (openMSX I8255::outputPortC). *)
 let () =

@@ -195,8 +195,10 @@ type t = {
       (** The keyboard row the port C low pins hold while that half is an
           input: the latch's low nibble when the half last was an output. *)
   mutable ppi_c_high : int;
-      (** The same for the port C high pins, as a nibble. Bit 0 of it runs
-          the cassette motor. *)
+      (** What the port C high pins last drove, as a nibble (openMSX MSXPPI
+          prevBits): all ones at power-on, then the latch's high nibble each
+          time that half drives as an output. Bit 0 low runs the cassette
+          motor. *)
   mutable slot3_sel : int;
   keys : bool array;  (** key_rows × 8, 눌림=true *)
   psg : int array;
@@ -747,6 +749,12 @@ let ppi_bios_mode = ppi_set_mode lor ppi_input_b
 
 let ppi_is_input m bit = m.ppi_ctrl land bit <> 0
 
+(* Port C high drives its pins only while it is an output
+   (I8255::outputPortC), after a latch write, a bit set or reset, or a
+   mode word. *)
+let ppi_drive_c_high m =
+  if not (ppi_is_input m ppi_input_c_high) then m.ppi_c_high <- m.ppi_c lsr 4
+
 (* A mode word re-drives the output ports from their latches
    (I8255::writeControlPort). The pins of a port that turns into an input
    keep the value they had. *)
@@ -754,26 +762,24 @@ let ppi_write_control m v =
   if v land ppi_set_mode <> 0 then begin
     let latch_a = if ppi_is_input m ppi_input_a then m.ppi_latch_a else m.ppi_a in
     if not (ppi_is_input m ppi_input_c_low) then m.ppi_row <- m.ppi_c land 0x0f;
-    if not (ppi_is_input m ppi_input_c_high) then m.ppi_c_high <- m.ppi_c lsr 4;
     m.ppi_ctrl <- v;
     if ppi_is_input m ppi_input_a then m.ppi_latch_a <- latch_a else m.ppi_a <- latch_a
   end else begin
     let bit = 1 lsl ((v lsr 1) land 7) in
     m.ppi_c <- if v land 1 <> 0 then m.ppi_c lor bit else m.ppi_c land lnot bit
-  end
+  end;
+  ppi_drive_c_high m
 
 (* The keyboard row the port C low pins select: the latch while that half
    is an output, the value it last drove while it is an input. *)
 let ppi_selected_row m =
   if ppi_is_input m ppi_input_c_low then m.ppi_row else m.ppi_c land 0x0f
 
-(* Port C bit 4 low runs the cassette motor (openMSX MSXPPI::writeC1). Like
-   the keyboard row, the pins hold their last output while port C high is
-   an input. *)
-let cassette_motor_bit = 0x10
-let cassette_motor m =
-  let pins = if ppi_is_input m ppi_input_c_high then m.ppi_c_high lsl 4 else m.ppi_c in
-  pins land cassette_motor_bit = 0
+(* Port C bit 4 low runs the cassette motor (openMSX MSXPPI::writeC1). It
+   follows the pins, so the motor stays off until the BIOS first drives
+   port C high: on the NMS 8250, its mode word at cycle 112. *)
+let cassette_motor_bit = 0x1 (* of the port C high nibble *)
+let cassette_motor m = m.ppi_c_high land cassette_motor_bit = 0
 let cassette_input_bit = 0x80
 
 (* The tape moves up to a port C write with the motor as it was. *)
@@ -860,7 +866,7 @@ let port_write m port v =
     else m.ppi_a <- v land 0xff
   | 0xA9 -> m.ppi_b <- v land 0xff
   (* Port C bit 4 runs the cassette motor; both ports can change it. *)
-  | 0xAA -> cassette_advance m; m.ppi_c <- v land 0xff
+  | 0xAA -> cassette_advance m; m.ppi_c <- v land 0xff; ppi_drive_c_high m
   | 0xAB -> cassette_advance m; ppi_write_control m (v land 0xff)
   | 0xA0 -> m.psg_latch <- v land 0xff
   | 0xA1 -> if m.psg_latch < 16 then m.psg.(m.psg_latch) <- v land 0xff
@@ -936,7 +942,7 @@ let create ~machine =
       ppi_latch_a = 0x00;
       ppi_b = 0x00;
       ppi_row = 0;
-      ppi_c_high = 0;
+      ppi_c_high = 0xf;
       slot3_sel = 0x00;
       keys = Array.make (key_rows * 8) false;
       psg = Array.make 16 0;
@@ -2358,7 +2364,8 @@ let restore_with_reader reader state =
     end else t.ppi_ctrl <- ppi_bios_mode;
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
-    (* Before v5 nothing read the port C high pins; they follow the latch. *)
+    (* Before v5 nothing read the port C high pins. A state saved after the
+       BIOS set up the PPI has them equal to the latch. *)
     t.ppi_c_high <-
       (if State_codec.version r >= 5 then State_codec.get_int r ~min:0 ~max:15
        else t.ppi_c lsr 4);
