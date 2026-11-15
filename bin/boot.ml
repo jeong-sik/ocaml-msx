@@ -10,6 +10,7 @@ let watch_mem = ref ""
 let cart = ref ""
 let disk = ref ""
 let disk_warm = ref false
+let rtc_time = ref ""
 let disk_real = ref false
 let cart_mapper = ref ""
 let tap_space : int list ref = ref []
@@ -56,6 +57,26 @@ let count_nonblack rgb =
     rgb;
   !n
 
+(* --rtc-time: "host" reads the host's local clock; a fixed
+   YYYY-MM-DDTHH:MM:SS keeps runs repeatable. *)
+let parse_rtc_time spec =
+  let host () =
+    let tm = Unix.localtime (Unix.time ()) in
+    Rtc.time ~year:(tm.tm_year + 1900) ~month:(tm.tm_mon + 1) ~day:tm.tm_mday
+      ~hour:tm.tm_hour ~minute:tm.tm_min ~second:tm.tm_sec
+  in
+  let fixed () =
+    match
+      Scanf.sscanf_opt spec "%4d-%2d-%2dT%2d:%2d:%2d%!"
+        (fun year month day hour minute second -> Rtc.time ~year ~month ~day ~hour ~minute ~second)
+    with
+    | Some result -> result
+    | None -> Error "expected host or YYYY-MM-DDTHH:MM:SS"
+  in
+  match (if spec = "host" then host () else fixed ()) with
+  | Ok time -> time
+  | Error e -> Printf.ksprintf failwith "--rtc-time %s: %s" spec e
+
 let read_file p =
   let ic = open_in_bin p in
   let n = in_channel_length ic in
@@ -69,6 +90,9 @@ let () =
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
       ("--disk", Arg.Set_string disk, "PATH  플로피 이미지(.dsk) — 드라이브 A.");
+      ( "--rtc-time",
+        Arg.Set_string rtc_time,
+        "host|YYYY-MM-DDTHH:MM:SS  RTC 시작 시각 (없으면 00-00-00 00:00:00)" );
       ( "--disk-warm",
         Arg.Set disk_warm,
         "  720프레임 워밍업 뒤 Disk ROM 2차 호출 재생 (게임 화면 경로)" );
@@ -99,6 +123,7 @@ let () =
   let t =
     Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms }
   in
+  if !rtc_time <> "" then Msx.set_rtc_time t (parse_rtc_time !rtc_time);
   (* [begin..end] bounds the then-branch: without it the [let mapper = .. in]
      swallows every following statement (run loop, prints), so a no-cart boot
      (BIOS only or disk) ran nothing and exited silently. *)

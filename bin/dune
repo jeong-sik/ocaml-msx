@@ -26,7 +26,7 @@
 (executable
  (name boot)
  (modules boot)
- (libraries msx))
+ (libraries msx unix))
 
 (executable
  (name replay)
