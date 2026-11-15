@@ -142,17 +142,11 @@ type t = {
   mutable frames : int;
   mutable rtc_reg : int;
       (** RTC(RP5C01) 의 어드레스 래치(포트 0xB4 로 선택한 레지스터 번호). *)
-  rtc_regs : int array;
-      (** RP5C01 레지스터 파일 52니블 = 4뱅크 × 13레지스터(openMSX RP5C01
-          정본: bank = 모드 레지스터 bit0-1, 0=시계 1=알람/RAM 2·3=SRAM).
-          실 sub ROM 부트는 여기에 초기값을 쓰고 읽어 되돌려 검증한다(실측:
-          nms8250_msx2sub 0x0431/0x0440 — reg0 에 0x0A 를 심고 CP 0x0A 로
-          확인) — 읽기가 상수면 검증이 영원히 실패해 BIOS 초기화가 0x04xx
-          루프에 갇힌다. 시계 진행은 없다(부트 검증은 쓴 값의 되돌림만 보고,
-          실시간 비결정성도 만든다). *)
-  mutable rtc_mode : int;
-      (** 모드 레지스터(reg 13): bit0-1=뱅크, bit2=알람, bit3=타이머. 읽기에
-          그대로 드러난다. 전원 인가값은 타이머 동작 자세(0x8). *)
+  rtc : Rtc.t;
+      (** RP5C01 behind ports 0xB4/0xB5. A real MSX2 sub ROM writes values
+          into it at boot and reads them back to check the chip (measured:
+          nms8250_msx2sub 0x0431/0x0440 stores 0x0A in register 0 and
+          compares), so reads must return what was written. *)
   mutable con_esc : int;
       (** VT52 escape-sequence state for the BDOS console: 0=plain, 1=after
           ESC, 2=after "ESC Y" (row byte next), 3=column byte next. *)
@@ -686,49 +680,10 @@ let psg_read m =
   | r when r < 16 -> m.psg.(r)
   | _ -> 0xff
 
-(* RP5C01 접근 면(openMSX RP5C01.cc peekPort/writePort 정본): 뱅크 = 모드
-   bit0-1, reg 13 은 모드를 그대로, reg 14/15(TEST/RESET) 는 쓰기 전용이라
-   읽으면 0x0F. 뱅크별 니블 마스크는 시계 자릿수의 유효 범위(초 10자리 ≤5
-   등)를 낸다 — 초 1자리(레지스터 0)의 마스크는 0xF 라 0x0A 도 그대로
-   저장되고, sub ROM 의 부트 검증(CP 0x0A)은 이 되돌림을 본다. *)
-let rtc_masks =
-  [| [| 0xf; 0x7; 0xf; 0x7; 0xf; 0x3; 0x7; 0xf; 0x3; 0xf; 0x1; 0xf; 0xf |];
-     [| 0x0; 0x0; 0xf; 0x7; 0xf; 0x3; 0x7; 0xf; 0x3; 0x0; 0x1; 0x3; 0x0 |];
-     Array.make 13 0xf;
-     Array.make 13 0xf |]
-
-(* Power-on RTC registers. openMSX keeps the 52 nibbles in an SRAM that a
-   machine without a saved file starts filled with 0xFF (Ram::clear); the
-   RP5C01 then writes the time block and the leap-year counter (alarm
-   block register 11) from the host clock. This core reads no host clock:
-   the time stays zero, the alarm block and the two RAM blocks read 0xF.
-   C-BIOS leaves them so; a real MSX2 sub ROM rewrites them at boot. *)
-let rtc_block_size = 13
-let rtc_leap_year = rtc_block_size + 11
-let rtc_power_on () =
-  Array.init (4 * rtc_block_size) (fun i ->
-      if i < rtc_block_size || i = rtc_leap_year then 0 else 0x0f)
-
-let rtc_read_reg m =
-  match m.rtc_reg land 0x0f with
-  | 13 -> m.rtc_mode land 0x0f
-  | 14 | 15 -> 0x0f
-  | r ->
-    let bank = m.rtc_mode land 3 in
-    m.rtc_regs.((bank * 13) + r) land rtc_masks.(bank).(r)
-
-let rtc_write_reg m v =
-  match m.rtc_reg land 0x0f with
-  | 13 -> m.rtc_mode <- v land 0x0f
-  | 14 | 15 -> () (* TEST/RESET: 쓰기 효과(타이머 가속·분수 리셋) 없음 *)
-  | r ->
-    let bank = m.rtc_mode land 3 in
-    m.rtc_regs.((bank * 13) + r) <- (v land 0x0f) land rtc_masks.(bank).(r)
-
 let port_read m port =
   match port land 0xff with
   | 0xB4 -> m.rtc_reg land 0x0f
-  | 0xB5 -> rtc_read_reg m
+  | 0xB5 -> Rtc.read m.rtc ~cycle:(Z80.t_states m.cpu) m.rtc_reg
   | 0xD0 | 0xD1 | 0xD2 | 0xD3 -> fdc_read m port
   | 0x98 -> Vdp.io_read m.vdp ~port:0x98
   | 0x99 -> Vdp.io_read m.vdp ~port:0x99
@@ -777,7 +732,7 @@ let port_write m port v =
     mapper_writes.(port land 3) <- mapper_writes.(port land 3) + 1;
     m.mapper.(port land 3) <- v land 0x3f
   | 0xB4 -> m.rtc_reg <- v land 0xff
-  | 0xB5 -> rtc_write_reg m v
+  | 0xB5 -> Rtc.write m.rtc ~cycle:(Z80.t_states m.cpu) m.rtc_reg v
   | _ -> ()
 
 (* 메모리 쓰기 감시 — write 클로저가 참조하므로 create 보다 앞에. *)
@@ -822,8 +777,7 @@ let create ~machine =
       bdos_files = Hashtbl.create 4;
       frames = 0;
       rtc_reg = 0;
-      rtc_regs = rtc_power_on ();
-      rtc_mode = 0x8;
+      rtc = Rtc.create ();
       con_esc = 0;
       rst30_pending = [];
       hle_disk = true;
@@ -1988,6 +1942,7 @@ let step t ~frames =
   done
 
 let frame_number t = t.frames
+let set_rtc_time t time = Rtc.set_time t.rtc ~cycle:(Z80.t_states t.cpu) time
 let dump_pc t = Z80.dump_pc t.cpu
 
 let screen_text t =
@@ -2111,8 +2066,7 @@ let serialize t =
   State_codec.put_int w t.cart_sram_bit;
   State_codec.put_int w t.disk_dma;
   State_codec.put_int w t.rtc_reg;
-  State_codec.put_int w t.rtc_mode;
-  State_codec.put_int_array w t.rtc_regs;
+  Rtc.write_registers w t.rtc;
   State_codec.put_int w t.con_esc;
   State_codec.put_int w t.ppi_a;
   State_codec.put_int w t.ppi_c;
@@ -2150,6 +2104,10 @@ let serialize t =
   State_codec.put_bool w f.intr_fired;
   Z80.write_state w t.cpu;
   Vdp.write_state w t.vdp;
+  (* v4: the RTC's test register, fraction of a second and last counted
+     tick. It follows the CPU state because the tick is a point on the CPU
+     clock and is checked against it on restore. *)
+  Rtc.write_clock w t.rtc;
   State_codec.finish w
 
 let restore_with_reader reader state =
@@ -2181,10 +2139,7 @@ let restore_with_reader reader state =
     t.cart_sram_bit <- State_codec.get_int r ~min:0 ~max:max_int;
     t.disk_dma <- State_codec.get_int r ~min:0 ~max:65535;
     t.rtc_reg <- State_codec.get_int r ~min:0 ~max:255;
-    if State_codec.version r >= 2 then begin
-      t.rtc_mode <- State_codec.get_int r ~min:0 ~max:15;
-      State_codec.fill_int_array r ~min:0 ~max:15 t.rtc_regs
-    end;
+    if State_codec.version r >= 2 then Rtc.read_registers r t.rtc;
     t.con_esc <- State_codec.get_int r ~min:0 ~max:3;
     t.ppi_a <- State_codec.get_int r ~min:0 ~max:255;
     t.ppi_c <- State_codec.get_int r ~min:0 ~max:255;
@@ -2230,6 +2185,9 @@ let restore_with_reader reader state =
     end;
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
+    let cycle = Z80.t_states t.cpu in
+    if State_codec.version r >= 4 then Rtc.read_clock r t.rtc ~cycle
+    else Rtc.start_clock t.rtc ~cycle;
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message
