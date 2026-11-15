@@ -76,6 +76,12 @@ val mem_write : t -> int -> int -> unit
 (** Write a byte at a 16-bit address as the Z80 would — into RAM, or as a bank
     select in a MegaROM's cart window. For tests and debugging. *)
 
+val insert_cassette : t -> string -> (unit, string) result
+(** Put a CAS image in the cassette deck, rewound, from the current CPU
+    cycle on. The tape moves while software runs the motor (PPI port C bit
+    4 = 0) and shows on PSG R#14 bit 7. Error when the image holds no CAS
+    block header; the machine is unchanged then. *)
+
 val load_disk : ?interface_rom:bool -> ?real_rom:bool -> t -> string -> unit
 (** Plug a floppy image (raw .dsk, 512 bytes a sector) into drive A. By
     default a disk interface ROM rides in the cartridge slot: C-BIOS finds its

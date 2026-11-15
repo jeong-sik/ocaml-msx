@@ -199,6 +199,9 @@ type t = {
   psg : int array;
   mutable psg_latch : int;
   mutable joy1 : int;  (** 조이스틱 1 입력 6비트, active low — 빈 포트 0x3F *)
+  mutable cassette : Cassette.deck option;
+      (** The tape in the cassette deck. The motor is PPI port C bit 4, so
+          the deck keeps no copy of it. *)
   cpu_ref : t option ref;
 }
 
@@ -689,13 +692,35 @@ let mem_write m addr v =
   end
 
 (* PSG R#14 = 조이스틱 포트 입력. R#15 bit6 이 포트 선택(0 = 1번), 2번 포트는
-   비어 있다. bit6 = 키배열 점퍼(50on = 0), bit7 = 카세트 입력(0).
-   정본: openMSX MSXPSG::readA, DummyJoystick::read = 0x3F. *)
+   비어 있다. bit6 = 키배열 점퍼(50on = 0), bit7 = 카세트 입력(아래).
+   정본: openMSX MSXPSG::readA, DummyJoystick::read = 0x3F. openMSX 21
+   C-BIOS_MSX2 실측: 테이프 없이 두 포트 모두 0xBF. *)
 let joystick_idle = 0x3f
+
+(* PPI port C bit 4 low runs the cassette motor (openMSX MSXPPI::writeC1). *)
+let cassette_motor_bit = 0x10
+let cassette_motor m = m.ppi_c land cassette_motor_bit = 0
+let cassette_input_bit = 0x80
+
+(* With no tape the input reads 1: openMSX's comparator takes a sample >= 0
+   as high, and an empty deck gives silence (0). *)
+(* The tape moves up to a port C write with the motor as it was. *)
+let cassette_advance m =
+  Option.iter
+    (fun d -> Cassette.advance d ~cycle:(Z80.t_states m.cpu) ~motor:(cassette_motor m))
+    m.cassette
+
+let cassette_input m =
+  match m.cassette with
+  | None -> true
+  | Some d -> Cassette.input d ~cycle:(Z80.t_states m.cpu) ~motor:(cassette_motor m)
 
 let psg_read m =
   match m.psg_latch with
-  | 14 -> if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle
+  | 14 ->
+    let joystick = if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle in
+    (joystick land lnot cassette_input_bit)
+    lor (if cassette_input m then cassette_input_bit else 0)
   | r when r < 16 -> m.psg.(r)
   | _ -> 0xff
 
@@ -826,8 +851,9 @@ let port_write m port v =
     if ppi_is_input m ppi_input_a then m.ppi_latch_a <- v land 0xff
     else m.ppi_a <- v land 0xff
   | 0xA9 -> m.ppi_b <- v land 0xff
-  | 0xAA -> m.ppi_c <- v land 0xff
-  | 0xAB -> ppi_write_control m (v land 0xff)
+  (* Port C bit 4 runs the cassette motor; both ports can change it. *)
+  | 0xAA -> cassette_advance m; m.ppi_c <- v land 0xff
+  | 0xAB -> cassette_advance m; ppi_write_control m (v land 0xff)
   | 0xA0 -> m.psg_latch <- v land 0xff
   | 0xA1 -> if m.psg_latch < 16 then m.psg.(m.psg_latch) <- v land 0xff
   | 0xFC | 0xFD | 0xFE | 0xFF ->
@@ -907,6 +933,7 @@ let create ~machine =
       psg = Array.make 16 0;
       psg_latch = 0;
       joy1 = joystick_idle;
+      cassette = None;
       cpu_ref = m_ref;
     }
   in
@@ -1171,6 +1198,13 @@ let fat12_open t name11 =
     match fat12_find t fs name11 with
     | None -> None
     | Some e -> Some (fat12_read t fs e)
+
+let insert_cassette t cas =
+  match Cassette.of_cas cas with
+  | Error e -> Error e
+  | Ok tape ->
+    t.cassette <- Some (Cassette.insert tape ~cycle:(Z80.t_states t.cpu));
+    Ok ()
 
 let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
   t.disk <- Bytes.of_string dsk;
@@ -2216,6 +2250,15 @@ let serialize t =
   State_codec.put_int w t.ppi_row;
   Z80.write_state w t.cpu;
   Vdp.write_state w t.vdp;
+  (* v5: the cassette image and how far its tape has moved. It follows the
+     CPU state because the deck counts CPU cycles from the restored time. *)
+  (match t.cassette with
+   | None -> State_codec.put_bool w false
+   | Some d ->
+     State_codec.put_bool w true;
+     State_codec.put_bytes w (Bytes.of_string (Cassette.cas (Cassette.tape d)));
+     State_codec.put_int w
+       (Cassette.position d ~cycle:(Z80.t_states t.cpu) ~motor:(cassette_motor t)));
   State_codec.finish w
 
 let restore_with_reader reader state =
@@ -2304,6 +2347,15 @@ let restore_with_reader reader state =
     end else t.ppi_ctrl <- ppi_bios_mode;
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
+    if State_codec.version r >= 5 && State_codec.get_bool r then begin
+      let tape =
+        match Cassette.of_cas (Bytes.to_string (State_codec.get_bytes r)) with
+        | Ok tape -> tape
+        | Error e -> State_codec.fail ("invalid saved cassette: " ^ e)
+      in
+      let position = State_codec.get_int r ~min:0 ~max:max_int in
+      t.cassette <- Some (Cassette.resume tape ~position ~cycle:(Z80.t_states t.cpu))
+    end;
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message
