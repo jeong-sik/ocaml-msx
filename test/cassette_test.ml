@@ -145,12 +145,26 @@ let () =
   check "motor off keeps the position"
     (Cassette.position d ~cycle:(stopped_at + 1_000_000) ~motor:off
      = stopped_at * 960);
-  check "still on the low half-pulse" (not (Cassette.input d ~cycle:(stopped_at + 1_000_000) ~motor:off));
+  (* openMSX CassettePlayer::readSample: a tape that does not roll gives
+     silence, high, even on the low half of a pulse. *)
+  check "motor off reads high" (Cassette.input d ~cycle:(stopped_at + 1_000_000) ~motor:off);
+  check "motor on again: the low half-pulse"
+    (not (Cassette.input d ~cycle:(stopped_at + 1_000_000) ~motor:on));
   check "position counts cycles while the motor runs"
-    (Cassette.position d ~cycle:(stopped_at + 1_000_010) ~motor:on = (stopped_at + 10) * 960);
+    (Cassette.position d ~cycle:(stopped_at + 1_000_010) ~motor:on
+     = (stopped_at + 10) * 960);
   let resumed = Cassette.resume tape ~position:(stopped_at * 960) ~cycle:5 in
   check "a resumed deck reads where it was"
-    (not (Cassette.input resumed ~cycle:5 ~motor:on))
+    (not (Cassette.input resumed ~cycle:5 ~motor:on));
+  (* The tape stops at the end of the wave (openMSX execEndOfTape). *)
+  let end_ = Cassette.end_position tape in
+  check "the end is the last sample's end" (end_ = Cassette.samples tape * units_per_sample);
+  let past = (end_ / 960) + 2_000_000 in
+  check "the position stops at the end" (Cassette.position d ~cycle:past ~motor:on = end_);
+  Cassette.advance d ~cycle:past ~motor:on;
+  check "past the end reads high" (Cassette.input d ~cycle:(past + 1) ~motor:on);
+  check "and stays at the end"
+    (Cassette.position d ~cycle:(past + 1_000_000) ~motor:on = end_)
 
 (* Through the machine: PPI port C bit 4 = 0 runs the motor, PSG R#14 bit 7
    shows the input, and a save state carries the tape. *)
@@ -192,7 +206,22 @@ let () =
   | Error e -> failwith ("restore: " ^ e)
   | Ok restored ->
     motor restored true;
-    check "saved with the motor off" (levels restored 16 = original)
+    check "saved with the motor off" (levels restored 16 = original);
+    (* The tape position is the state's last field; a restore takes it only
+       up to the end of the tape. *)
+    let forge position =
+      let head = String.length "OCAML-MSX\000" + 1 in
+      let payload =
+        Bytes.of_string (String.sub state (head + 16) (String.length state - head - 16))
+      in
+      Bytes.set_int64_be payload (Bytes.length payload - 8) (Int64.of_int position);
+      String.sub state 0 head ^ Digest.bytes payload ^ Bytes.to_string payload
+    in
+    let end_ = Cassette.end_position (tape_exn binary) in
+    check "a saved position at the end restores"
+      (Result.is_ok (Msx.restore ~state:(forge end_)));
+    check "a saved position past the end is refused"
+      (Result.is_error (Msx.restore ~state:(forge (end_ + 1))))
 
 (* At power-on the port C high pins have driven nothing yet (openMSX
    MSXPPI prevBits = 15): the motor is off although the latch is 0, until a

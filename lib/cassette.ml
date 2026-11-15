@@ -171,15 +171,23 @@ type deck = {
 let insert tape ~cycle = { deck_tape = tape; moved = 0; synced = cycle }
 let tape d = d.deck_tape
 
+(* openMSX stops the tape at the end of the wave (CassettePlayer
+   execEndOfTape), so the position never passes it. *)
+let end_position t = t.total * units_per_sample
+
 let position d ~cycle ~motor =
-  if motor then d.moved + ((cycle - d.synced) * units_per_cycle) else d.moved
+  if motor then
+    min (end_position d.deck_tape) (d.moved + ((cycle - d.synced) * units_per_cycle))
+  else d.moved
 
 let advance d ~cycle ~motor =
   d.moved <- position d ~cycle ~motor;
   d.synced <- cycle
 
+(* A stopped tape gives silence, which reads high (CassettePlayer::readSample
+   returns 0 unless the tape rolls). *)
 let input d ~cycle ~motor =
   advance d ~cycle ~motor;
-  level d.deck_tape (d.moved / units_per_sample)
+  (not motor) || level d.deck_tape (d.moved / units_per_sample)
 
 let resume tape ~position ~cycle = { deck_tape = tape; moved = position; synced = cycle }

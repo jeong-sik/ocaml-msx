@@ -18,8 +18,9 @@ let tap_key_spec = ref ""
 let cas = ref ""
 
 (* --type F:TEXT presses each character for [type_hold] frames, one
-   character every [type_period] frames from frame F. A shifted character
-   presses SHIFT with its key (international layout); CR or LF is RETURN.
+   character every [type_period] frames from frame F. A capital letter or
+   a shifted character presses SHIFT with its key (international layout);
+   CR or LF is RETURN.
    The BIOS reads the keyboard every third interrupt, 3.6 frames apart at
    50 Hz, so a press and a release each last longer than that. *)
 let type_period = 10
@@ -34,6 +35,7 @@ let shifted =
 
 let keys_of_char = function
   | '\r' | '\n' -> [ Msx.Return ]
+  | 'A' .. 'Z' as c -> [ Msx.Shift; Msx.Char c ]
   | c -> (
     match List.assoc_opt c shifted with
     | Some base -> [ Msx.Shift; Msx.Char base ]

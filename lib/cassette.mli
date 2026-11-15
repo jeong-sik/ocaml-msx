@@ -39,14 +39,19 @@ val insert : tape -> cycle:int -> deck
 
 val input : deck -> cycle:int -> motor:bool -> bool
 (** The input bit at CPU cycle [cycle]. [motor] is the motor state since the
-    last call; the tape moved only if it was on. *)
+    last call; the tape moved only if it was on. With the motor off the
+    input is [true], as from silence. *)
 
 val advance : deck -> cycle:int -> motor:bool -> unit
 (** Move the tape to CPU cycle [cycle]; call it before the motor changes. *)
 
 val position : deck -> cycle:int -> motor:bool -> int
 (** How far the tape has moved by CPU cycle [cycle], in units of
-    1/(3579545 * 960) s, without changing the deck. *)
+    1/(3579545 * 960) s, without changing the deck. It stops at
+    [end_position]. *)
+
+val end_position : tape -> int
+(** Where the tape stops: the end of its wave, in the units of [position]. *)
 
 val tape : deck -> tape
 

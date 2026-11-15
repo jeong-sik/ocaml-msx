@@ -2365,7 +2365,8 @@ let restore_with_reader reader state =
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
     (* Before v5 nothing read the port C high pins. A state saved after the
-       BIOS set up the PPI has them equal to the latch. *)
+       BIOS set up the PPI has them equal to the latch; one saved with port
+       C high as an input may not, but such a state has no tape either. *)
     t.ppi_c_high <-
       (if State_codec.version r >= 5 then State_codec.get_int r ~min:0 ~max:15
        else t.ppi_c lsr 4);
@@ -2375,7 +2376,7 @@ let restore_with_reader reader state =
         | Ok tape -> tape
         | Error e -> State_codec.fail ("invalid saved cassette: " ^ e)
       in
-      let position = State_codec.get_int r ~min:0 ~max:max_int in
+      let position = State_codec.get_int r ~min:0 ~max:(Cassette.end_position tape) in
       t.cassette <- Some (Cassette.resume tape ~position ~cycle:(Z80.t_states t.cpu))
     end;
     State_codec.end_of_input r;
