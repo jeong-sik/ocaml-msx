@@ -146,7 +146,81 @@ let koei_sram () =
   Msx.mem_write t 0x7000 0x20;
   check "koei sram retained across bank switch" (win t 0x8000 = 0xab)
 
+(* The 64KB RAM cartridge (openMSX -extb ram64k): RAM over all four pages of
+   primary slot 2, every byte 0xFF at power-on, saved with the machine. *)
+let pages = [ 0x0000; 0x4000; 0x8000; 0xc000 ]
+
+(* PPI port A = 0xAA: every page on slot 2. 0x00: every page on slot 0. *)
+let all_slot2 t = Msx.port_out t 0xA8 0xAA
+
+(* A save whose mapper code is [code]: the blobs ram, main, logo, sub, cart,
+   cart SRAM and disk each carry an 8-byte length, and the mapper code
+   follows them. The checksum is recomputed so only the restore's own
+   checks can refuse the result. *)
+let with_mapper_code state code =
+  let magic_and_digest = 11 + 16 in
+  let b = Bytes.of_string state in
+  let pos = ref magic_and_digest in
+  for _ = 1 to 7 do
+    pos := !pos + 8 + Int64.to_int (Bytes.get_int64_be b !pos)
+  done;
+  Bytes.set_int64_be b !pos (Int64.of_int code);
+  let payload = Bytes.sub_string b magic_and_digest (Bytes.length b - magic_and_digest) in
+  Bytes.blit_string (Digest.string payload) 0 b 11 16;
+  Bytes.to_string b
+
+let ram_cart () =
+  let t = machine () in
+  let ppi = Msx.port_in t 0xA8 in
+  Msx.insert_ram_cartridge t;
+  check "ram cart: the slot selection is left alone" (Msx.port_in t 0xA8 = ppi);
+  check "ram cart: the mapper reads Ram64" (Msx.cart_mapper t = Msx.Ram64);
+  all_slot2 t;
+  List.iter
+    (fun a ->
+      check (Printf.sprintf "ram cart: 0x%04x powers up 0xFF" a) (Msx.mem_read t a = 0xff);
+      check (Printf.sprintf "ram cart: 0x%04x top powers up 0xFF" a)
+        (Msx.mem_read t (a + 0x3fff) = 0xff))
+    pages;
+  List.iteri (fun i a -> Msx.mem_write t a (0x10 + i)) pages;
+  Msx.mem_write t 0xffff 0x5a;
+  List.iteri
+    (fun i a ->
+      check (Printf.sprintf "ram cart: 0x%04x keeps its byte" a) (Msx.mem_read t a = 0x10 + i))
+    pages;
+  check "ram cart: 0xFFFF is RAM, slot 2 is not expanded" (Msx.mem_read t 0xffff = 0x5a);
+  (* the main RAM in slot 3-2 is a different memory *)
+  Msx.port_out t 0xA8 0xFF;
+  Msx.mem_write t 0xffff 0xAA;
+  Msx.mem_write t 0x8000 0x77;
+  all_slot2 t;
+  check "ram cart: slot 3 writes do not reach it" (Msx.mem_read t 0x8000 = 0x12);
+  (* a save keeps the contents; the restored copy is its own memory *)
+  (match Msx.restore ~state:(Msx.serialize t) with
+   | Error e -> check ("ram cart: restore " ^ e) false
+   | Ok copy ->
+     check "ram cart: the mapper survives a save" (Msx.cart_mapper copy = Msx.Ram64);
+     check "ram cart: the bytes survive a save" (Msx.mem_read copy 0xc000 = 0x13);
+     Msx.mem_write copy 0xc000 0x99;
+     check "ram cart: the copy does not alias" (Msx.mem_read t 0xc000 = 0x13));
+  (* a save that claims a RAM cart over a 32KB ROM is refused *)
+  let rom = machine () in
+  Msx.load_cartridge ~mapper:Msx.Flat rom (synth 4);
+  check "ram cart: a forged save keeps a valid checksum"
+    (Result.is_ok (Msx.restore ~state:(with_mapper_code (Msx.serialize rom) 0)));
+  check "ram cart: a 32KB cart cannot restore as Ram64"
+    (Result.is_error (Msx.restore ~state:(with_mapper_code (Msx.serialize rom) 6)));
+  check "ram cart: load_cartridge refuses Ram64"
+    (match Msx.load_cartridge ~mapper:Msx.Ram64 (machine ()) (synth 8) with
+     | () -> false
+     | exception Invalid_argument _ -> true);
+  (* a ROM cart plugged in afterwards replaces the RAM *)
+  Msx.load_cartridge t (synth 4);
+  all_slot2 t;
+  check "ram cart: a ROM cart replaces it" (Msx.cart_mapper t = Msx.Flat && win t 0x6000 = 1)
+
 let () =
+  ram_cart ();
   konami ();
   konami_scc ();
   ascii8 ();

@@ -84,8 +84,13 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    segments per window and swaps them when the running code writes a bank
    register. [Flat] is the plain 16/32KB cart with no banking. The four here are
    the common ones (openMSX RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16);
-   the SCC sound chip is not modelled, only its banking. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
+   the SCC sound chip is not modelled, only its banking. [Ram64] is no ROM at
+   all: 64KB of RAM over the whole slot (openMSX's ram64k extension), held in
+   [cart] so a save keeps its contents. *)
+type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram | Ram64
+
+(* The RAM cartridge covers all four 16KB pages of its slot. *)
+let ram_cart_bytes = 0x10000
 
 (* WD279x 근사 상태. 즉시-완료 모델: 명령을 받으면 상태 읽기 한 번 안에
    seek/read 준비를 끝낸다 — 실기 타이밍의 근사이고, 로더가 상태 비트를
@@ -198,14 +203,14 @@ let cart_seg8 m w =
   match m.cart_mapper with
   | Konami | Konami_scc | Ascii8 | Ascii8_sram -> m.cart_banks.(w)
   | Ascii16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
-  | Flat -> w
+  | Flat | Ram64 -> w
 
 (* A write into the cart window selects a bank. Each mapper decodes the target
    address differently; a write that hits no register is ignored (ROM is not
    RAM). Segment values are masked to the ROM size at read time. *)
 let cart_bank_write m a v =
   match m.cart_mapper with
-  | Flat -> ()
+  | Flat | Ram64 -> ()
   | Konami ->
     (* 0x4000-0x5FFF fixed to segment 0; the upper three windows select. *)
     (match a land 0xe000 with
@@ -443,6 +448,7 @@ let mem_read m addr =
     | _ -> (m.ppi_a lsr 6) land 3
   in
   if a = 0xffff && slot = 3 then lnot m.slot3_sel land 0xff
+  else if slot = 2 && m.cart_mapper = Ram64 then Char.code (Bytes.get m.cart a)
   else if
     a land 0x3ff8 = 0x3ff8
     && ((slot = 2 && not m.cart_is_disk_rom && Bytes.length m.cart >= 0x4000)
@@ -614,6 +620,7 @@ let mem_write m addr v =
     | _ -> (m.ppi_a lsr 6) land 3
   in
   if a = 0xffff && slot = 3 then m.slot3_sel <- v land 0xff
+  else if slot = 2 && m.cart_mapper = Ram64 then Bytes.set m.cart a (Char.chr (v land 0xff))
   else if
     a land 0x3ff8 = 0x3ff8
     && ((slot = 2 && not m.cart_is_disk_rom && Bytes.length m.cart >= 0x4000)
@@ -845,6 +852,8 @@ let palette_entries t = Array.init 16 (Vdp.palette_rgb t.vdp)
 let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
 
 let load_cartridge ?mapper t rom =
+  if mapper = Some Ram64 then
+    invalid_arg "Msx.load_cartridge: a RAM cartridge has no ROM; use insert_ram_cartridge";
   t.cart <- Bytes.of_string rom;
   t.cart_mapper <- (match mapper with Some m -> m | None -> guess_mapper rom);
   (* Reset the banks linear so a MegaROM boots: segment 0 at 0x4000 holds the
@@ -870,6 +879,20 @@ let load_cartridge ?mapper t rom =
      돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
   t.ppi_a <- (t.ppi_a land 0xf3) lor 0x08
+
+(* openMSX's ram64k extension (-extb ram64k): a plain MSXRam in primary slot 2,
+   not expanded, covering 0x0000-0xFFFF. MSXRam::powerUp fills it with 0xFF.
+   Unlike [load_cartridge] the slot selection stays as it is: nothing in a RAM
+   cart asks to be booted, and the BIOS RAM search finds it on its own. *)
+let insert_ram_cartridge t =
+  t.cart <- Bytes.make ram_cart_bytes '\xff';
+  t.cart_mapper <- Ram64;
+  t.cart_banks.(0) <- 0;
+  t.cart_banks.(1) <- 1;
+  t.cart_banks.(2) <- 2;
+  t.cart_banks.(3) <- 3;
+  t.cart_sram_bit <- 0;
+  t.cart_sram <- Bytes.make 0 '\000'
 
 (* --- Disk interface (HLE) -------------------------------------------------
    A game disk boots through a disk interface ROM that rides in the cartridge
@@ -2081,8 +2104,10 @@ let frame_rgb t = Vdp.frame_rgb t.vdp
 
 let mapper_code = function
   | Flat -> 0 | Konami -> 1 | Konami_scc -> 2 | Ascii8 -> 3 | Ascii16 -> 4 | Ascii8_sram -> 5
+  | Ram64 -> 6
 let mapper_of_code = function
   | 0 -> Flat | 1 -> Konami | 2 -> Konami_scc | 3 -> Ascii8 | 4 -> Ascii16 | 5 -> Ascii8_sram
+  | 6 -> Ram64
   | _ -> State_codec.fail "invalid cartridge mapper"
 
 let serialize t =
@@ -2160,7 +2185,9 @@ let restore_with_reader reader state =
     if sram_size <> 0 && (sram_size mod 8192 <> 0 || sram_size land (sram_size - 1) <> 0) then
       State_codec.fail "invalid cartridge SRAM size";
     t.disk <- State_codec.get_bytes r;
-    t.cart_mapper <- mapper_of_code (State_codec.get_int r ~min:0 ~max:5);
+    t.cart_mapper <- mapper_of_code (State_codec.get_int r ~min:0 ~max:6);
+    if t.cart_mapper = Ram64 && Bytes.length t.cart <> ram_cart_bytes then
+      State_codec.fail "invalid RAM cartridge size";
     State_codec.fill_int_array r ~min:0 ~max:255 t.cart_banks;
     State_codec.fill_int_array r ~min:0 ~max:63 t.mapper;
     State_codec.fill_int_array r ~min:0 ~max:255 t.psg;
