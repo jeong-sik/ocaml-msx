@@ -625,7 +625,7 @@ let update_user t slot_of flag =
   done
 
 let write_register t reg data =
-  if reg < registers then begin
+  if reg >= 0 && reg < registers then begin
     let reg =
       if (0x19 <= reg && reg <= 0x1f) || (0x29 <= reg && reg <= 0x2f) || (0x39 <= reg && reg <= 0x3f)
       then reg - 9

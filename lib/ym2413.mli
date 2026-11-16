@@ -20,7 +20,7 @@ val write_address : t -> int -> unit
 (** Port 0x7C: latch the register number. *)
 
 val write_data : t -> int -> unit
-(** Port 0x7D: write the latched register. Registers 0x40 and above are
+(** Port 0x7D: write the latched register. Registers outside 0x00-0x3F are
     ignored; 0x19-0x1F, 0x29-0x2F and 0x39-0x3F mirror nine below. *)
 
 val write_register : t -> int -> int -> unit
@@ -38,8 +38,8 @@ val outputs : int
     and top cymbal. *)
 
 val output : t -> int -> int
-(** The last sample of output [i]. A melody channel ranges -2048..2048, a
-    rhythm output -4096..4094. Melody channels 6-8 read 0 in rhythm mode, and
+(** The last sample of output [i]. A melody channel stays within
+    -2048..2048, a rhythm output within -4096..4094. Melody channels 6-8 read 0 in rhythm mode, and
     the rhythm outputs read 0 outside it. *)
 
 val mix : t -> int
