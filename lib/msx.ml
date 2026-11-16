@@ -86,7 +86,9 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    the common ones (openMSX RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16);
    a Konami SCC cart also carries the SCC sound chip ([scc]). [Scc_plus] is
    Konami's SCC+ sound cartridge: no ROM, [cart] is its RAM, [cart_banks] its
-   mapper registers and [scc_plus_mode] its mode register (see Scc_plus). *)
+   mapper registers and [scc_plus_mode] its mode register (see Scc_plus).
+   [Scc_cart] is the empty Konami SCC cartridge (openMSX extension "scc"): the
+   SCC mapper with no ROM, so only [scc] and [scc_enabled] matter. *)
 type cart_mapper =
   | Flat
   | Konami
@@ -95,6 +97,7 @@ type cart_mapper =
   | Ascii16
   | Ascii8_sram
   | Scc_plus of Scc_plus.kind
+  | Scc_cart
 
 (* WD279x 근사 상태. 즉시-완료 모델: 명령을 받으면 상태 읽기 한 번 안에
    seek/read 준비를 끝낸다 — 실기 타이밍의 근사이고, 로더가 상태 비트를
@@ -217,6 +220,7 @@ let cart_seg8 m w =
   | Ascii16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
   | Flat -> w
   | Scc_plus _ -> invalid_arg "cart_seg8: the SCC+ cart maps RAM in Scc_plus"
+  | Scc_cart -> invalid_arg "cart_seg8: the SCC cart has no ROM"
 
 (* A write into the cart window selects a bank. Each mapper decodes the target
    address differently; a write that hits no register is ignored (ROM is not
@@ -225,6 +229,7 @@ let cart_bank_write m a v =
   match m.cart_mapper with
   | Flat -> ()
   | Scc_plus _ -> invalid_arg "cart_bank_write: the SCC+ cart decodes writes in Scc_plus"
+  | Scc_cart -> invalid_arg "cart_bank_write: the SCC cart has no ROM to bank"
   | Konami ->
     (* 0x4000-0x5FFF fixed to segment 0; the upper three windows select. *)
     (match a land 0xe000 with
@@ -250,13 +255,16 @@ let cart_bank_write m a v =
 
 (* The SCC register window: 0x9800-0x9FFF of a Konami SCC cart while bank
    register 0x9000 holds 0x3F (openMSX RomKonamiSCC). *)
-let scc_window m a = m.cart_mapper = Konami_scc && m.scc_enabled && a >= 0x9800 && a < 0xa000
+let scc_window m a =
+  match m.cart_mapper with
+  | Konami_scc | Scc_cart -> m.scc_enabled && a >= 0x9800 && a < 0xa000
+  | Flat | Konami | Ascii8 | Ascii16 | Ascii8_sram | Scc_plus _ -> false
 
 (* The SCC+ sound cartridge, when slot 2 holds one. *)
 let sound_cart m =
   match m.cart_mapper with
   | Scc_plus kind -> Some kind
-  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram -> None
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram | Scc_cart -> None
 
 (* Guess a mapper from the ROM by looking at where its code writes bank
    registers ([ld (nn),a]). Only for ROMs over 32KB; smaller carts sit flat.
@@ -527,9 +535,11 @@ let mem_read m addr =
        fdc_note m 0 0xd7 v;
        v)
   else
-    (* An SCC+ sound cartridge decodes all of slot 2 itself. *)
+    (* An SCC+ sound cartridge decodes all of slot 2 itself. The empty SCC
+       cart reads 0xFF outside the SCC: its mapper has no ROM to show. *)
     match if slot = 2 then sound_cart m else None with
     | Some kind -> Scc_plus.read kind ~ram:m.cart ~banks:m.cart_banks ~mode:m.scc_plus_mode m.scc a
+    | None when slot = 2 && m.cart_mapper = Scc_cart -> if scc_window m a then Scc.read m.scc a else 0xff
     | None ->
   if slot = 2 && scc_window m a then Scc.read m.scc a
   else if
@@ -690,6 +700,11 @@ let mem_write m addr v =
     | Some kind ->
       m.scc_plus_mode <-
         Scc_plus.write kind ~ram:m.cart ~banks:m.cart_banks ~mode:m.scc_plus_mode m.scc a v
+    | None when slot = 2 && m.cart_mapper = Scc_cart ->
+      (* openMSX RomKonamiSCC::writeMem: the open SCC takes the write first;
+         otherwise 0x9000-0x97FF opens or closes it. *)
+      if scc_window m a then Scc.write m.scc a v
+      else if a land 0xf800 = 0x9000 then m.scc_enabled <- v land 0x3f = 0x3f
     | None ->
   if
     slot = 2 && scc_window m a
@@ -897,6 +912,7 @@ let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
 
 let load_cartridge ?mapper t rom =
   t.cart_mapper <- (match mapper with Some m -> m | None -> guess_mapper rom);
+  if t.cart_mapper = Scc_cart && rom <> "" then invalid_arg "load_cartridge: the SCC cart has no ROM";
   (* An SCC+ cart has RAM, not ROM: it powers up 0xFF (openMSX), and [rom]
      preloads its first bytes. *)
   t.cart <-
@@ -1983,10 +1999,11 @@ let pc_hist = Array.make 256 0
 
 (* PSG and SCC on one scale. openMSX gives the PSG volume 21000 (machine
    XML) at amplification 1, and the SCC its cartridge's volume at
-   amplification 1/128: 9000 for an SCC MegaROM (HardwareConfig), 13000 for
-   the SCC+ sound cartridges (extension XML). A PSG channel at level 15 is
-   8191 here, so one SCC unit weighs volume / 128 * 8191 / 21000, rounded:
-   27.4 -> 27 and 39.6 -> 40. *)
+   amplification 1/128: 9000 for an SCC MegaROM (HardwareConfig), 11500 for
+   the empty SCC cartridge and 13000 for the SCC+ sound cartridges
+   (extension XML). A PSG channel at level 15 is 8191 here, so one SCC unit
+   weighs volume / 128 * 8191 / 21000, rounded: 27.4 -> 27, 35.0 -> 35 and
+   39.6 -> 40. *)
 let psg_volume = 21000
 let psg_channel_full = 8191
 let scc_amplification_divisor = 128
@@ -1994,13 +2011,15 @@ let scc_weight_of volume =
   let den = scc_amplification_divisor * psg_volume in
   ((volume * psg_channel_full) + (den / 2)) / den
 let scc_weight = scc_weight_of 9000
-let sound_cart_weight = scc_weight_of 13000
+let scc_cart_weight = scc_weight_of 11500
+let scc_plus_weight = scc_weight_of 13000
 
 let sound_level t =
   let psg = Psg.chip_sample t.psg in
   match t.cart_mapper with
   | Konami_scc -> psg + (scc_weight * Scc.tick t.scc)
-  | Scc_plus _ -> psg + (sound_cart_weight * Scc.tick t.scc)
+  | Scc_cart -> psg + (scc_cart_weight * Scc.tick t.scc)
+  | Scc_plus _ -> psg + (scc_plus_weight * Scc.tick t.scc)
   | Flat | Konami | Ascii8 | Ascii16 | Ascii8_sram -> psg
 
 let step t ~frames =
@@ -2172,13 +2191,14 @@ let frame_rgb t = Vdp.frame_rgb t.vdp
 
 let mapper_code = function
   | Flat -> 0 | Konami -> 1 | Konami_scc -> 2 | Ascii8 -> 3 | Ascii16 -> 4 | Ascii8_sram -> 5
-  | Scc_plus Snatcher -> 6 | Scc_plus Sd_snatcher -> 7 | Scc_plus Expanded -> 8
+  | Scc_plus Snatcher -> 6 | Scc_plus Sd_snatcher -> 7 | Scc_plus Expanded -> 8 | Scc_cart -> 9
 let mapper_of_code = function
   | 0 -> Flat | 1 -> Konami | 2 -> Konami_scc | 3 -> Ascii8 | 4 -> Ascii16 | 5 -> Ascii8_sram
-  | 6 -> Scc_plus Snatcher | 7 -> Scc_plus Sd_snatcher | 8 -> Scc_plus Expanded
+  | 6 -> Scc_plus Snatcher | 7 -> Scc_plus Sd_snatcher | 8 -> Scc_plus Expanded | 9 -> Scc_cart
   | _ -> State_codec.fail "invalid cartridge mapper"
-(* The highest mapper code each format can hold: v10 added the SCC+ carts. *)
-let max_mapper_code r = if State_codec.version r >= 10 then 8 else 5
+(* The highest mapper code each format can hold: v10 added the SCC+ carts
+   and the empty SCC cart. *)
+let max_mapper_code r = if State_codec.version r >= 10 then 9 else 5
 
 let serialize t =
   let w = State_codec.writer () in
@@ -2337,6 +2357,8 @@ let restore_with_reader reader state =
          State_codec.fail "invalid sound cartridge RAM size";
        Scc.set_mode t.scc (Scc_plus.chip_mode t.scc_plus_mode)
      | None -> if t.scc_plus_mode <> 0 then State_codec.fail "invalid sound cartridge mode");
+    if t.cart_mapper = Scc_cart && Bytes.length t.cart <> 0 then
+      State_codec.fail "invalid SCC cartridge ROM";
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message

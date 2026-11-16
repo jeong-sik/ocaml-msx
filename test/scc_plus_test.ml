@@ -277,6 +277,78 @@ let () =
   check (Printf.sprintf "SCC MegaROM: 27 * 119 / 2 (got %d)" ks) (ks = 27 * 119 / 2);
   check (Printf.sprintf "SCC+ cart: 40 * 119 / 2 (got %d)" ps) (ps = 40 * 119 / 2)
 
+(* --- the empty SCC cart: openMSX extension "scc", the SCC mapper with no
+   ROM (RomKonamiSCC, share/extensions/scc.xml, volume 11500) --- *)
+
+let scc_cart () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Scc_cart t "";
+  slot2 t;
+  t
+
+let () =
+  let t = scc_cart () in
+  (* every page on slot 2 *)
+  Msx.port_out t 0xa8 0xaa;
+  check "SCC cart: no ROM, slot 2 reads 0xFF"
+    (List.for_all (fun a -> rd t a = 0xff) [ 0x0000; 0x4000; 0x5000; 0x7fff; 0x9000; 0x9800; 0xbfff; 0xc000; 0xffff ]);
+  let t = scc_cart () in
+  wr t 0x9800 0x5a;
+  check "SCC cart: closed SCC reads 0xFF" (rd t 0x9800 = 0xff);
+  wr t 0x9000 0x3f;
+  wr t 0x9801 0x11;
+  (* waveforms power up 0xFF (openMSX SCC::powerUp) *)
+  check "SCC cart: a write while closed missed the SCC" (rd t 0x9801 = 0x11 && rd t 0x9800 = 0xff);
+  wr t 0x9800 0x5a;
+  check "SCC cart: 0x9000 = 0x3F opens the SCC at 0x9800" (rd t 0x9800 = 0x5a && rd t 0x9000 = 0xff);
+  wr t 0x9860 0x33;
+  check "SCC cart: a Real SCC, 0xA0 reads 0xFF" (rd t 0x98a0 = 0xff);
+  wr t 0x9000 0x00;
+  check "SCC cart: 0x9000 = 0x00 closes it" (rd t 0x9800 = 0xff);
+  wr t 0x97ff 0x7f;
+  check "SCC cart: 0x9000-0x97FF all open it, low 6 bits 0x3F" (rd t 0x9800 = 0x5a);
+  let t = scc_cart () in
+  List.iter (fun a -> wr t a 0x3f) [ 0x5000; 0x7000; 0x8fff; 0x9800; 0xb000 ];
+  wr t 0x9801 0x11;
+  check "SCC cart: only 0x9000-0x97FF opens it" (rd t 0x9801 = 0xff);
+  check "SCC cart: load_cartridge refuses a ROM"
+    (try Msx.load_cartridge ~mapper:Msx.Scc_cart (machine ()) "\xff"; false with Invalid_argument _ -> true);
+
+  (* Save keeps the open SCC and its waveforms; a ROM on it, or an older
+     format, is rejected. *)
+  let t = scc_cart () in
+  wr t 0x9000 0x3f;
+  wr t 0x9805 0x66;
+  let s = Msx.serialize t in
+  (match Msx.restore ~state:s with
+   | Error e -> failwith ("restore: " ^ e)
+   | Ok r ->
+     check "SCC cart: round trip is stable" (Msx.serialize r = s);
+     slot2 r;
+     check "SCC cart: restored open, waveform kept" (Msx.cart_mapper r = Msx.Scc_cart && rd r 0x9805 = 0x66));
+  let magic v = Printf.sprintf "OCAML-MSX\000%c" (Char.chr v) in
+  let payload s = String.sub s 27 (String.length s - 27) in
+  let wrap v p = magic v ^ Digest.string p ^ p in
+  let be64 n = let b = Bytes.create 8 in Bytes.set_int64_be b 0 (Int64.of_int n); Bytes.to_string b in
+  let rejected name want state =
+    match Msx.restore ~state with
+    | Error e -> check (name ^ ": " ^ e) (e = want)
+    | Ok _ -> check (name ^ " must be rejected") false
+  in
+  let p = payload s in
+  let skip at = at + 8 + Int64.to_int (String.get_int64_be p at) in
+  let cart_at = skip (skip (skip (skip 0))) in
+  let with_rom = String.sub p 0 cart_at ^ be64 1 ^ "\xff" ^ String.sub p (skip cart_at) (String.length p - skip cart_at) in
+  rejected "SCC cart with a ROM" "invalid SCC cartridge ROM" (wrap 10 with_rom);
+  rejected "SCC cart in format 9" "MSX state integer out of range"
+    (wrap 9 (String.sub p 0 (String.length p - 8)));
+
+  (* The mix: the empty SCC cart's 11500 weighs 35 per SCC unit. *)
+  let t = scc_cart () in
+  wr t 0x9000 0x3f;
+  let v = dc_sample t in
+  check (Printf.sprintf "SCC cart: 35 * 119 / 2 (got %d)" v) (v = 35 * 119 / 2)
+
 let () =
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
