@@ -19,6 +19,11 @@
  (libraries msx))
 
 (test
+ (name rtc_test)
+ (modules rtc_test)
+ (libraries msx))
+
+(test
  (name replay_test)
  (modules replay_test)
  (libraries msx))
