@@ -204,3 +204,8 @@
  (name pac_test)
  (modules pac_test)
  (libraries msx))
+
+(test
+ (name disk_rom_slot_test)
+ (modules disk_rom_slot_test)
+ (libraries msx))

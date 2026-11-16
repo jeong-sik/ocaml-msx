@@ -9,7 +9,8 @@ type reader = { input : string; mutable pos : int; version : int }
    clock (test register, fraction of a second, last counted tick); see
    Msx.serialize. v7: appends two more bank registers, the NEO regions
    at 0x8000 and 0xA000. v8 appends the LD A,I/R IRQ window.
-   v9 appends slot 1 PAC state. Readers accept 1-9; writers emit v9. *)
+   v9 appends slot 1 PAC state. v10 appends the disk interface ROM.
+   Readers accept 1-10; writers emit v10. *)
 let magic_prefix = "OCAML-MSX\000"
 let magic = magic_prefix ^ "\002"
 let magic_v3 = magic_prefix ^ "\003"
@@ -19,6 +20,7 @@ let magic_v6 = magic_prefix ^ "\006"
 let magic_v7 = magic_prefix ^ "\007"
 let magic_v8 = magic_prefix ^ "\008"
 let magic_v9 = magic_prefix ^ "\009"
+let magic_v10 = magic_prefix ^ "\010"
 let magic_v1 = magic_prefix ^ "\001"
 let writer () = Buffer.create 1024
 let put_int w n =
@@ -30,13 +32,14 @@ let put_bytes w b = put_int w (Bytes.length b); Buffer.add_bytes w b
 let put_int_array w a = Array.iter (put_int w) a
 let finish w =
   let payload = Buffer.contents w in
-  magic_v9 ^ Digest.string payload ^ payload
+  magic_v10 ^ Digest.string payload ^ payload
 let reader input =
   let start = String.length magic + 16 in
   if String.length input < start then fail "unsupported or truncated MSX state header";
   let head = String.sub input 0 (String.length magic) in
   let version =
-    if head = magic_v9 then 9
+    if head = magic_v10 then 10
+    else if head = magic_v9 then 9
     else if head = magic_v8 then 8
     else if head = magic_v7 then 7
     else if head = magic_v6 then 6
@@ -45,7 +48,7 @@ let reader input =
     else if head = magic_v3 then 3
     else if head = magic then 2 else if head = magic_v1 then 1
     else if String.sub head 0 (String.length magic_prefix) = magic_prefix then
-      fail (Printf.sprintf "MSX state saved as format %d; this build reads formats 1-9"
+      fail (Printf.sprintf "MSX state saved as format %d; this build reads formats 1-10"
               (Char.code head.[String.length magic_prefix]))
     else fail "unsupported or truncated MSX state header" in
   let payload = String.sub input start (String.length input - start) in

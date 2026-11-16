@@ -121,7 +121,8 @@ val load_disk : ?interface_rom:bool -> ?disk_rom:disk_rom -> t -> string -> unit
     "AB" header and calls INIT, whose BIOS entries are HLE traps the step loop
     services against the image. [~interface_rom:false] leaves the slot empty
     for the warm-up replay ({!boot_disk}). [~disk_rom] mounts that real ROM in
-    slot 3-3 page 1 instead and lets its code drive the WD2793 model. *)
+    slot 3-3 page 1, leaves a slot 2 cartridge attached and lets the ROM
+    drive the WD2793 model. *)
 
 val disk_image : t -> string option
 (** Copy of the current floppy bytes, including guest writes, for multi-disk

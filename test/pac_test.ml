@@ -134,7 +134,7 @@ let () =
    | Ok r -> check "restored without PAC" (Msx.pac r = None));
 
   let with_pac = payload (Msx.serialize t) and without = payload (Msx.serialize bare) in
-  let pac_at = String.length without - 1 in
+  let pac_at = String.length without - 1 - 8 in
   let v8 = String.sub without 0 pac_at in
   (match Msx.restore ~state:(wrap 8 v8) with
    | Error e -> check ("v8 restore: " ^ e) false
@@ -147,7 +147,7 @@ let () =
     Msx.port_out t 0xaa (high lsl 4);
     let saved = Msx.serialize t in
     let data = payload saved in
-    let newer_bytes = (5 * 8) + 2 in
+    let newer_bytes = (6 * 8) + 2 in
     let v5 = String.sub data 0 (String.length data - newer_bytes) in
     match Msx.restore ~state:(wrap 5 v5) with
     | Error e -> check ("v5 restore: " ^ e) false
@@ -165,7 +165,7 @@ let () =
     ^ String.sub with_pac (sram_at + 8) 8189
     ^ String.sub with_pac rest (String.length with_pac - rest)
   in
-  (match Msx.restore ~state:(wrap 9 short) with
+  (match Msx.restore ~state:(wrap 10 short) with
    | Error e -> check (Printf.sprintf "short SRAM rejected (%s)" e) (e = "invalid PAC SRAM size")
    | Ok _ -> check "short SRAM must be rejected" false)
 
