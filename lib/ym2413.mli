@@ -45,3 +45,10 @@ val output : t -> int -> int
 val mix : t -> int
 (** The sum of the fourteen outputs, wrapped to 16 bits the way emu2413's
     [OPLL_calc] wraps it. *)
+
+val write_state : State_codec.writer -> t -> unit
+(** Registers, LFO, noise and every slot's phase and envelope. *)
+
+val read_state : State_codec.reader -> t -> unit
+(** Restore what [write_state] wrote.
+    @raise State_codec.Invalid_state on a value out of range. *)

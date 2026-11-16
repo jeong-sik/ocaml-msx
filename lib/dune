@@ -29,11 +29,12 @@
  (name ym2413core)
  (public_name ocaml-msx.ym2413core)
  (wrapped false)
- (modules ym2413 ym2413_tables))
+ (modules ym2413 ym2413_tables)
+ (libraries state_codec))
 
 (library
  (name msx)
  (public_name ocaml-msx.msx)
  (wrapped false)
  (modules msx disk_fat12)
- (libraries z80core vdpcore soundcore state_codec))
+ (libraries z80core vdpcore soundcore ym2413core state_codec))

@@ -731,3 +731,104 @@ let create () =
   t
 
 let register t r = t.reg.(r)
+
+(* Save state. The user instrument is registers 0-7 and every slot plays
+   its channel's instrument (16-18 on channels 6-8 in rhythm mode), so
+   neither is stored: restore rebuilds them. *)
+let role_code = function Modulator -> 0 | Carrier -> 1 | Single -> 2
+let role_of_code = function
+  | 0 -> Modulator
+  | 1 -> Carrier
+  | 2 -> Single
+  | n -> State_codec.fail (Printf.sprintf "YM2413: slot role %d" n)
+
+let eg_code = function Attack -> 0 | Decay -> 1 | Sustain -> 2 | Release -> 3 | Damp -> 4
+
+let eg_of_code = function
+  | 0 -> Attack
+  | 1 -> Decay
+  | 2 -> Sustain
+  | 3 -> Release
+  | 4 -> Damp
+  | n -> State_codec.fail (Printf.sprintf "YM2413: envelope state %d" n)
+
+let int16_min = -0x8000
+let int16_max = 0x7fff
+
+let write_state w t =
+  let int = State_codec.put_int w and bool = State_codec.put_bool w in
+  int t.address;
+  State_codec.put_int_array w t.reg;
+  int t.test;
+  int t.key_status;
+  bool t.rhythm;
+  int t.eg_counter;
+  int t.pm_phase;
+  int t.am_phase;
+  int t.noise;
+  State_codec.put_int_array w t.instrument;
+  Array.iter
+    (fun s ->
+      int (role_code s.role);
+      int s.out0;
+      int s.out1;
+      bool (s.wave == wave_half);
+      int s.pg_phase;
+      int s.pg_out;
+      bool s.pg_keep;
+      int s.blk_fnum;
+      int s.fnum;
+      int s.blk;
+      int (eg_code s.eg_state);
+      int s.volume;
+      bool s.key_on;
+      bool s.sustain;
+      int s.tll;
+      int s.rks;
+      int s.eg_rate_h;
+      int s.eg_rate_l;
+      int s.eg_shift;
+      int s.eg_out;
+      int s.updates)
+    t.slot;
+  State_codec.put_int_array w t.out
+
+let read_state r t =
+  let int ~min ~max = State_codec.get_int r ~min ~max and bool () = State_codec.get_bool r in
+  t.address <- int ~min:0 ~max:0xff;
+  State_codec.fill_int_array r ~min:0 ~max:0xff t.reg;
+  t.test <- int ~min:0 ~max:0xff;
+  t.key_status <- int ~min:0 ~max:((1 lsl slots) - 1);
+  t.rhythm <- bool ();
+  t.eg_counter <- int ~min:0 ~max:eg_counter_mask;
+  t.pm_phase <- int ~min:0 ~max:(pm_period - 1);
+  t.am_phase <- int ~min:0 ~max:(am_period - 1);
+  t.noise <- int ~min:0 ~max:((1 lsl 24) - 1);
+  State_codec.fill_int_array r ~min:0 ~max:(instruments - 1) t.instrument;
+  load_instrument t.patches.(0) t.patches.(1) (Array.sub t.reg 0 8);
+  Array.iteri
+    (fun i s ->
+      s.role <- role_of_code (int ~min:0 ~max:max_int);
+      s.patch <- t.patches.((t.instrument.(i / 2) * 2) + (i land 1));
+      s.out0 <- int ~min:int16_min ~max:int16_max;
+      s.out1 <- int ~min:int16_min ~max:int16_max;
+      s.wave <- (if bool () then wave_half else wave_full);
+      s.pg_phase <- int ~min:0 ~max:dp_mask;
+      s.pg_out <- int ~min:0 ~max:pg_mask;
+      s.pg_keep <- bool ();
+      s.blk_fnum <- int ~min:0 ~max:0xfff;
+      s.fnum <- int ~min:0 ~max:0x1ff;
+      s.blk <- int ~min:0 ~max:7;
+      s.eg_state <- eg_of_code (int ~min:0 ~max:max_int);
+      s.volume <- int ~min:0 ~max:63;
+      s.key_on <- bool ();
+      s.sustain <- bool ();
+      s.tll <- int ~min:0 ~max:0xff;
+      s.rks <- int ~min:0 ~max:15;
+      s.eg_rate_h <- int ~min:0 ~max:15;
+      s.eg_rate_l <- int ~min:0 ~max:3;
+      s.eg_shift <- int ~min:0 ~max:13;
+      s.eg_out <- int ~min:0 ~max:eg_mute;
+      s.updates <- int ~min:0 ~max:update_all)
+    t.slot;
+  State_codec.fill_int_array r ~min:int16_min ~max:int16_max t.out
