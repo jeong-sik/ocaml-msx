@@ -80,7 +80,11 @@ val load_disk : ?interface_rom:bool -> ?real_rom:bool -> t -> string -> unit
     default a disk interface ROM rides in the cartridge slot: C-BIOS finds its
     "AB" header and calls INIT, whose BIOS entries are HLE traps the step loop
     services against the image. [~interface_rom:false] leaves the slot empty
-    for the warm-up replay ({!boot_disk}). *)
+    for the warm-up replay ({!boot_disk}). [~real_rom:true] loads the 16KB
+    interface ROM named by [DISK_ROM] (else [roms/cbios/cbios_disk.rom])
+    into slot 3-3 as on an NMS 8250: its own code serves the disk BIOS, the
+    HLE traps stay off, and a cart in slot 2 stays plugged. Without such a
+    file it falls back to the HLE ROM. *)
 
 val disk_image : t -> string option
 (** Copy of the current floppy bytes, including guest writes, for multi-disk

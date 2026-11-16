@@ -160,15 +160,12 @@ type t = {
       (** RST 30h 인터슬롯의 복귀 대기: (복귀 PC, 저장한 ppi_a) 최근 것 먼저.
           워밍업 재생 경로(page0 = RAM)에서 디스크 로더가 쓰는 벡터를
           트램페린이 대신 서기 위한 상태. *)
-  mutable hle_disk : bool;
-      (** 인터페이스 ROM 이 HLE(RET 채움)이면 true — disk_trap 이 BIOS 엔트리를
-          OCaml 로 서빙한다. 실ROM(cbios_disk.rom)을 심으면 false: ROM 코드가
-          직접 돌고 트랩은 물러난다. *)
-  mutable cart_is_disk_rom : bool;
-      (** [cart] 가 게임 카트리지가 아니라 슬롯3-3 의 디스크 인터페이스 ROM 이다
-          — 실ROM 부트(--disk-real)의 배선. 실기 NMS8250 은 이때 카트리지 슬롯
-          (2) 이 비어 있고(전 페이지 빈 버스), FDC 레지스터 창도 오직 3-3 뷰에만
-          존재한다. 이 플래그가 없으면(레거시 rm2 HLE 경로) 인터페이스 ROM 이
+  mutable disk_rom : Bytes.t;
+      (** 슬롯3-3 page1 의 디스크 인터페이스 ROM — 실ROM 부트(--disk-real)의
+          배선. 비어 있으면 실ROM 이 없다. 있으면 FDC 레지스터 창도 오직 3-3
+          뷰에만 있고, 카트리지 슬롯(2)은 [cart] 를 그대로 보인다(카트가 없으면
+          전 페이지 빈 버스) — 실기 NMS8250 처럼 디스크 게임과 슬롯 2 카트(SCC
+          등)가 함께 꽂힌다. 비어 있으면(레거시 rm2 HLE 경로) 인터페이스 ROM 이
           카트로 slot 2 에 올라가고 창도 slot 2 뷰에 보인다 — 실ROM 커널이
           SP=0x7FFF(MSX-DOS TPA 관례)로 돌 때 스택 푸시가 slot 2 뷰의 창에
           떨어져(푸시 → 모터 레지스터, 팝 → DSKCHG) 인터슬롯 프리미티브가 자기
@@ -432,6 +429,20 @@ let fdc_recent_calls () =
    RAM)이 서브0(sub ROM)로 뭉개져 "MEMORY NOT FOUND" 가 난다(실측). *)
 let slot3_sub m page = (m.slot3_sel lsr (page * 2)) land 3
 
+(* 디스크 인터페이스 ROM 하나 크기 — 실ROM 은 page1 의 16KB 만 보인다. *)
+let disk_rom_size = 0x4000
+
+(* The WD2793 register window 0x3FF8-0x3FFF of every page is live in the
+   interface slot: 3-3 with a real interface ROM ([disk_rom]); in the legacy
+   wiring, wherever the interface ROM rides as the cart (slot 2, and the 3-3
+   view that reads [cart]). *)
+let fdc_window m ~slot ~page =
+  Bytes.length m.disk > 0
+  && (if Bytes.length m.disk_rom > 0 then slot = 3 && slot3_sub m page = 3
+      else
+        Bytes.length m.cart >= disk_rom_size
+        && (slot = 2 || (slot = 3 && slot3_sub m page = 3)))
+
 let mem_read m addr =
   let a = addr land 0xffff in
   let page = a lsr 14 in
@@ -443,12 +454,7 @@ let mem_read m addr =
     | _ -> (m.ppi_a lsr 6) land 3
   in
   if a = 0xffff && slot = 3 then lnot m.slot3_sel land 0xff
-  else if
-    a land 0x3ff8 = 0x3ff8
-    && ((slot = 2 && not m.cart_is_disk_rom && Bytes.length m.cart >= 0x4000)
-        || (slot = 3 && slot3_sub m page = 3 && Bytes.length m.cart >= 0x4000))
-    && Bytes.length m.disk > 0
-  then
+  else if a land 0x3ff8 = 0x3ff8 && fdc_window m ~slot ~page then
     (* NMS8250 의 WD2793 은 I/O 포트가 아니라 메모리 매핑: 인터페이스 슬롯의
        페이지마다 0x3FF8-0x3FFF 창(=0x7FF8-0x7FFF 미러)에 상태/트랙/섹터/데이터
        레지스터가 보인다(openMSX 설정 문서: "FDC registers are visible in all
@@ -549,11 +555,11 @@ let mem_read m addr =
           (* 32KB 카트는 뒷 16KB. 16KB 카트는 A15 를 해독하지 않아 페이지2 에
              앞 16KB 가 다시 보인다 (미러). 경계는 >= — 정확히 0x8000 인
              파일이 로고 ROM 으로 새는 게 스펠렁커 halt 사태의 원인이었다.
-             [cart] 가 디스크 인터페이스 ROM(실ROM 부트)이면 카트리지 슬롯은
+             카트가 없고 실ROM 인터페이스가 3-3 에 있으면 카트리지 슬롯은
              실기처럼 비어 있다 — 전 페이지 빈 버스. *)
-          if m.cart_is_disk_rom then (Bytes.make 0 '\000', 0)
-          else if Bytes.length m.cart >= 0x8000 then (m.cart, cart_off)
+          if Bytes.length m.cart >= 0x8000 then (m.cart, cart_off)
           else if Bytes.length m.cart >= 0x4000 then (m.cart, off)
+          else if Bytes.length m.disk_rom > 0 then (Bytes.make 0 '\000', 0)
           else (m.logo_rom, off)
         | 2, 0 ->
           (* 실기 NMS8250: 카트리지는 page1(0x4000) 부터 보인다 — page0 은
@@ -561,12 +567,12 @@ let mem_read m addr =
              실 BIOS 의 슬롯 스캔 판정을 오염시킨다. 카트가 없는 부트의 기존
              폴백(main ROM 미러)은 유지 — 그 부트가 이 뷰를 읽는다. 실ROM
              부트의 인터페이스는 3-3 에만 있으므로 여기도 빈 버스다. *)
-          if m.cart_is_disk_rom || Bytes.length m.cart >= 0x4000
+          if Bytes.length m.disk_rom > 0 || Bytes.length m.cart >= 0x4000
           then (Bytes.make 0 '\000', 0)
           else (m.main_rom, off)
         | 2, 1 ->
-          if m.cart_is_disk_rom then (Bytes.make 0 '\000', 0)
-          else if Bytes.length m.cart >= 0x4000 then (m.cart, cart_off)
+          if Bytes.length m.cart >= 0x4000 then (m.cart, cart_off)
+          else if Bytes.length m.disk_rom > 0 then (Bytes.make 0 '\000', 0)
           else (m.main_rom, off)
         | 0, 3 | 1, 3 | 2, 3 ->
           (* 실기 NMS8250: 슬롯0-2 의 page3(0xC000-) 는 빈 버스(0xFF) 다.
@@ -598,8 +604,9 @@ let mem_read m addr =
         let base = ((seg * 0x4000) + off) mod (Bytes.length m.ram) in
         Char.code (Bytes.get m.ram base)
       | _ ->
-        if page = 1 && Bytes.length m.disk > 0 && Bytes.length m.cart >= 0x4000
-        then Char.code (Bytes.get m.cart (min off (Bytes.length m.cart - 1)))
+        let rom = if Bytes.length m.disk_rom > 0 then m.disk_rom else m.cart in
+        if page = 1 && Bytes.length m.disk > 0 && Bytes.length rom >= disk_rom_size
+        then Char.code (Bytes.get rom (min off (Bytes.length rom - 1)))
         else 0xff
   end
 
@@ -614,12 +621,7 @@ let mem_write m addr v =
     | _ -> (m.ppi_a lsr 6) land 3
   in
   if a = 0xffff && slot = 3 then m.slot3_sel <- v land 0xff
-  else if
-    a land 0x3ff8 = 0x3ff8
-    && ((slot = 2 && not m.cart_is_disk_rom && Bytes.length m.cart >= 0x4000)
-        || (slot = 3 && slot3_sub m page = 3 && Bytes.length m.cart >= 0x4000))
-    && Bytes.length m.disk > 0
-  then
+  else if a land 0x3ff8 = 0x3ff8 && fdc_window m ~slot ~page then
     (* 메모리 매핑 FDC 창의 쓰기 면(읽기 면의 주석 참조): +0..3 = WD279x
        포트 0xD0-0xD3(명령/트랙/섹터/데이터), +4 = 사이드(bit0), +5 =
        드라이브(bits0-1)·모터(bit7) — 0xD4 포트 계열과는 비트 배치가 다르다
@@ -814,8 +816,7 @@ let create ~machine =
       rtc_mode = 0x8;
       con_esc = 0;
       rst30_pending = [];
-      hle_disk = true;
-      cart_is_disk_rom = false;
+      disk_rom = Bytes.empty;
       fdc = fdc_create ();
       (* 전원 인가 시 RAM 의 실측 패턴(openMSX Philips_NMS_8250 initialContent):
          (00 FF)*128 (FF 00)*128 의 512 바이트 블록이 전체를 덮는다. 룬마스터
@@ -1117,27 +1118,15 @@ let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
      "AB" header findable. *)
   (match (if real_rom then disk_rom_real () else None) with
    | Some real ->
-     (* 실ROM 은 슬롯3-3 의 원래 자리에만 둔다 — 실기 NMS8250 배선. [cart] 에
-         바이트를 얹되(3-3 page1 뷰가 여기를 읽는다) load_cartridge 를 부르지
-         않는다: 그 호출은 page1 을 카트 슬롯(2) 로 강제 배선해, BIOS 카트
-         스캔(C=0,1,2,3 순서)이 slot 2 의 그림자 복제본을 먼저 발견하게 만든
-         다. 그림자로 등록된 인터페이스를 통해 커널이 일하면 page1=slot2 뷰의
-         FDC 레지스터 창(레거시 배선)에 스택(0x7FF8-0x7FFF)이 겹쳐 무한 루프
-         한다(실측: 09-11, 0x02C0 프리미티브가 8만 회). HLE 트랩은 유지 — 부트
-         섹터 로드와 BIOS 엔트리는 트랩이, 나머지는 실ROM 코드가 맡는다. *)
-     t.cart <- real;
-     t.cart_mapper <- Flat;
-     t.cart_banks.(0) <- 0;
-     t.cart_banks.(1) <- 1;
-     t.cart_banks.(2) <- 2;
-     t.cart_banks.(3) <- 3;
-     t.cart_is_disk_rom <- true;
-     (* 트랩은 물러난다(hle_disk 필드 계약 그대로). 실ROM 의 MSX-DOS 부트는
-         0xF37D 에 자기 엔트리를 RAM 에 심는데, 트랩이 그 주소를 대신 서빙하면
-         미구현 함수(C=0x91)에게 0xFF 를 돌려준 채 커널이 101 회 재시도하고
-         멈춘다(실측: 09-11). 부트 섹터 로드부터 DSKIO 까지 전부 실ROM 코드 가
-         맡는다 — FDC 모델이 그 프로토콜을 받는다. *)
-     t.hle_disk <- false
+     (* 실ROM 은 슬롯3-3 의 원래 자리에만 둔다 — 실기 NMS8250 배선. 자기
+         버퍼 [disk_rom] 에 얹고 카트 슬롯(2)은 건드리지 않는다: 먼저 꽂은 카트
+         (SCC 등)는 그대로 slot 2 에 남는다. load_cartridge 를 부르면 page1 을
+         카트 슬롯(2) 로 강제 배선해, BIOS 카트 스캔(C=0,1,2,3 순서)이 slot 2
+         의 그림자 복제본을 먼저 발견한다. 그림자로 등록된 인터페이스를 통해
+         커널이 일하면 page1=slot2 뷰의 FDC 레지스터 창(레거시 배선)에 스택
+         (0x7FF8-0x7FFF)이 겹쳐 무한 루프한다(실측: 09-11, 0x02C0 프리미티브가
+         8만 회). *)
+     t.disk_rom <- real
    | None ->
      if interface_rom then load_cartridge ~mapper:Flat t (disk_rom_bytes ()))
 
@@ -1174,8 +1163,8 @@ let boot_disk t =
   else begin
     (* 워밍업 동안 슬롯 뷰에 없던 인터페이스 ROM 을 재생 시점에 장착한다.
        3-2 뷰의 문턱(>= 0x4000)과 같은 조건으로, 이미 올라온 ROM(interface_rom
-       경로, 실ROM 하이브리드)은 그대로 둔다. *)
-    if Bytes.length t.cart < 0x4000 then begin
+       경로)과 3-3 의 실ROM 은 그대로 둔다. *)
+    if Bytes.length t.cart < disk_rom_size && Bytes.length t.disk_rom = 0 then begin
       t.cart <- Bytes.of_string (disk_rom_bytes ());
       t.cart_mapper <- Flat;
       t.cart_banks.(0) <- 0;
@@ -1365,7 +1354,13 @@ let disk_trap t pc =
      t.rst30_pending <- rest;
      t.ppi_a <- saved
    | _ -> ());
-  if Bytes.length t.disk = 0 || not t.hle_disk then false
+  (* 실ROM 이 3-3 에 있으면 트랩은 물러난다. 실ROM 의 MSX-DOS 부트는 0xF37D 에
+     자기 엔트리를 RAM 에 심는데, 트랩이 그 주소를 대신 서빙하면 미구현
+     함수(C=0x91)에게 0xFF 를 돌려준 채 커널이 101 회 재시도하고 멈춘다(실측:
+     09-11). 부트 섹터 로드부터 DSKIO 까지 전부 실ROM 코드가 맡는다 — FDC
+     모델이 그 프로토콜을 받는다. 인터페이스 ROM 이 HLE(RET 채움)이면 trap 이
+     BIOS 엔트리를 OCaml 로 서빙한다. *)
+  if Bytes.length t.disk = 0 || Bytes.length t.disk_rom > 0 then false
   else if pc = disk_rst30_entry && t.ppi_a land 3 = 3 then begin
     Z80.set_pc t.cpu (serve_rst30 t);
     true
@@ -2105,7 +2100,9 @@ let serialize t =
   State_codec.put_int w t.ppi_a;
   State_codec.put_int w t.ppi_c;
   State_codec.put_int w t.slot3_sel;
-  State_codec.put_int w (if t.cart_is_disk_rom then 1 else 0);
+  (* v4: the 3-3 interface ROM in its own field, where v2-v3 kept a flag
+     saying the cart bytes were that ROM. *)
+  State_codec.put_bytes w t.disk_rom;
   State_codec.put_int w (if t.fdc.disk_changed then 1 else 0);
   State_codec.put_int w t.psg_latch;
   State_codec.put_int w t.joy1;
@@ -2177,10 +2174,20 @@ let restore_with_reader reader state =
     t.ppi_a <- State_codec.get_int r ~min:0 ~max:255;
     t.ppi_c <- State_codec.get_int r ~min:0 ~max:255;
     t.slot3_sel <- State_codec.get_int r ~min:0 ~max:255;
-    if State_codec.version r >= 2 then begin
-      t.cart_is_disk_rom <- State_codec.get_int r ~min:0 ~max:1 <> 0;
-      t.fdc.disk_changed <- State_codec.get_int r ~min:0 ~max:1 <> 0
+    if State_codec.version r >= 4 then begin
+      t.disk_rom <- State_codec.get_bytes r;
+      let n = Bytes.length t.disk_rom in
+      if n <> 0 && n <> disk_rom_size then State_codec.fail "invalid disk interface ROM size"
+    end
+    else if State_codec.version r >= 2 && State_codec.get_int r ~min:0 ~max:1 = 1 then begin
+      (* Formats 2-3 kept the 3-3 interface ROM in the cart buffer, with the
+         cartridge slot empty. *)
+      if Bytes.length t.cart <> disk_rom_size then State_codec.fail "invalid disk interface ROM size";
+      t.disk_rom <- t.cart;
+      t.cart <- Bytes.empty
     end;
+    if State_codec.version r >= 2 then
+      t.fdc.disk_changed <- State_codec.get_int r ~min:0 ~max:1 <> 0;
     t.psg_latch <- State_codec.get_int r ~min:0 ~max:255;
     t.joy1 <- State_codec.get_int r ~min:0 ~max:255;
     let pending = State_codec.get_int r ~min:0 ~max:(State_codec.remaining r / 16) in
