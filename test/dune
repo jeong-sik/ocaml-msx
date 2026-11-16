@@ -92,3 +92,8 @@
  (name state_fdc_test)
  (modules state_fdc_test)
  (libraries msx))
+
+(test
+ (name disk_rom_slot_test)
+ (modules disk_rom_slot_test)
+ (libraries msx unix))
