@@ -1,7 +1,8 @@
 (* 키보드 매트릭스와 조이스틱 포트 계약 증명. 전부 Z80 이 보는 I/O 포트
    경로(0xAA 행 선택 → 0xA9 읽기, 0xA0 래치 → 0xA2 읽기)로 판정한다.
    기대값의 정본: openMSX unicodemap.int (행/비트), MSXPSG::readA +
-   DummyJoystick (R#14 idle = 0x3F). ROM 없이 돈다. *)
+   DummyJoystick (조이스틱 비트 idle = 0x3F) + 빈 카세트 포트(bit7 = 1),
+   openMSX 21 C-BIOS_MSX2 실측 R#14 = 0xBF. ROM 없이 돈다. *)
 
 let failures = ref 0
 
@@ -119,7 +120,8 @@ let () =
   check "F9 unmapped" (not (Msx.set_key t (Function 9) ~pressed:true));
   all_rows_idle t "after unmapped";
 
-  (* PSG R#14: 빈 조이스틱 = 0x3F. Trigger_a/b = bit 4/5. R#15 bit6 = 포트 2 선택. *)
+  (* PSG R#14: 빈 조이스틱 = 0x3F, 카세트 입력 bit7 = 1. Trigger_a/b = bit 4/5.
+     R#15 bit6 = 포트 2 선택. *)
   let psg_read t r =
     Msx.port_out t 0xA0 r;
     Msx.port_in t 0xA2
@@ -128,37 +130,37 @@ let () =
     Msx.port_out t 0xA0 r;
     Msx.port_out t 0xA1 v
   in
-  check "R#14 idle = 0x3F (not the written value)" (psg_read t 14 = 0x3f);
+  check "R#14 idle = 0xBF (not the written value)" (psg_read t 14 = 0xbf);
   check "Trigger_a maps" (Msx.set_key t Trigger_a ~pressed:true);
-  check "Trigger_a clears bit 4" (psg_read t 14 = 0x2f);
+  check "Trigger_a clears bit 4" (psg_read t 14 = 0xaf);
   ignore (Msx.set_key t Trigger_b ~pressed:true);
-  check "Trigger_a+b clear bits 4,5" (psg_read t 14 = 0x0f);
+  check "Trigger_a+b clear bits 4,5" (psg_read t 14 = 0x8f);
   check "triggers do not touch row 8" (row_read t 8 = 0xff);
   psg_write t 15 0x4f;
-  check "port 2 selected reads empty" (psg_read t 14 = 0x3f);
+  check "port 2 selected reads empty" (psg_read t 14 = 0xbf);
   psg_write t 15 0x0f;
-  check "port 1 again" (psg_read t 14 = 0x0f);
+  check "port 1 again" (psg_read t 14 = 0x8f);
   ignore (Msx.set_key t Trigger_a ~pressed:false);
   ignore (Msx.set_key t Trigger_b ~pressed:false);
-  check "released = 0x3F" (psg_read t 14 = 0x3f);
+  check "released = 0xBF" (psg_read t 14 = 0xbf);
 
   (* 방향키는 커서(매트릭스 행 8)와 조이스틱 방향 비트를 함께 구동한다.
      openMSX JoystickDevice: UP=0x01 DOWN=0x02 LEFT=0x04 RIGHT=0x08 (active low).
      GTSTCK(0) 게임은 행 8 을, GTSTCK(1)/PSG 직독 게임은 R#14 를 읽는다 —
      한 키가 두 경로를 모두 채운다. *)
   ignore (Msx.set_key t Up ~pressed:true);
-  check "Up clears joy1 bit 0" (psg_read t 14 = 0x3e);
+  check "Up clears joy1 bit 0" (psg_read t 14 = 0xbe);
   check "Up still drives cursor row 8 bit 5" (row_read t 8 = 0xdf);
   ignore (Msx.set_key t Up ~pressed:false);
   check "Up release restores joy1 and row 8"
-    (psg_read t 14 = 0x3f && row_read t 8 = 0xff);
+    (psg_read t 14 = 0xbf && row_read t 8 = 0xff);
   ignore (Msx.set_key t Left ~pressed:true);
   ignore (Msx.set_key t Down ~pressed:true);
-  check "Left+Down clear joy1 bits 2,1" (psg_read t 14 = 0x39);
+  check "Left+Down clear joy1 bits 2,1" (psg_read t 14 = 0xb9);
   check "Left+Down still drive row 8 bits 4,6" (row_read t 8 = 0xaf);
   ignore (Msx.set_key t Left ~pressed:false);
   ignore (Msx.set_key t Down ~pressed:false);
-  check "directions released = idle" (psg_read t 14 = 0x3f && row_read t 8 = 0xff);
+  check "directions released = idle" (psg_read t 14 = 0xbf && row_read t 8 = 0xff);
 
   psg_write t 7 0xb8;
   check "other registers read back" (psg_read t 7 = 0xb8);
@@ -167,7 +169,7 @@ let () =
   let u = machine () in
   ignore (Msx.set_key t Space ~pressed:true);
   check "second machine sees no keys" (row_read u 8 = 0xff);
-  check "second machine PSG idle" (psg_read u 14 = 0x3f);
+  check "second machine PSG idle" (psg_read u 14 = 0xbf);
 
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;

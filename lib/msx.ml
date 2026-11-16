@@ -676,13 +676,19 @@ let mem_write m addr v =
   end
 
 (* PSG R#14 = 조이스틱 포트 입력. R#15 bit6 이 포트 선택(0 = 1번), 2번 포트는
-   비어 있다. bit6 = 키배열 점퍼(50on = 0), bit7 = 카세트 입력(0).
-   정본: openMSX MSXPSG::readA, DummyJoystick::read = 0x3F. *)
+   비어 있다. bit6 = 키배열 점퍼(50on = 0). bit7 = 카세트 입력: 테이프가
+   없으면 비교기가 1 을 읽는다(openMSX CassettePort::cassetteIn 은
+   sample >= 0, 빈 포트의 DummyCassetteDevice::readSample = 32767).
+   정본: openMSX MSXPSG::readA, DummyJoystick::read = 0x3F. openMSX 21
+   C-BIOS_MSX2 실측: 두 포트 모두 0xBF. *)
 let joystick_idle = 0x3f
+let cassette_in_idle = 0x80
 
 let psg_read m =
   match m.psg_latch with
-  | 14 -> if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle
+  | 14 ->
+    cassette_in_idle
+    lor if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle
   | r when r < 16 -> m.psg.(r)
   | _ -> 0xff
 
