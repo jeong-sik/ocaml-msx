@@ -4,14 +4,15 @@
     {!step} 호출로만 진행한다. P0 의 Z80 과 P1 의 V9938(TMS 호환)·PPI·
     RAM 매퍼를 배선한 MSX2 머신이다.
 
-    Sound: the PSG (AY-3-8910) and a Konami SCC cart's SCC fill one PCM
-    buffer, see {!audio}; FM is not modelled. Versioned save states include CPU,
+    Sound: the PSG (AY-3-8910), a Konami SCC cart's SCC and MSX-MUSIC's
+    YM2413 ({!insert_music_rom}) fill one PCM buffer, see {!audio}.
+    Versioned save states include CPU,
     VDP, memory, mounted media, the WD2793 drive state (format v3,
     ocaml-msx #46), the VDP sprite collision coordinates (format v4), the
     VDP raster and published frame (format v5), the VDP LMCM transfer, BD
     and ASX (format v6), the VDP S#2 EO bit and 50/60 Hz frame length
     (format v7), the PSG generators (format v8), the cartridge SCC (format
-    v9) and device state; file IO
+    v9), MSX-MUSIC (format v10) and device state; file IO
     belongs to callers. *)
 
 type key =
@@ -62,6 +63,14 @@ val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
     ({!guess_mapper}); pass it to override a wrong guess. The bank registers
     reset linear so the ROM boots from segment 0. *)
+
+val insert_music_rom : t -> string -> (unit, string) result
+(** Insert MSX-MUSIC into slot 1: the 16KB ROM appears at 0x4000-0x7FFF and
+    ports 0x7C/0x7D (register number, then data) drive a YM2413 whose
+    output joins {!audio}. The ROM is the one openMSX ships as
+    [cbios_music.rom] or a 16KB MSX-MUSIC BIOS; an FM-PAC (64KB, banked,
+    with SRAM) is not this. Any other size is an [Error] and leaves the
+    machine as it was. Inserting again resets the chip. *)
 
 val cart_mapper : t -> cart_mapper
 (** The mapper the plugged-in cart is using ([Flat] when none/plain). *)
@@ -150,11 +159,13 @@ val step : t -> frames:int -> unit
 (** [frames] 프레임만큼 진행. 한 프레임 = 262 라인 × 228 사이클. *)
 
 val audio : t -> string
-(** 마지막 {!step} 호출이 만든 소리(PSG + SCC 카트의 SCC). 부호 있는
+(** 마지막 {!step} 호출이 만든 소리(PSG, SCC 카트의 SCC, MSX-MUSIC). 부호 있는
     16비트 리틀엔디언 모노 PCM, {!audio_sample_rate} Hz. 한 프레임에
     735~737 샘플(평균 735.95)이다. PSG 는 0(무음)부터 12286(세 채널 최대)
-    까지, SCC 는 그 위에 -8100..8032 를 더한다. DC 를 빼는 일은 클라이언트
-    몫이다.
+    까지, SCC 는 그 위에 -8100..8032 를 더한다. MSX-MUSIC({!insert_music_rom})
+    은 열네 출력의 합에 12/7 을 곱하고 반으로 나눠 더한다(한 멜로디 채널
+    최대 ±1755). 합이 16비트를 넘으면 -32768..32767 로 자른다. DC 를 빼는
+    일은 클라이언트 몫이다.
     세이브에서 막 복원한 기계는 다음 [step] 전까지 빈 문자열을 준다. *)
 
 val audio_sample_rate : int

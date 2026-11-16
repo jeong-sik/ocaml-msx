@@ -6,7 +6,10 @@
    of ticks has gone by; that sample
    is the mean of the tick levels since the previous one (a box filter, as
    openMSX's resampler sees a held level), halved. The halving keeps the PSG
-   (0..24573) and an SCC (-16200..16200 in PSG units) inside 16 bits. *)
+   (0..24573) and an SCC (-16200..16200 in PSG units) inside 16 bits. The
+   YM2413 can go past that (six melody channels and five drums, up to 56160
+   in PSG units), so the sample is clipped to 16 bits, as openMSX clips a
+   float sample when it writes 16 bits (WavWriter float2int16). *)
 
 let cpu_hz = 3_579_545
 let cycles_per_tick = 16
@@ -16,6 +19,8 @@ let sample_rate = 44_100
    every [cpu_hz] of phase. Exact: ticks are whole CPU cycles. *)
 let phase_step = cycles_per_tick * sample_rate
 let output_divisor = 2
+let int16_min = -0x8000
+let int16_max = 0x7fff
 
 type t = {
   (* CPU cycles short of a tick, the output phase, and the tick levels summed
@@ -44,7 +49,8 @@ let push t level =
   t.phase <- t.phase + phase_step;
   if t.phase >= cpu_hz then begin
     t.phase <- t.phase - cpu_hz;
-    Buffer.add_int16_le t.out (floor_div t.acc (t.acc_n * output_divisor));
+    let sample = floor_div t.acc (t.acc_n * output_divisor) in
+    Buffer.add_int16_le t.out (max int16_min (min int16_max sample));
     t.acc <- 0;
     t.acc_n <- 0
   end

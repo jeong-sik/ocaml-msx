@@ -11,6 +11,7 @@ let cart = ref ""
 let disk = ref ""
 let disk_warm = ref false
 let wav = ref ""
+let music_rom = ref ""
 let audio = Buffer.create (1 lsl 20)
 
 (* RIFF/WAVE, PCM 16비트 모노. *)
@@ -132,7 +133,10 @@ let () =
         "N[,N..]  해당 프레임마다 스페이스 탭 (down 5프레임)" );
       ("--watch-mem", Arg.Set_string watch_mem, "A,B,C  RAM 쓰기 감시 (hex, 콤마 구분)");
       ("--frames", Arg.Int (fun n -> frames := n), "N  실행할 프레임");
-      ("--wav", Arg.Set_string wav, "PATH  PSG 소리를 44.1 kHz 모노 WAV 로 저장");
+      ("--wav", Arg.Set_string wav, "PATH  소리(PSG·SCC·MSX-MUSIC)를 44.1 kHz 모노 WAV 로 저장");
+      ( "--music-rom",
+        Arg.Set_string music_rom,
+        "PATH  MSX-MUSIC 16KB ROM(cbios_music.rom 등) — 슬롯1 에, 포트 0x7C/0x7D 에 YM2413" );
       ("--roms", Arg.String (fun s -> rom_dir := s), "DIR  C-BIOS roms 디렉터리");
       ("--out", Arg.String (fun s -> out_prefix := s), "PREFIX  덤프 접두어") ]
     (fun _ -> ())
@@ -160,6 +164,11 @@ let () =
       | other -> Printf.ksprintf failwith "unknown --cart-mapper %s" other
     in
     Msx.load_cartridge ?mapper t (read_file !cart)
+  end;
+  if !music_rom <> "" then begin
+    match Msx.insert_music_rom t (read_file !music_rom) with
+    | Ok () -> ()
+    | Error e -> Printf.ksprintf failwith "--music-rom %s: %s" !music_rom e
   end;
   if !disk <> "" then begin
     Msx.load_disk ~interface_rom:(not !disk_warm) ~real_rom:!disk_real t (read_file !disk);

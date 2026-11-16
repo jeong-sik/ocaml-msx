@@ -127,3 +127,14 @@
  (name scc_test)
  (modules scc_test)
  (libraries soundcore msx state_codec))
+
+(test
+ (name ym2413_test)
+ (modules ym2413_test)
+ (deps ym2413/events.txt ym2413/nukeykt.txt)
+ (libraries ym2413core))
+
+(test
+ (name msx_music_test)
+ (modules msx_music_test)
+ (libraries soundcore msx))
