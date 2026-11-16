@@ -127,3 +127,8 @@
  (name scc_test)
  (modules scc_test)
  (libraries soundcore msx state_codec))
+
+(test
+ (name scc_plus_test)
+ (modules scc_plus_test)
+ (libraries soundcore msx state_codec))

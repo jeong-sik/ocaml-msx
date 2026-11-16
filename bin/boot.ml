@@ -37,6 +37,7 @@ let write_wav path pcm =
   close_out oc
 let disk_real = ref false
 let cart_mapper = ref ""
+let sound_cart = ref ""
 let tap_space : int list ref = ref []
 let tap_keys : (int * Msx.key) list ref = ref []
 let tap_key_spec = ref ""
@@ -120,6 +121,9 @@ let () =
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
         "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
+      ( "--sound-cart",
+        Arg.Set_string sound_cart,
+        "KIND  슬롯 2 에 코나미 SCC+ 사운드 카트: snatcher|sd-snatcher|expanded" );
       ( "--tap-key",
         Arg.String (fun spec -> tap_key_spec := spec),
         "F:KEY[,F:KEY..]  해당 프레임에 키 탭 (space/return/up/.../shift/a)" );
@@ -148,6 +152,16 @@ let () =
   (* [begin..end] bounds the then-branch: without it the [let mapper = .. in]
      swallows every following statement (run loop, prints), so a no-cart boot
      (BIOS only or disk) ran nothing and exited silently. *)
+  if !cart <> "" && !sound_cart <> "" then failwith "--cart and --sound-cart both want slot 2";
+  if !sound_cart <> "" then begin
+    let kind = match !sound_cart with
+      | "snatcher" -> Scc_plus.Snatcher
+      | "sd-snatcher" -> Scc_plus.Sd_snatcher
+      | "expanded" -> Scc_plus.Expanded
+      | other -> Printf.ksprintf failwith "unknown --sound-cart %s" other
+    in
+    Msx.load_cartridge ~mapper:(Msx.Scc_plus kind) t ""
+  end;
   if !cart <> "" then begin
     let mapper = match !cart_mapper with
       | "plain" -> Some Msx.Flat

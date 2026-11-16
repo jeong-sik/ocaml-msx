@@ -46,7 +46,16 @@ type t
     8KB/16KB windows the way the named hardware does (openMSX RomKonami /
     RomKonamiSCC / RomAscii8 / RomAscii16). A Konami SCC cart also carries
     the SCC sound chip ({!audio}). *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
+type cart_mapper =
+  | Flat
+  | Konami
+  | Konami_scc
+  | Ascii8
+  | Ascii16
+  | Ascii8_sram
+  | Scc_plus of Scc_plus.kind
+      (** Konami SCC+ sound cartridge (SCC-I and RAM, no ROM). With
+          {!load_cartridge} the string preloads the RAM; the rest is 0xFF. *)
 
 val create : machine:machine -> t
 

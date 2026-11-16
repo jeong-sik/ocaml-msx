@@ -22,7 +22,7 @@
  (name soundcore)
  (public_name ocaml-msx.soundcore)
  (wrapped false)
- (modules psg mixer scc)
+ (modules psg mixer scc scc_plus)
  (libraries state_codec))
 
 (library

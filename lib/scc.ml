@@ -1,6 +1,8 @@
 (* Konami SCC, the sound chip inside Konami's SCC MegaROM carts: five
    channels, each playing a 32-byte signed waveform. The model follows openMSX
-   src/sound/SCC.cc in Real mode (the MegaROM chip, not the SCC-I).
+   src/sound/SCC.cc. The MegaROM chip runs in Real mode; the SCC-I of the SCC+
+   sound cartridge runs in Compatible or Plus mode, which move the registers
+   (see [write] and [read]). The notes below are Real mode.
 
    - Registers, [addr land 0xFF] of the CPU window 0x9800-0x9FFF:
      0x00-0x7F waveforms of channels 1-4 (channel 5 plays channel 4's);
@@ -25,7 +27,10 @@ let ticks_per_sample = 2 (* a sample lasts two 16-cycle mixer ticks *)
 let min_running_period = 9
 let count_step = 32
 
+type mode = Real | Compatible | Plus
+
 type t = {
+  mutable mode : mode;
   wave : int array array;
   adjusted : int array array;  (** [(wave * volume) asr 4] *)
   org_period : int array;  (** the period as written *)
@@ -85,6 +90,8 @@ let set_freq_vol t a v =
 
 let set_deform_mode t v =
   t.deform <- v;
+  (* SCC::setDeformRegHelper: the SCC-I ignores bit 7 here. *)
+  let v = match t.mode with Real -> v | Compatible | Plus -> v land 0x7f in
   let set lo hi ~rotate ~read_only =
     for ch = lo to hi do
       t.rotate.(ch) <- rotate;
@@ -112,34 +119,66 @@ let write_wave t ch a v =
     let p = a land (wave_len - 1) and s = signed_byte v in
     t.wave.(ch).(p) <- s;
     t.adjusted.(ch).(p) <- adjust s t.volume.(ch);
-    if ch = 3 then begin
+    (* Outside Plus mode channel 5 plays channel 4's waveform. *)
+    if ch = 3 && t.mode <> Plus then begin
       t.wave.(4).(p) <- s;
       t.adjusted.(4).(p) <- adjust s t.volume.(4)
     end
   end
 
+(* SCC::writeMem. Real: waveforms 1-4 at 0x00, periods and volumes at 0x80,
+   deformation at 0xE0. Compatible: the same but deformation at 0xC0.
+   Plus: waveforms 1-5 at 0x00, periods and volumes at 0xA0, deformation at
+   0xC0. Other addresses do nothing. *)
 let write t a v =
   let a = a land 0xff and v = v land 0xff in
-  if a < 0x80 then write_wave t (a lsr 5) a v
-  else if a < 0xa0 then set_freq_vol t a v
-  else if a >= 0xe0 then set_deform t v
+  match t.mode with
+  | Real ->
+    if a < 0x80 then write_wave t (a lsr 5) a v
+    else if a < 0xa0 then set_freq_vol t a v
+    else if a >= 0xe0 then set_deform t v
+  | Compatible ->
+    if a < 0x80 then write_wave t (a lsr 5) a v
+    else if a < 0xa0 then set_freq_vol t a v
+    else if a >= 0xc0 && a < 0xe0 then set_deform t v
+  | Plus ->
+    if a < 0xa0 then write_wave t (a lsr 5) a v
+    else if a < 0xc0 then set_freq_vol t a v
+    else if a < 0xe0 then set_deform t v
 
 let read_wave t ch a =
   let shift =
     if not t.rotate.(ch) then 0
     else
-      let period_ch = if ch = 3 && t.deform land 0xc0 = 0x40 then 4 else ch in
+      let period_ch = if ch = 3 && t.mode <> Plus && t.deform land 0xc0 = 0x40 then 4 else ch in
       t.deform_cycles / (t.period.(period_ch) + 1)
   in
   t.wave.(ch).((a + shift) land (wave_len - 1)) land 0xff
 
+(* SCC::readMem. Reading the deformation register writes 0xFF to it.
+   Compatible mode also shows waveform 5 at 0xA0; Plus mode shows waveforms
+   1-5 at 0x00. The rest reads 0xFF. *)
 let read t a =
   let a = a land 0xff in
-  if a >= 0xe0 then set_deform t 0xff;
-  if a < 0x80 then read_wave t (a lsr 5) a else 0xff
+  let deform_at = match t.mode with Real -> a >= 0xe0 | Compatible | Plus -> a >= 0xc0 && a < 0xe0 in
+  if deform_at then set_deform t 0xff;
+  match t.mode with
+  | Real -> if a < 0x80 then read_wave t (a lsr 5) a else 0xff
+  | Compatible ->
+    if a < 0x80 then read_wave t (a lsr 5) a
+    else if a >= 0xa0 && a < 0xc0 then read_wave t 4 a
+    else 0xff
+  | Plus -> if a < 0xa0 then read_wave t (a lsr 5) a else 0xff
 
-(* SCC::powerUp: reset, waveforms 0xFF, volumes 15, periods 0. *)
+(* The rotation flags hang on the mode (bit 7 above), so they are rebuilt. *)
+let set_mode t mode =
+  t.mode <- mode;
+  set_deform_mode t t.deform
+
+(* SCC::powerUp: reset (an SCC-I back in Compatible mode), waveforms 0xFF,
+   volumes 15, periods 0. *)
 let power_up t =
+  (match t.mode with Real -> () | Compatible | Plus -> t.mode <- Compatible);
   set_deform_mode t 0;
   t.enable <- 0;
   Array.iter (fun w -> Array.fill w 0 wave_len (-1)) t.wave;
@@ -153,6 +192,7 @@ let power_up t =
 let create () =
   let t =
     {
+      mode = Real;
       wave = Array.init channels (fun _ -> Array.make wave_len 0);
       adjusted = Array.init channels (fun _ -> Array.make wave_len 0);
       org_period = Array.make channels 0;
