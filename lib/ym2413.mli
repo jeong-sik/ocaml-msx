@@ -39,8 +39,8 @@ val outputs : int
 
 val output : t -> int -> int
 (** The last sample of output [i]. A melody channel stays within
-    -2048..2048, a rhythm output within -4096..4094. Melody channels 6-8 read 0 in rhythm mode, and
-    the rhythm outputs read 0 outside it. *)
+    -2048..2048, a rhythm output within -4096..4094. Melody channels 6-8
+    read 0 in rhythm mode, and the rhythm outputs read 0 outside it. *)
 
 val mix : t -> int
 (** The sum of the fourteen outputs, wrapped to 16 bits the way emu2413's
