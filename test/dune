@@ -124,6 +124,11 @@
  (libraries soundcore msx state_codec))
 
 (test
+ (name mixer_test)
+ (modules mixer_test)
+ (libraries soundcore state_codec))
+
+(test
  (name scc_test)
  (modules scc_test)
  (libraries soundcore msx state_codec))
