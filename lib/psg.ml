@@ -1,5 +1,6 @@
-(* AY-3-8910 PSG: three square-wave tones, one noise source and one
-   envelope, mixed to mono 16-bit PCM at 44.1 kHz.
+(* PSG: three square-wave tones, one noise source and one envelope, mixed
+   to mono 16-bit PCM at 44.1 kHz. The NMS 8250 has a YM2149 inside its
+   S-3527 MSX-ENGINE (openMSX share/machines/Philips_NMS_8250.xml).
 
    The model follows openMSX src/sound/AY8910.cc. The chip runs at half the
    CPU clock and produces one internal sample every 8 of its clocks, so one
@@ -9,7 +10,8 @@
    - Noise (NoiseGenerator): a 17-bit LFSR, stepped every 2 * R#6 chip
      samples (5 bits, 0 counts as 1); its bit 0 is the noise output.
    - Envelope (Envelope): 32 steps, one every R#11/R#12 chip samples
-     (0 counts as 1); the AY repeats each of its 16 levels twice.
+     (0 counts as 1). The YM2149 gives each step its own level, 1.5 dB
+     apart (YM2149EnvelopeTab); an AY-3-8910 would repeat 16 levels twice.
    - Mixer (generateChannels): a channel sounds while
      (tone or tone disabled) and (noise or noise disabled), so with both
      disabled the volume register alone sets a constant level.
@@ -30,6 +32,13 @@ let phase_step = cycles_per_chip_sample * sample_rate
 (* 2^(-(15 - i) / 2) scaled to 8191: 3 dB per level, three channels fit in
    16 bits. *)
 let volume = [| 0; 64; 90; 128; 181; 256; 362; 512; 724; 1024; 1448; 2048; 2896; 4096; 5792; 8191 |]
+
+(* The YM2149 envelope levels: 2^(-(31 - i) / 4) scaled to 8191, 1.5 dB per
+   step, level 0 silent. The odd levels are [volume]: level 2k + 1 is
+   volume k. Written out like [volume], so the two read side by side. *)
+let envelope =
+  [| 0; 45; 54; 64; 76; 90; 108; 128; 152; 181; 215; 256; 304; 362; 430; 512;
+     609; 724; 861; 1024; 1218; 1448; 1722; 2048; 2435; 2896; 3444; 4096; 4870; 5792; 6888; 8191 |]
 
 type tone = { mutable period : int; mutable count : int; mutable high : bool }
 
@@ -151,7 +160,7 @@ let env_steps t steps =
 let chip_sample t =
   let mixer = t.regs.(7) in
   let noise_on = t.random land 1 = 1 in
-  let env_level = volume.((t.env_step lxor t.env_attack) lsr 1) in
+  let env_level = envelope.(t.env_step lxor t.env_attack) in
   let level = ref 0 in
   for ch = 0 to 2 do
     let tone_off = mixer land (0x01 lsl ch) <> 0
