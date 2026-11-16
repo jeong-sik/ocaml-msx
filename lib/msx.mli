@@ -56,6 +56,10 @@ type cart_mapper =
   | Scc_plus of Scc_plus.kind
       (** Konami SCC+ sound cartridge (SCC-I and RAM, no ROM). With
           {!load_cartridge} the string preloads the RAM; the rest is 0xFF. *)
+  | Scc_cart
+      (** The empty Konami SCC cartridge (openMSX extension "scc"): the SCC at
+          0x9800 while 0x9000 holds 0x3F, 0xFF everywhere else. {!load_cartridge}
+          takes it with an empty string only. *)
 
 val create : machine:machine -> t
 

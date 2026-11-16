@@ -123,7 +123,7 @@ let () =
         "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
       ( "--sound-cart",
         Arg.Set_string sound_cart,
-        "KIND  슬롯 2 에 코나미 SCC+ 사운드 카트: snatcher|sd-snatcher|expanded" );
+        "KIND  슬롯 2 에 코나미 사운드 카트: scc(빈 SCC 카트)|snatcher|sd-snatcher|expanded(SCC+)" );
       ( "--tap-key",
         Arg.String (fun spec -> tap_key_spec := spec),
         "F:KEY[,F:KEY..]  해당 프레임에 키 탭 (space/return/up/.../shift/a)" );
@@ -154,13 +154,14 @@ let () =
      (BIOS only or disk) ran nothing and exited silently. *)
   if !cart <> "" && !sound_cart <> "" then failwith "--cart and --sound-cart both want slot 2";
   if !sound_cart <> "" then begin
-    let kind = match !sound_cart with
-      | "snatcher" -> Scc_plus.Snatcher
-      | "sd-snatcher" -> Scc_plus.Sd_snatcher
-      | "expanded" -> Scc_plus.Expanded
+    let mapper = match !sound_cart with
+      | "scc" -> Msx.Scc_cart
+      | "snatcher" -> Msx.Scc_plus Snatcher
+      | "sd-snatcher" -> Msx.Scc_plus Sd_snatcher
+      | "expanded" -> Msx.Scc_plus Expanded
       | other -> Printf.ksprintf failwith "unknown --sound-cart %s" other
     in
-    Msx.load_cartridge ~mapper:(Msx.Scc_plus kind) t ""
+    Msx.load_cartridge ~mapper t ""
   end;
   if !cart <> "" then begin
     let mapper = match !cart_mapper with
