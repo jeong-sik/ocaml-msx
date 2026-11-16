@@ -4,7 +4,7 @@
     {!step} 호출로만 진행한다. P0 의 Z80 과 P1 의 V9938(TMS 호환)·PPI·
     RAM 매퍼를 배선한 MSX2 머신이다.
 
-    Sound: the PSG (AY-3-8910) fills a PCM buffer, see {!audio}; SCC and
+    Sound: the PSG (YM2149) fills a PCM buffer, see {!audio}; SCC and
     FM are not modelled. Versioned save states include CPU,
     VDP, memory, mounted media, the WD2793 drive state (format v3,
     ocaml-msx #46), the VDP sprite collision coordinates (format v4), the

@@ -1,4 +1,4 @@
-(* AY-3-8910 PSG 소리의 계약 증명. 레지스터를 쓰고 CPU 사이클만큼 돌린 뒤
+(* PSG(NMS 8250 의 YM2149) 소리의 계약 증명. 레지스터를 쓰고 CPU 사이클만큼 돌린 뒤
    44.1 kHz 출력 샘플로 판정한다.
 
    기대값의 출처는 openMSX src/sound/AY8910.cc 다.
@@ -133,10 +133,19 @@ let () =
   (* R#12 is the high byte of the envelope period: R#11 = 0, R#12 = 1 makes
      a step 256 chip samples long *)
   let lv = env_levels 0x00 ~ep:256 ~steps:33 in
-  check "envelope period from R#12" (lv.(0) = 8191 && lv.(1) = 8191 && lv.(2) = 5792 && lv.(31) = 0);
-  (* The AY repeats each of its 16 levels twice: steps 30 and 31 match. *)
+  check "envelope period from R#12" (lv.(0) = 8191 && lv.(1) = 6888 && lv.(2) = 5792 && lv.(31) = 0);
+  (* The NMS 8250's YM2149 gives each of the 32 steps its own level, 1.5 dB
+     apart (openMSX YM2149EnvelopeTab scaled to 8191); the odd levels are the
+     volume register levels. An AY-3-8910 would pair them. *)
+  let ym2149 =
+    [| 0; 45; 54; 64; 76; 90; 108; 128; 152; 181; 215; 256; 304; 362; 430; 512;
+       609; 724; 861; 1024; 1218; 1448; 1722; 2048; 2435; 2896; 3444; 4096; 4870; 5792; 6888; 8191 |]
+  in
   let lv = env_levels 0x0d ~ep:100 ~steps:32 in
-  check "AY envelope pairs its 32 steps" (lv.(30) = lv.(31) && lv.(28) = lv.(29) && lv.(29) < lv.(30));
+  check "YM2149 envelope rises through 32 levels" (lv = ym2149);
+  let vol k = (run (psg [ (7, 0x3f); (8, k) ]) 50_000).(0) in
+  check "odd envelope levels are the volume register levels"
+    (List.for_all (fun k -> ym2149.((2 * k) + 1) = vol k) (List.init 15 (fun k -> k + 1)));
   (* Rewriting the shape restarts it *)
   let p = psg [ (7, 0x3f); (8, 0x10); (11, 100); (13, 0x00) ] in
   ignore (run p (40 * 100 * chip));
