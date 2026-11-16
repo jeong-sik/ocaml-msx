@@ -189,6 +189,12 @@ type t = {
       (** Konami SCC carts: bank register 0x9000 = 0x3F puts the SCC registers
           at 0x9800-0x9FFF (openMSX RomKonamiSCC). *)
   mixer : Mixer.t;
+  opll : Ym2413.t;
+  mutable music_rom : Bytes.t;
+      (** MSX-MUSIC's 16KB ROM, seen at 0x4000-0x7FFF of slot 1; empty when no
+          MSX-MUSIC is inserted. Ports 0x7C/0x7D reach [opll] only while it is
+          present (openMSX MSXMusic). *)
+  mutable opll_rest : int;  (** CPU cycles short of the next YM2413 sample *)
   mutable psg_latch : int;
   mutable joy1 : int;  (** 조이스틱 1 입력 6비트, active low — 빈 포트 0x3F *)
   cpu_ref : t option ref;
@@ -548,6 +554,12 @@ let mem_read m addr =
              보여 부트가 "FILE" 을 실행하며 RST0 루프에 빠진다(실측). *)
           (m.main_rom, if page = 1 && Bytes.length m.main_rom >= 0x8000
                         then 0x4000 + off else off)
+        | 1, 1 when Bytes.length m.music_rom > 0 ->
+          (* MSX-MUSIC 를 꽂으면 슬롯1 page1 에 그 16KB ROM 이 보인다
+             (openMSX MSXMusic: base 0x4000, size 0x4000). 0x4018 의
+             "APRLOPLL" 서명으로 게임과 플레이어가 FM 유무를 판정한다
+             (MSXgl s_vgm 실측: 서명이 없으면 "YM2413: No!"). *)
+          (m.music_rom, off)
         | 1, 0 | 1, 1 | 1, 2 ->
           (* 실기 NMS8250 의 슬롯1 은 미장착 카트리지 슬롯 — 전 페이지가 빈
              버스(0xFF) 다. main ROM 미러를 보이면(실측: page0[0]=0xF3) 실
@@ -782,6 +794,8 @@ let port_write m port v =
     m.mapper.(port land 3) <- v land 0x3f
   | 0xB4 -> m.rtc_reg <- v land 0xff
   | 0xB5 -> rtc_write_reg m v
+  | 0x7C when Bytes.length m.music_rom > 0 -> Ym2413.write_address m.opll v
+  | 0x7D when Bytes.length m.music_rom > 0 -> Ym2413.write_data m.opll v
   | _ -> ()
 
 (* 메모리 쓰기 감시 — write 클로저가 참조하므로 create 보다 앞에. *)
@@ -851,6 +865,9 @@ let create ~machine =
       scc = Scc.create ();
       scc_enabled = false;
       mixer = Mixer.create ();
+      opll = Ym2413.create ();
+      music_rom = Bytes.make 0 '\000';
+      opll_rest = 0;
       psg_latch = 0;
       joy1 = joystick_idle;
       cpu_ref = m_ref;
@@ -891,6 +908,19 @@ let load_cartridge ?mapper t rom =
      돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
      슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
   t.ppi_a <- (t.ppi_a land 0xf3) lor 0x08
+
+let music_rom_size = 0x4000
+
+let insert_music_rom t rom =
+  let n = String.length rom in
+  if n <> music_rom_size then
+    Error (Printf.sprintf "MSX-MUSIC ROM must be %d bytes, not %d" music_rom_size n)
+  else begin
+    t.music_rom <- Bytes.of_string rom;
+    t.opll_rest <- 0;
+    Ym2413.reset t.opll;
+    Ok ()
+  end
 
 (* --- Disk interface (HLE) -------------------------------------------------
    A game disk boots through a disk interface ROM that rides in the cartridge
@@ -1945,11 +1975,44 @@ let pc_hist = Array.make 256 0
    unit weighs 9000 / 128 * 8191 / 21000 = 27.4. *)
 let scc_weight = 27
 
+(* MSX-MUSIC on the same scale. A YM2413 melody channel at full swing is 2048
+   here and amplitude 1.0 in openMSX's channel recording (2048 x 16 = 32768,
+   test/ym2413/nukeykt.txt), and openMSX gives MSX-MUSIC volume 9000. So one
+   YM2413 unit weighs 8191 / 2048 * 9000 / 21000 = 1.7141, taken as 12 / 7
+   (1.7143). *)
+let fm_weight_num = 12
+let fm_weight_den = 7
+
+let fm_level t =
+  if Bytes.length t.music_rom = 0 then 0
+  else begin
+    let sum = ref 0 in
+    for i = 0 to Ym2413.outputs - 1 do
+      sum := !sum + Ym2413.output t.opll i
+    done;
+    fm_weight_num * !sum / fm_weight_den
+  end
+
 let sound_level t =
   let psg = Psg.chip_sample t.psg in
-  match t.cart_mapper with
-  | Konami_scc -> psg + (scc_weight * Scc.tick t.scc)
-  | Flat | Konami | Ascii8 | Ascii16 | Ascii8_sram -> psg
+  let cart =
+    match t.cart_mapper with
+    | Konami_scc -> scc_weight * Scc.tick t.scc
+    | Flat | Konami | Ascii8 | Ascii16 | Ascii8_sram -> 0
+  in
+  psg + cart + fm_level t
+
+(* The YM2413 makes one sample every 72 clocks of its 3.58 MHz input, which
+   is the CPU clock (49716 Hz). A port write lands before the chip runs the
+   writing instruction's cycles, less than one chip sample early. *)
+let opll_cycles = 72
+
+let advance_opll t ~cycles =
+  let total = t.opll_rest + cycles in
+  for _ = 1 to total / opll_cycles do
+    Ym2413.step t.opll
+  done;
+  t.opll_rest <- total mod opll_cycles
 
 let step t ~frames =
   Mixer.clear_output t.mixer;
@@ -2004,6 +2067,7 @@ let step t ~frames =
       let used = if disk_trap t pc then 18 else Z80.step t.cpu in
       incr instr_count;
       ignore (Vdp.advance t.vdp ~cycles:used);
+      if Bytes.length t.music_rom > 0 then advance_opll t ~cycles:used;
       for _ = 1 to Mixer.ticks t.mixer ~cycles:used do
         Mixer.push t.mixer (sound_level t)
       done;
@@ -2183,6 +2247,10 @@ let serialize t =
   (* v9: the cartridge SCC. *)
   State_codec.put_bool w t.scc_enabled;
   Scc.write_state w t.scc;
+  (* v10: MSX-MUSIC. *)
+  State_codec.put_bytes w t.music_rom;
+  State_codec.put_int w t.opll_rest;
+  Ym2413.write_state w t.opll;
   State_codec.finish w
 
 let restore_with_reader reader state =
@@ -2270,6 +2338,14 @@ let restore_with_reader reader state =
     if State_codec.version r >= 9 then begin
       t.scc_enabled <- State_codec.get_bool r;
       Scc.read_state r t.scc
+    end;
+    if State_codec.version r >= 10 then begin
+      let rom = State_codec.get_bytes r in
+      let n = Bytes.length rom in
+      if n <> 0 && n <> music_rom_size then State_codec.fail "invalid MSX-MUSIC ROM size";
+      t.music_rom <- rom;
+      t.opll_rest <- State_codec.get_int r ~min:0 ~max:(opll_cycles - 1);
+      Ym2413.read_state r t.opll
     end;
     State_codec.end_of_input r;
     Ok t
