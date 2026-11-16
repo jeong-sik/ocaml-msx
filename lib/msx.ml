@@ -2253,7 +2253,8 @@ let serialize t =
   State_codec.put_bool w f.intr_fired;
   Z80.write_state w t.cpu;
   Vdp.write_state w t.vdp;
-  (* v8: PSG counters, LFSR, envelope position and resampler. *)
+  (* v8: PSG counters, LFSR, envelope position and resampler (its layout
+     changed in v11, see Mixer.read_state). *)
   Psg.write_state w t.psg;
   Mixer.write_state w t.mixer;
   (* v9: the cartridge SCC. *)

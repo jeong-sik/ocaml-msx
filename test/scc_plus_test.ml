@@ -244,12 +244,12 @@ let () =
   let plain = payload (Msx.serialize (machine ())) in
   let n = String.length plain in
   rejected "mode register without an SCC+ cart" "invalid sound cartridge mode"
-    (wrap 10 (String.sub plain 0 (n - 8) ^ be64 0x20));
+    (wrap 11 (String.sub plain 0 (n - 8) ^ be64 0x20));
   let p = payload s in
   let skip at = at + 8 + Int64.to_int (String.get_int64_be p at) in
   let cart_at = skip (skip (skip (skip 0))) in
   let short = String.sub p 0 cart_at ^ be64 1 ^ "\xff" ^ String.sub p (skip cart_at) (String.length p - skip cart_at) in
-  rejected "wrong RAM size" "invalid sound cartridge RAM size" (wrap 10 short);
+  rejected "wrong RAM size" "invalid sound cartridge RAM size" (wrap 11 short);
   rejected "SCC+ cart in format 9" "MSX state integer out of range"
     (wrap 9 (String.sub p 0 (String.length p - 8)))
 
@@ -263,8 +263,12 @@ let dc_sample t =
   wr t 0x988a 15;
   wr t 0x988f 0x01;
   Msx.step t ~frames:1;
-  let a = Msx.audio t in
-  String.get_int16_le a (2 * 100)
+  String.get_int16_le (Msx.audio t) (2 * 100)
+
+let expected_sample weight =
+  let mixer = Mixer.create () in
+  for _ = 1 to 600 do Mixer.push mixer (weight * 119) done;
+  String.get_int16_le (Mixer.output mixer) (2 * 100)
 
 let () =
   let k = machine () in
@@ -274,8 +278,8 @@ let () =
   let p = cart Snatcher in
   wr p 0x9000 0x3f;
   let ks = dc_sample k and ps = dc_sample p in
-  check (Printf.sprintf "SCC MegaROM: 27 * 119 / 2 (got %d)" ks) (ks = 27 * 119 / 2);
-  check (Printf.sprintf "SCC+ cart: 40 * 119 / 2 (got %d)" ps) (ps = 40 * 119 / 2)
+  check (Printf.sprintf "SCC MegaROM: mix weight 27 (got %d)" ks) (ks = expected_sample 27);
+  check (Printf.sprintf "SCC+ cart: mix weight 40 (got %d)" ps) (ps = expected_sample 40)
 
 (* --- the empty SCC cart: openMSX extension "scc", the SCC mapper with no
    ROM (RomKonamiSCC, share/extensions/scc.xml, volume 11500) --- *)
@@ -339,7 +343,7 @@ let () =
   let skip at = at + 8 + Int64.to_int (String.get_int64_be p at) in
   let cart_at = skip (skip (skip (skip 0))) in
   let with_rom = String.sub p 0 cart_at ^ be64 1 ^ "\xff" ^ String.sub p (skip cart_at) (String.length p - skip cart_at) in
-  rejected "SCC cart with a ROM" "invalid SCC cartridge ROM" (wrap 10 with_rom);
+  rejected "SCC cart with a ROM" "invalid SCC cartridge ROM" (wrap 11 with_rom);
   rejected "SCC cart in format 9" "MSX state integer out of range"
     (wrap 9 (String.sub p 0 (String.length p - 8)));
 
@@ -347,7 +351,7 @@ let () =
   let t = scc_cart () in
   wr t 0x9000 0x3f;
   let v = dc_sample t in
-  check (Printf.sprintf "SCC cart: 35 * 119 / 2 (got %d)" v) (v = 35 * 119 / 2)
+  check (Printf.sprintf "SCC cart: mix weight 35 (got %d)" v) (v = expected_sample 35)
 
 let () =
   if !failures > 0 then begin
