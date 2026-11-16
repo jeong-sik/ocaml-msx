@@ -92,3 +92,9 @@
  (name state_fdc_test)
  (modules state_fdc_test)
  (libraries msx))
+
+(test
+ (name ym2413_test)
+ (modules ym2413_test)
+ (deps ym2413/events.txt ym2413/nukeykt.txt)
+ (libraries ym2413core))
