@@ -54,7 +54,8 @@ let registers () =
   let before = List.init 0x40 (Ym2413.register t) in
   Ym2413.write_register t 0x40 0xff;
   Ym2413.write_register t 0xff 0xff;
-  check "registers 0x40 and above are ignored" (List.init 0x40 (Ym2413.register t) = before);
+  Ym2413.write_register t (-1) 0xff;
+  check "registers outside 0x00-0x3F are ignored" (List.init 0x40 (Ym2413.register t) = before);
   Ym2413.write_address t 0x05;
   Ym2413.write_data t 0x9c;
   check "address then data writes the latched register" (Ym2413.register t 0x05 = 0x9c);
