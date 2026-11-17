@@ -207,14 +207,17 @@ let () =
   | Ok restored ->
     motor restored true;
     check "saved with the motor off" (levels restored 16 = original);
-    (* The tape position is the state's last field; a restore takes it only
-       up to the end of the tape. *)
+    (* The tape position is followed only by the RTC clock (format 6: three
+       ints of 8 bytes); a restore takes it only up to the end of the tape. *)
+    let rtc_clock_bytes = 3 * 8 in
     let forge position =
       let head = String.length "OCAML-MSX\000" + 1 in
       let payload =
         Bytes.of_string (String.sub state (head + 16) (String.length state - head - 16))
       in
-      Bytes.set_int64_be payload (Bytes.length payload - 8) (Int64.of_int position);
+      Bytes.set_int64_be payload
+        (Bytes.length payload - rtc_clock_bytes - 8)
+        (Int64.of_int position);
       String.sub state 0 head ^ Digest.bytes payload ^ Bytes.to_string payload
     in
     let end_ = Cassette.end_position (tape_exn binary) in

@@ -152,6 +152,10 @@ val step : t -> frames:int -> unit
 val frame_number : t -> int
 (** Completed frames since creation; preserved by save states. *)
 
+val set_rtc_time : t -> Rtc.time -> unit
+(** Set the RP5C01 date and time from the current CPU cycle on. A machine
+    whose time is never set starts at 00-00-00 00:00:00. *)
+
 val dump_pc : t -> int
 (** 현재 PC — 부트 하네스 판정용. *)
 

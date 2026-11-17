@@ -39,7 +39,7 @@ let () =
     Msx.step t ~frames:3;
     check "restored v1 machine keeps running" (Msx.frame_number t = f0 + 3);
     let s2 = Msx.serialize t in
-    check "re-serialized as current version" (String.sub s2 0 11 = "OCAML-MSX\000\005");
+    check "re-serialized as current version" (String.sub s2 0 11 = "OCAML-MSX\000\006");
     (match Msx.restore ~state:s2 with
      | Ok t2 -> check "v2 round trip is stable" (Msx.serialize t2 = s2)
      | Error e -> failwith ("v2 round trip: " ^ e));
@@ -51,6 +51,6 @@ let () =
     Bytes.set future 10 '\x09';
     check "unknown format number is named"
       (match Msx.restore ~state:(Bytes.to_string future) with
-       | Error e -> e = "MSX state saved as format 9; this build reads formats 1-5"
+       | Error e -> e = "MSX state saved as format 9; this build reads formats 1-6"
        | Ok _ -> false);
     print_endline "state v1 compat: ok"
