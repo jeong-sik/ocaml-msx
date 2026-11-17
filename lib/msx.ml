@@ -689,13 +689,19 @@ let mem_write m addr v =
   end
 
 (* PSG R#14 = 조이스틱 포트 입력. R#15 bit6 이 포트 선택(0 = 1번), 2번 포트는
-   비어 있다. bit6 = 키배열 점퍼(50on = 0), bit7 = 카세트 입력(0).
-   정본: openMSX MSXPSG::readA, DummyJoystick::read = 0x3F. *)
+   비어 있다. bit6 = 키배열 점퍼(50on = 0). bit7 = 카세트 입력: 테이프가
+   없으면 비교기가 1 을 읽는다(openMSX CassettePort::cassetteIn 은
+   sample >= 0, 빈 포트의 DummyCassetteDevice::readSample = 32767).
+   정본: openMSX MSXPSG::readA, DummyJoystick::read = 0x3F. openMSX 21
+   C-BIOS_MSX2 실측: 두 포트 모두 0xBF. *)
 let joystick_idle = 0x3f
+let cassette_in_idle = 0x80
 
 let psg_read m =
   match m.psg_latch with
-  | 14 -> if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle
+  | 14 ->
+    cassette_in_idle
+    lor if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle
   | r when r < 16 -> m.psg.(r)
   | _ -> 0xff
 
@@ -709,6 +715,18 @@ let rtc_masks =
      [| 0x0; 0x0; 0xf; 0x7; 0xf; 0x3; 0x7; 0xf; 0x3; 0x0; 0x1; 0x3; 0x0 |];
      Array.make 13 0xf;
      Array.make 13 0xf |]
+
+(* Power-on RTC registers. openMSX keeps the 52 nibbles in an SRAM that a
+   machine without a saved file starts filled with 0xFF (Ram::clear); the
+   RP5C01 then writes the time block and the leap-year counter (alarm
+   block register 11) from the host clock. This core reads no host clock:
+   the time stays zero, the alarm block and the two RAM blocks read 0xF.
+   C-BIOS leaves them so; a real MSX2 sub ROM rewrites them at boot. *)
+let rtc_block_size = 13
+let rtc_leap_year = rtc_block_size + 11
+let rtc_power_on () =
+  Array.init (4 * rtc_block_size) (fun i ->
+      if i < rtc_block_size || i = rtc_leap_year then 0 else 0x0f)
 
 let rtc_read_reg m =
   match m.rtc_reg land 0x0f with
@@ -775,10 +793,15 @@ let keyboard_row m row =
     !bits
   end
 
+(* The RP5C01 drives only the low four data lines, so a read of port 0xB5
+   shows the register in the low nibble and 1s above it (openMSX
+   MSXRTC::readIO ORs 0xF0). Port 0xB4 is write-only: the machine maps only
+   0xB5 for input, so a read of 0xB4 finds no device and gets 0xFF. *)
+let rtc_data_high = 0xf0
+
 let port_read m port =
   match port land 0xff with
-  | 0xB4 -> m.rtc_reg land 0x0f
-  | 0xB5 -> rtc_read_reg m
+  | 0xB5 -> rtc_read_reg m lor rtc_data_high
   | 0xD0 | 0xD1 | 0xD2 | 0xD3 -> fdc_read m port
   | 0x98 -> Vdp.io_read m.vdp ~port:0x98
   | 0x99 -> Vdp.io_read m.vdp ~port:0x99
@@ -879,7 +902,7 @@ let create ~machine =
       bdos_files = Hashtbl.create 4;
       frames = 0;
       rtc_reg = 0;
-      rtc_regs = Array.make 52 0;
+      rtc_regs = rtc_power_on ();
       rtc_mode = 0x8;
       con_esc = 0;
       rst30_pending = [];
