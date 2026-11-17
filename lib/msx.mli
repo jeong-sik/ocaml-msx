@@ -6,8 +6,8 @@
 
     Sound output remains unimplemented. Versioned save states include CPU,
     VDP, memory, mounted media, the WD2793 drive state (format v3,
-    ocaml-msx #46), the i8255 PPI control word and latches (format v4) and
-    device state; file IO belongs to callers. *)
+    ocaml-msx #46), the i8255 PPI control word and latches (format v4), the
+    slot 1 PAC (format v5) and device state; file IO belongs to callers. *)
 
 type key =
   | Up
@@ -56,6 +56,14 @@ val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
     ({!guess_mapper}); pass it to override a wrong guess. The bank registers
     reset linear so the ROM boots from segment 0. *)
+
+val insert_pac : t -> Pac.t -> unit
+(** Plug a PAC SRAM cart into slot 1 (openMSX extension "pac"). The machine
+    shares [Pac.t] with the caller, so the caller can write the SRAM to a
+    file with {!Pac.to_file} when the run ends. *)
+
+val pac : t -> Pac.t option
+(** The PAC in slot 1, if one is plugged in. *)
 
 val cart_mapper : t -> cart_mapper
 (** The mapper the plugged-in cart is using ([Flat] when none/plain). *)
