@@ -99,6 +99,11 @@
  (libraries msx))
 
 (test
+ (name cassette_test)
+ (modules cassette_test)
+ (libraries msx))
+
+(test
  (name rtc_port_test)
  (modules rtc_port_test)
  (libraries msx))

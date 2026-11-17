@@ -194,11 +194,19 @@ type t = {
   mutable ppi_row : int;
       (** The keyboard row the port C low pins hold while that half is an
           input: the latch's low nibble when the half last was an output. *)
+  mutable ppi_c_high : int;
+      (** What the port C high pins last drove, as a nibble (openMSX MSXPPI
+          prevBits): all ones at power-on, then the latch's high nibble each
+          time that half drives as an output. Bit 0 low runs the cassette
+          motor. *)
   mutable slot3_sel : int;
   keys : bool array;  (** key_rows × 8, 눌림=true *)
   psg : int array;
   mutable psg_latch : int;
   mutable joy1 : int;  (** 조이스틱 1 입력 6비트, active low — 빈 포트 0x3F *)
+  mutable cassette : Cassette.deck option;
+      (** The tape in the cassette deck. The motor is PPI port C bit 4, so
+          the deck keeps no copy of it. *)
   cpu_ref : t option ref;
 }
 
@@ -689,21 +697,10 @@ let mem_write m addr v =
   end
 
 (* PSG R#14 = 조이스틱 포트 입력. R#15 bit6 이 포트 선택(0 = 1번), 2번 포트는
-   비어 있다. bit6 = 키배열 점퍼(50on = 0). bit7 = 카세트 입력: 테이프가
-   없으면 비교기가 1 을 읽는다(openMSX CassettePort::cassetteIn 은
-   sample >= 0, 빈 포트의 DummyCassetteDevice::readSample = 32767).
+   비어 있다. bit6 = 키배열 점퍼(50on = 0), bit7 = 카세트 입력(아래).
    정본: openMSX MSXPSG::readA, DummyJoystick::read = 0x3F. openMSX 21
-   C-BIOS_MSX2 실측: 두 포트 모두 0xBF. *)
+   C-BIOS_MSX2 실측: 테이프 없이 두 포트 모두 0xBF. *)
 let joystick_idle = 0x3f
-let cassette_in_idle = 0x80
-
-let psg_read m =
-  match m.psg_latch with
-  | 14 ->
-    cassette_in_idle
-    lor if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle
-  | r when r < 16 -> m.psg.(r)
-  | _ -> 0xff
 
 (* RP5C01 접근 면(openMSX RP5C01.cc peekPort/writePort 정본): 뱅크 = 모드
    bit0-1, reg 13 은 모드를 그대로, reg 14/15(TEST/RESET) 는 쓰기 전용이라
@@ -764,6 +761,12 @@ let ppi_bios_mode = ppi_set_mode lor ppi_input_b
 
 let ppi_is_input m bit = m.ppi_ctrl land bit <> 0
 
+(* Port C high drives its pins only while it is an output
+   (I8255::outputPortC), after a latch write, a bit set or reset, or a
+   mode word. *)
+let ppi_drive_c_high m =
+  if not (ppi_is_input m ppi_input_c_high) then m.ppi_c_high <- m.ppi_c lsr 4
+
 (* A mode word re-drives the output ports from their latches
    (I8255::writeControlPort). The pins of a port that turns into an input
    keep the value they had. *)
@@ -776,12 +779,42 @@ let ppi_write_control m v =
   end else begin
     let bit = 1 lsl ((v lsr 1) land 7) in
     m.ppi_c <- if v land 1 <> 0 then m.ppi_c lor bit else m.ppi_c land lnot bit
-  end
+  end;
+  ppi_drive_c_high m
 
 (* The keyboard row the port C low pins select: the latch while that half
    is an output, the value it last drove while it is an input. *)
 let ppi_selected_row m =
   if ppi_is_input m ppi_input_c_low then m.ppi_row else m.ppi_c land 0x0f
+
+(* Port C bit 4 low runs the cassette motor (openMSX MSXPPI::writeC1). It
+   follows the pins, so the motor stays off until the BIOS first drives
+   port C high: on the NMS 8250, its mode word at cycle 112. *)
+let cassette_motor_bit = 0x1 (* of the port C high nibble *)
+let cassette_motor m = m.ppi_c_high land cassette_motor_bit = 0
+let cassette_input_bit = 0x80
+
+(* The tape moves up to a port C write with the motor as it was. *)
+let cassette_advance m =
+  Option.iter
+    (fun d -> Cassette.advance d ~cycle:(Z80.t_states m.cpu) ~motor:(cassette_motor m))
+    m.cassette
+
+(* With no tape the input reads 1: openMSX's comparator takes a sample >= 0
+   as high, and an empty deck gives silence (0). *)
+let cassette_input m =
+  match m.cassette with
+  | None -> true
+  | Some d -> Cassette.input d ~cycle:(Z80.t_states m.cpu) ~motor:(cassette_motor m)
+
+let psg_read m =
+  match m.psg_latch with
+  | 14 ->
+    let joystick = if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle in
+    (joystick land lnot cassette_input_bit)
+    lor (if cassette_input m then cassette_input_bit else 0)
+  | r when r < 16 -> m.psg.(r)
+  | _ -> 0xff
 
 let keyboard_row m row =
   if row >= key_rows then 0xff
@@ -849,8 +882,9 @@ let port_write m port v =
     if ppi_is_input m ppi_input_a then m.ppi_latch_a <- v land 0xff
     else m.ppi_a <- v land 0xff
   | 0xA9 -> m.ppi_b <- v land 0xff
-  | 0xAA -> m.ppi_c <- v land 0xff
-  | 0xAB -> ppi_write_control m (v land 0xff)
+  (* Port C bit 4 runs the cassette motor; both ports can change it. *)
+  | 0xAA -> cassette_advance m; m.ppi_c <- v land 0xff; ppi_drive_c_high m
+  | 0xAB -> cassette_advance m; ppi_write_control m (v land 0xff)
   | 0xA0 -> m.psg_latch <- v land 0xff
   | 0xA1 -> if m.psg_latch < 16 then m.psg.(m.psg_latch) <- v land 0xff
   | 0xFC | 0xFD | 0xFE | 0xFF ->
@@ -925,11 +959,13 @@ let create ~machine =
       ppi_latch_a = 0x00;
       ppi_b = 0x00;
       ppi_row = 0;
+      ppi_c_high = 0xf;
       slot3_sel = 0x00;
       keys = Array.make (key_rows * 8) false;
       psg = Array.make 16 0;
       psg_latch = 0;
       joy1 = joystick_idle;
+      cassette = None;
       cpu_ref = m_ref;
     }
   in
@@ -1194,6 +1230,13 @@ let fat12_open t name11 =
     match fat12_find t fs name11 with
     | None -> None
     | Some e -> Some (fat12_read t fs e)
+
+let insert_cassette t cas =
+  match Cassette.of_cas cas with
+  | Error e -> Error e
+  | Ok tape ->
+    t.cassette <- Some (Cassette.insert tape ~cycle:(Z80.t_states t.cpu));
+    Ok ()
 
 let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
   t.disk <- Bytes.of_string dsk;
@@ -2239,6 +2282,17 @@ let serialize t =
   State_codec.put_int w t.ppi_row;
   Z80.write_state w t.cpu;
   Vdp.write_state w t.vdp;
+  (* v5: the port C high pins, the cassette image and how far its tape has
+     moved. It follows the CPU state because the deck counts CPU cycles
+     from the restored time. *)
+  State_codec.put_int w t.ppi_c_high;
+  (match t.cassette with
+   | None -> State_codec.put_bool w false
+   | Some d ->
+     State_codec.put_bool w true;
+     State_codec.put_bytes w (Bytes.of_string (Cassette.cas (Cassette.tape d)));
+     State_codec.put_int w
+       (Cassette.position d ~cycle:(Z80.t_states t.cpu) ~motor:(cassette_motor t)));
   State_codec.finish w
 
 let restore_with_reader reader state =
@@ -2327,6 +2381,21 @@ let restore_with_reader reader state =
     end else t.ppi_ctrl <- ppi_bios_mode;
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
+    (* Before v5 nothing read the port C high pins. A state saved after the
+       BIOS set up the PPI has them equal to the latch; one saved with port
+       C high as an input may not, but such a state has no tape either. *)
+    t.ppi_c_high <-
+      (if State_codec.version r >= 5 then State_codec.get_int r ~min:0 ~max:15
+       else t.ppi_c lsr 4);
+    if State_codec.version r >= 5 && State_codec.get_bool r then begin
+      let tape =
+        match Cassette.of_cas (Bytes.to_string (State_codec.get_bytes r)) with
+        | Ok tape -> tape
+        | Error e -> State_codec.fail ("invalid saved cassette: " ^ e)
+      in
+      let position = State_codec.get_int r ~min:0 ~max:(Cassette.end_position tape) in
+      t.cassette <- Some (Cassette.resume tape ~position ~cycle:(Z80.t_states t.cpu))
+    end;
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message
