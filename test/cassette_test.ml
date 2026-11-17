@@ -208,8 +208,8 @@ let () =
     motor restored true;
     check "saved with the motor off" (levels restored 16 = original);
     (* The tape position precedes the RTC clock, two NEO registers, and the
-       CPU IRQ window. Restore accepts positions up to the end of the tape. *)
-    let trailing_bytes = (5 * 8) + 1 in
+       CPU IRQ window and empty PAC slot. Restore accepts positions up to the end of the tape. *)
+    let trailing_bytes = (5 * 8) + 2 in
     let forge position =
       let head = String.length "OCAML-MSX\000" + 1 in
       let payload =

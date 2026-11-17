@@ -122,6 +122,10 @@ type fdc_state = {
   mutable intr_fired : bool;  (** 이번 INTRQ 펄스를 이미 CPU 에 전달했나 *)
 }
 
+(* Cartridge slot 1. The NMS 8250 leaves it empty; a PAC answers in its
+   page 1 (openMSX puts the "pac" extension there when slot 2 holds a cart). *)
+type slot1 = Empty_slot1 | Pac_slot1 of Pac.t
+
 type t = {
   cpu : Z80.t;
   vdp : Vdp.t;
@@ -138,6 +142,7 @@ type t = {
       (** 8KB page (0-7) where a [Flat] cart's first byte sits. Derived from
       [cart] by [plain_rom_first_page]; [set_cart] keeps the two together. *)
   mutable cart_mapper : cart_mapper;
+  mutable slot1 : slot1;
   cart_banks : int array;
       (** bank registers. Konami/SCC/ASCII8 use [.(0)..(3)], one per 8KB window
           of 0x4000-0xBFFF; ASCII16 uses [.(0)]/[.(1)] as 16KB banks. NEO8 uses
@@ -578,7 +583,11 @@ let mem_read m addr =
     | _ -> (m.ppi_a lsr 6) land 3
   in
   if a = 0xffff && slot = 3 then lnot m.slot3_sel land 0xff
-  else if slot = 2 && m.cart_mapper = Ram64 then Char.code (Bytes.get m.cart a)
+  else
+    match if slot = 1 && page = 1 then m.slot1 else Empty_slot1 with
+    | Pac_slot1 p -> Pac.read p a
+    | Empty_slot1 ->
+  if slot = 2 && m.cart_mapper = Ram64 then Char.code (Bytes.get m.cart a)
   else if
     a land 0x3ff8 = 0x3ff8
     && ((slot = 2 && not m.cart_is_disk_rom && Bytes.length m.cart >= 0x4000)
@@ -735,7 +744,11 @@ let mem_write m addr v =
     | _ -> (m.ppi_a lsr 6) land 3
   in
   if a = 0xffff && slot = 3 then m.slot3_sel <- v land 0xff
-  else if slot = 2 && m.cart_mapper = Ram64 then Bytes.set m.cart a (Char.chr (v land 0xff))
+  else
+    match if slot = 1 && page = 1 then m.slot1 else Empty_slot1 with
+    | Pac_slot1 p -> Pac.write p a v
+    | Empty_slot1 ->
+  if slot = 2 && m.cart_mapper = Ram64 then Bytes.set m.cart a (Char.chr (v land 0xff))
   else if
     a land 0x3ff8 = 0x3ff8
     && ((slot = 2 && not m.cart_is_disk_rom && Bytes.length m.cart >= 0x4000)
@@ -1017,6 +1030,7 @@ let create ~machine =
       cart = Bytes.make 0 '\000';
       cart_first_page = 0;
       cart_mapper = Flat;
+      slot1 = Empty_slot1;
       cart_banks = [| 0; 1; 2; 3; 4; 5 |];
       cart_sram = Bytes.make 0 '\000';
       cart_sram_bit = 0;
@@ -1055,6 +1069,10 @@ let create ~machine =
 let palette_entries t = Array.init 16 (Vdp.palette_rgb t.vdp)
 
 let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
+
+let insert_pac t p = t.slot1 <- Pac_slot1 p
+
+let pac t = match t.slot1 with Pac_slot1 p -> Some p | Empty_slot1 -> None
 
 let load_cartridge ?mapper t rom =
   if mapper = Some Ram64 then
@@ -2400,6 +2418,7 @@ let serialize t =
   State_codec.put_int w t.ppi_latch_a;
   State_codec.put_int w t.ppi_b;
   State_codec.put_int w t.ppi_row;
+  (* v5: the PAC in slot 1, if any. *)
   Z80.write_state w t.cpu;
   Vdp.write_state w t.vdp;
   (* v5: the port C high pins, the cassette image and how far its tape has
@@ -2423,6 +2442,11 @@ let serialize t =
   State_codec.put_int w t.cart_banks.(4);
   State_codec.put_int w t.cart_banks.(5);
   Z80.write_irq_window w t.cpu;
+  (match t.slot1 with
+   | Empty_slot1 -> State_codec.put_bool w false
+   | Pac_slot1 p ->
+     State_codec.put_bool w true;
+     Pac.write_state w p);
   State_codec.finish w
 
 let restore_with_reader reader state =
@@ -2531,6 +2555,8 @@ let restore_with_reader reader state =
     if State_codec.version r >= 7 then
       for i = 4 to 5 do t.cart_banks.(i) <- State_codec.get_int r ~min:0 ~max:neo_bank_max done;
     if State_codec.version r >= 8 then Z80.read_irq_window r t.cpu;
+    if State_codec.version r >= 9 && State_codec.get_bool r then
+      t.slot1 <- Pac_slot1 (Pac.read_state r);
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message

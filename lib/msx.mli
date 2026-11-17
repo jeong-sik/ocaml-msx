@@ -6,8 +6,8 @@
 
     Sound output remains unimplemented. Versioned save states include CPU,
     VDP, memory, mounted media, the WD2793 drive state (format v3,
-    ocaml-msx #46), the i8255 PPI control word and latches (format v4) and
-    device state; file IO belongs to callers. *)
+    ocaml-msx #46), the i8255 PPI control word and latches (format v4), the
+    slot 1 PAC (format v5) and device state; file IO belongs to callers. *)
 
 type key =
   | Up
@@ -69,6 +69,14 @@ val insert_ram_cartridge : t -> unit
     Some MSX1 tape loaders look for RAM by switching primary slots only; the
     NMS8250's RAM sits in expanded slot 3-2, and this cart gives them RAM in
     a primary slot. *)
+
+val insert_pac : t -> Pac.t -> unit
+(** Plug a PAC SRAM cart into slot 1 (openMSX extension "pac"). The machine
+    shares [Pac.t] with the caller, so the caller can write the SRAM to a
+    file with {!Pac.to_file} when the run ends. *)
+
+val pac : t -> Pac.t option
+(** The PAC in slot 1, if one is plugged in. *)
 
 val cart_mapper : t -> cart_mapper
 (** The mapper the plugged-in cart is using ([Flat] when none/plain, [Ram64]
