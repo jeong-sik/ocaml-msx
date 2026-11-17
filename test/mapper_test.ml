@@ -68,6 +68,10 @@ let ascii8 () =
   let t = machine () in
   Msx.load_cartridge ~mapper:Msx.Ascii8 t (synth 8);
   show_cart t;
+  (* openMSX RomAscii8kB::reset: setRom(i, 0) for every window *)
+  List.iter
+    (fun a -> check (Printf.sprintf "ascii8 reset 0x%04X=seg0" a) (win t a = 0))
+    [ 0x4000; 0x6000; 0x8000; 0xA000 ];
   (* registers at 0x6000/0x6800/0x7000/0x7800 for windows 0..3 *)
   Msx.mem_write t 0x6000 4;
   check "ascii8 0x6000 selects window0 seg4" (win t 0x4000 = 4);
@@ -80,9 +84,12 @@ let ascii16 () =
   let t = machine () in
   Msx.load_cartridge ~mapper:Msx.Ascii16 t (synth 8);
   show_cart t;
-  check "ascii16 boots linear 0x4000=seg0" (win t 0x4000 = 0);
-  check "ascii16 boots linear 0x6000=seg1" (win t 0x6000 = 1);
-  check "ascii16 boots linear 0x8000=seg2" (win t 0x8000 = 2);
+  (* openMSX RomAscii16kB::reset: setRom(1, 0), setRom(2, 0) -- both 16KB
+     windows show bank 0 *)
+  check "ascii16 reset 0x4000=seg0" (win t 0x4000 = 0);
+  check "ascii16 reset 0x6000=seg1" (win t 0x6000 = 1);
+  check "ascii16 reset 0x8000=seg0" (win t 0x8000 = 0);
+  check "ascii16 reset 0xA000=seg1" (win t 0xA000 = 1);
   (* 0x6000 selects the 16KB bank at 0x4000-0x7FFF: bank 2 -> segs 4,5 *)
   Msx.mem_write t 0x6000 2;
   check "ascii16 0x6000 low half is seg4" (win t 0x4000 = 4);
@@ -146,8 +153,68 @@ let koei_sram () =
   Msx.mem_write t 0x7000 0x20;
   check "koei sram retained across bank switch" (win t 0x8000 = 0xab)
 
+(* A bank number past the ROM, after openMSX RomBlocks::setRom: a block
+   below nrBlocks is used as is, a larger one is masked with blockMask
+   (nrBlocks - 1, or 31 for RomKonami), and one still past the end leaves
+   the window unmapped (0xFF). *)
+let out_of_range () =
+  let bank mapper rom reg v addr =
+    let t = machine () in
+    Msx.load_cartridge ~mapper t rom;
+    show_cart t;
+    Msx.mem_write t reg v;
+    win t addr
+  in
+  (* 16 segments: 255 -> 15, 16 -> 0, 17 -> 1 (the MSXgl s_mapper case) *)
+  check "ascii8 255 wraps to 15" (bank Msx.Ascii8 (synth 16) 0x7800 255 0xA000 = 15);
+  check "ascii8 16 wraps to 0" (bank Msx.Ascii8 (synth 16) 0x7800 16 0xA000 = 0);
+  check "ascii8 17 wraps to 1" (bank Msx.Ascii8 (synth 16) 0x7800 17 0xA000 = 1);
+  (* 12 segments: the mask is 11, not the next power of two minus one *)
+  check "ascii8 13 of 12 -> 9" (bank Msx.Ascii8 (synth 12) 0x7800 13 0xA000 = 9);
+  check "ascii8 12 of 12 -> 8" (bank Msx.Ascii8 (synth 12) 0x7800 12 0xA000 = 8);
+  check "ascii8 4 of 12 is not masked" (bank Msx.Ascii8 (synth 12) 0x7800 4 0xA000 = 4);
+  (* ASCII16 counts 16KB banks: 8 segments are 4 banks, 5 -> 1 = segs 2,3 *)
+  check "ascii16 5 of 4 -> 1" (bank Msx.Ascii16 (synth 8) 0x7000 5 0x8000 = 2);
+  (* Konami masks with 31 whatever the size: 8 segments, 13 -> 13 is past
+     the end and reads 0xFF; 35 -> 3 *)
+  check "konami 13 of 8 is unmapped" (bank Msx.Konami (synth 8) 0x8000 13 0x8000 = 0xff);
+  check "konami 35 of 8 -> 3" (bank Msx.Konami (synth 8) 0x8000 35 0x8000 = 3);
+  check "scc 63 of 8 -> 7" (bank Msx.Konami_scc (synth 8) 0x9000 63 0x8000 = 7);
+  (* A ROM 3 bytes short of 8 segments is padded with 0xFF to 64KB: block
+     63 is block 7, at its start and not 3 bytes into it, and its last
+     bytes are the padding. *)
+  let short = String.sub (synth 8) 0 ((8 * 0x2000) - 3) in
+  check "short rom: 63 -> 7 at its start" (bank Msx.Konami_scc short 0x9000 63 0x8000 = 7);
+  check "short rom: padding reads 0xFF" (bank Msx.Konami_scc short 0x9000 7 0x9fff = 0xff)
+
+(* Koei SRAM: openMSX RomAscii8_8 KOEI (sramPages 0x34) stores through
+   windows 0, 2 and 3; a store into window 1 (0x6000-0x7FFF) is a bank
+   select. The SRAM bit is the ROM's block count: 24 segments -> 0x18,
+   so bank 8 selects SRAM. *)
+let koei_windows () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Ascii8_sram t (synth 32);
+  show_cart t;
+  Msx.mem_write t 0x6000 0x20;
+  Msx.mem_write t 0x4000 0xcd;
+  check "koei window 0 stores into sram" (win t 0x4000 = 0xcd);
+  Msx.mem_write t 0x6800 0x21;
+  check "koei window 1 reads sram page 1" (win t 0x6000 = 0);
+  Msx.mem_write t 0x6800 0x20;
+  check "koei window 1 reads sram page 0" (win t 0x6000 = 0xcd);
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Ascii8_sram t (synth 24);
+  show_cart t;
+  Msx.mem_write t 0x7000 8;
+  Msx.mem_write t 0x8000 0x5a;
+  check "koei 24 segments: bank 8 has the sram bit" (win t 0x8000 = 0x5a);
+  Msx.mem_write t 0x7000 7;
+  check "koei 24 segments: bank 7 is rom" (win t 0x8000 = 7)
+
 let () =
   konami ();
+  out_of_range ();
+  koei_windows ();
   konami_scc ();
   ascii8 ();
   ascii16 ();
