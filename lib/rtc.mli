@@ -42,9 +42,9 @@ val read_registers : State_codec.reader -> t -> unit
 val write_clock : State_codec.writer -> t -> unit
 val read_clock : State_codec.reader -> t -> cycle:int -> unit
 (** The test register, the fraction of a second and the last tick counted
-    into the registers (state format 4 on). [cycle] is the restored CPU time;
+    into the registers (state format 6 on). [cycle] is the restored CPU time;
     a saved tick after it is rejected. *)
 
 val start_clock : t -> cycle:int -> unit
-(** For states saved before format 4, whose clock never ran: count ticks
+(** For states saved before format 6, whose clock never ran: count ticks
     from [cycle] on. *)

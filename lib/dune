@@ -22,5 +22,5 @@
  (name msx)
  (public_name ocaml-msx.msx)
  (wrapped false)
- (modules msx rtc disk_fat12)
+ (modules msx cassette rtc disk_fat12)
  (libraries z80core vdpcore state_codec))

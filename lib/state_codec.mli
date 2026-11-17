@@ -12,8 +12,8 @@ val reader : string -> reader
 val reader_with_current_v1_layout : string -> reader
 val version : reader -> int
 (* Layout version of the decoded state: 1 (pre-#38), 2 (#38 envelope),
-    3 (#47 WD2793 drive state) or 4 (RTC clock). Bumped when the payload
-    layout changes. *)
+    3 (#47 WD2793 drive state), 4 (i8255 control word), 5 (cassette) or
+    6 (RTC clock). Bumped when the payload layout changes. *)
 val end_of_input : reader -> unit
 val remaining : reader -> int
 val fail : string -> 'a
