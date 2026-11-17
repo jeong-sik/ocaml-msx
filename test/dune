@@ -102,3 +102,8 @@
  (name rtc_port_test)
  (modules rtc_port_test)
  (libraries msx))
+
+(test
+ (name pac_test)
+ (modules pac_test)
+ (libraries msx))

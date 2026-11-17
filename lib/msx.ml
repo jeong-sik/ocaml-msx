@@ -114,6 +114,10 @@ type fdc_state = {
   mutable intr_fired : bool;  (** 이번 INTRQ 펄스를 이미 CPU 에 전달했나 *)
 }
 
+(* Cartridge slot 1. The NMS 8250 leaves it empty; a PAC answers in its
+   page 1 (openMSX puts the "pac" extension there when slot 2 holds a cart). *)
+type slot1 = Empty_slot1 | Pac_slot1 of Pac.t
+
 type t = {
   cpu : Z80.t;
   vdp : Vdp.t;
@@ -122,6 +126,7 @@ type t = {
   mutable sub_rom : Bytes.t;
   mutable cart : Bytes.t;
   mutable cart_mapper : cart_mapper;
+  mutable slot1 : slot1;
   cart_banks : int array;
       (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
           window); ASCII16 uses [.(0)]/[.(1)] as 16KB banks. *)
@@ -456,7 +461,11 @@ let mem_read m addr =
     | _ -> (m.ppi_a lsr 6) land 3
   in
   if a = 0xffff && slot = 3 then lnot m.slot3_sel land 0xff
-  else if
+  else
+    match if slot = 1 && page = 1 then m.slot1 else Empty_slot1 with
+    | Pac_slot1 p -> Pac.read p a
+    | Empty_slot1 ->
+  if
     a land 0x3ff8 = 0x3ff8
     && ((slot = 2 && not m.cart_is_disk_rom && Bytes.length m.cart >= 0x4000)
         || (slot = 3 && slot3_sub m page = 3 && Bytes.length m.cart >= 0x4000))
@@ -627,7 +636,11 @@ let mem_write m addr v =
     | _ -> (m.ppi_a lsr 6) land 3
   in
   if a = 0xffff && slot = 3 then m.slot3_sel <- v land 0xff
-  else if
+  else
+    match if slot = 1 && page = 1 then m.slot1 else Empty_slot1 with
+    | Pac_slot1 p -> Pac.write p a v
+    | Empty_slot1 ->
+  if
     a land 0x3ff8 = 0x3ff8
     && ((slot = 2 && not m.cart_is_disk_rom && Bytes.length m.cart >= 0x4000)
         || (slot = 3 && slot3_sub m page = 3 && Bytes.length m.cart >= 0x4000))
@@ -894,6 +907,7 @@ let create ~machine =
       sub_rom = rom_or_empty sub;
       cart = Bytes.make 0 '\000';
       cart_mapper = Flat;
+      slot1 = Empty_slot1;
       cart_banks = [| 0; 1; 2; 3 |];
       cart_sram = Bytes.make 0 '\000';
       cart_sram_bit = 0;
@@ -939,6 +953,10 @@ let create ~machine =
 let palette_entries t = Array.init 16 (Vdp.palette_rgb t.vdp)
 
 let name t = Printf.sprintf "MSX2/C-BIOS (%dKB RAM)" (Bytes.length t.ram / 1024)
+
+let insert_pac t p = t.slot1 <- Pac_slot1 p
+
+let pac t = match t.slot1 with Pac_slot1 p -> Some p | Empty_slot1 -> None
 
 let load_cartridge ?mapper t rom =
   t.cart <- Bytes.of_string rom;
@@ -2237,6 +2255,12 @@ let serialize t =
   State_codec.put_int w t.ppi_latch_a;
   State_codec.put_int w t.ppi_b;
   State_codec.put_int w t.ppi_row;
+  (* v5: the PAC in slot 1, if any. *)
+  (match t.slot1 with
+   | Empty_slot1 -> State_codec.put_bool w false
+   | Pac_slot1 p ->
+     State_codec.put_bool w true;
+     Pac.write_state w p);
   Z80.write_state w t.cpu;
   Vdp.write_state w t.vdp;
   State_codec.finish w
@@ -2325,6 +2349,7 @@ let restore_with_reader reader state =
       t.ppi_b <- State_codec.get_int r ~min:0 ~max:255;
       t.ppi_row <- State_codec.get_int r ~min:0 ~max:15
     end else t.ppi_ctrl <- ppi_bios_mode;
+    if State_codec.version r >= 5 && State_codec.get_bool r then t.slot1 <- Pac_slot1 (Pac.read_state r);
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
     State_codec.end_of_input r;
