@@ -76,18 +76,27 @@ val mem_write : t -> int -> int -> unit
 (** Write a byte at a 16-bit address as the Z80 would — into RAM, or as a bank
     select in a MegaROM's cart window. For tests and debugging. *)
 
+type disk_rom
+(** A real disk interface ROM image, checked and given an "AB" header. *)
+
+val disk_rom_of_string : string -> (disk_rom, string) result
+(** Parse a real disk ROM dump (e.g. NMS8250, cbios_disk.rom). The first 16KB
+    are used; a shorter image is an error. A ROM without its own "AB" header
+    gets one whose INIT is the disk INIENV entry. The caller reads the file. *)
+
 val insert_cassette : t -> string -> (unit, string) result
 (** Put a CAS image in the cassette deck, rewound, from the current CPU
     cycle on. The tape moves while software runs the motor (PPI port C bit
     4 = 0) and shows on PSG R#14 bit 7. Error when the image holds no CAS
     block header; the machine is unchanged then. *)
 
-val load_disk : ?interface_rom:bool -> ?real_rom:bool -> t -> string -> unit
+val load_disk : ?interface_rom:bool -> ?disk_rom:disk_rom -> t -> string -> unit
 (** Plug a floppy image (raw .dsk, 512 bytes a sector) into drive A. By
     default a disk interface ROM rides in the cartridge slot: C-BIOS finds its
     "AB" header and calls INIT, whose BIOS entries are HLE traps the step loop
     services against the image. [~interface_rom:false] leaves the slot empty
-    for the warm-up replay ({!boot_disk}). *)
+    for the warm-up replay ({!boot_disk}). [~disk_rom] mounts that real ROM in
+    slot 3-3 page 1 instead and lets its code drive the WD2793 model. *)
 
 val disk_image : t -> string option
 (** Copy of the current floppy bytes, including guest writes, for multi-disk
@@ -106,6 +115,14 @@ val boot_disk : t -> (unit, string) result
     frames of C-BIOS stepped before it, so the inter-slot primitives sit in
     RAM. This is the path a game's loader runs to its title on; the
     cart-INIT path reboots mid-boot (see the implementation note). *)
+
+val set_fdc_trace : bool -> unit
+(** FDC sector reads, data pump bytes and status-poll changes to stderr. Off
+    by default. *)
+
+val set_ppi_trace : bool -> unit
+(** Slot select (0xA8) and mapper (0xFC-0xFF) writes to stderr. Off by
+    default. *)
 
 val set_disk_call_log : bool -> unit
 (** Record each disk BIOS entry the running code reaches — for learning the
