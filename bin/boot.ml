@@ -18,6 +18,17 @@ let rom_db = ref ""
 let tap_space : int list ref = ref []
 let tap_keys : (int * Msx.key) list ref = ref []
 let tap_key_spec = ref ""
+
+(* --swap-disk F:PATH puts another disk image in the drive at frame F, the way
+   a player does when a game asks for its second disk. *)
+let swaps : (int * string) list ref = ref []
+
+let parse_swap spec =
+  match String.index_opt spec ':' with
+  | Some i ->
+    (int_of_string (String.sub spec 0 i),
+     String.sub spec (i + 1) (String.length spec - i - 1))
+  | None -> Printf.ksprintf failwith "bad --swap-disk %s (F:PATH)" spec
 let cas = ref ""
 
 (* --type F:TEXT presses each character for [type_hold] frames, one
@@ -142,6 +153,9 @@ let () =
       ( "--type",
         Arg.String (fun spec -> typed := !typed @ parse_type spec),
         "F:TEXT  프레임 F 부터 글자를 친다 (10프레임마다 한 글자, 5프레임 누름)" );
+      ( "--swap-disk",
+        Arg.String (fun spec -> swaps := !swaps @ [ parse_swap spec ]),
+        "F:PATH  프레임 F 에 드라이브 A 의 디스크를 PATH 로 갈아 끼운다 (여러 번 가능)" );
       ( "--disk-warm",
         Arg.Set disk_warm,
         "  720프레임 워밍업 뒤 Disk ROM 2차 호출 재생 (게임 화면 경로)" );
@@ -282,6 +296,13 @@ let () =
           if !ridx = f then ignore (Msx.set_key t k ~pressed:true);
           if !ridx = f + 5 then ignore (Msx.set_key t k ~pressed:false))
         !tap_keys;
+      List.iter
+        (fun (f, path) ->
+          if !ridx = f then
+            match Msx.change_disk t (In_channel.with_open_bin path In_channel.input_all) with
+            | Ok () -> ()
+            | Error e -> Printf.ksprintf failwith "--swap-disk %s: %s" path e)
+        !swaps;
       List.iter
         (fun (f, k, down) ->
           if !ridx = f && not (Msx.set_key t k ~pressed:down) then
