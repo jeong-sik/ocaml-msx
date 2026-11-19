@@ -20,6 +20,9 @@ let mapper_name : Msx.cart_mapper -> string = function
   | Konami -> "konami"
   | Konami_scc -> "konami-scc"
   | Ascii8_sram -> "koei"
+  (* A RAM cartridge has no ROM image, so the database never names it; this is
+     only the label boot.exe prints. *)
+  | Ram64 -> "ram64"
 
 let mapper_of_name = function
   | "plain" -> Some Msx.Flat
