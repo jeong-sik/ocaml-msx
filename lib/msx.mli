@@ -39,8 +39,9 @@ type t
 
 (** MegaROM cartridge mapper. [Flat] is a plain 16/32KB cart; the others bank
     8KB/16KB windows the way the named hardware does (openMSX RomKonami /
-    RomKonamiSCC / RomAscii8 / RomAscii16). SCC sound is not modelled. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
+    RomKonamiSCC / RomAscii8 / RomAscii16). SCC sound is not modelled.
+    [Ram64] is the RAM cartridge {!insert_ram_cartridge} plugs in. *)
+type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram | Ram64
 
 val create : machine:machine -> t
 
@@ -55,10 +56,21 @@ val fdc_recent_calls : unit -> (int * int * int * int) array
 val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
     ({!guess_mapper}); pass it to override a wrong guess. The bank registers
-    reset linear so the ROM boots from segment 0. *)
+    reset linear so the ROM boots from segment 0.
+    @raise Invalid_argument for [~mapper:Ram64]: that cart has no ROM. *)
+
+val insert_ram_cartridge : t -> unit
+(** Plug a 64KB RAM cartridge into slot 2, as openMSX's [-extb ram64k] does:
+    RAM over all four pages, every byte 0xFF, slot 2 not expanded. It replaces
+    a ROM cartridge. The disk interface ROM shares the cartridge's storage, so
+    a RAM cart and a disk do not mix: {!load_disk} replaces the RAM cart.
+    Some MSX1 tape loaders look for RAM by switching primary slots only; the
+    NMS8250's RAM sits in expanded slot 3-2, and this cart gives them RAM in
+    a primary slot. *)
 
 val cart_mapper : t -> cart_mapper
-(** The mapper the plugged-in cart is using ([Flat] when none/plain). *)
+(** The mapper the plugged-in cart is using ([Flat] when none/plain, [Ram64]
+    for a RAM cartridge). *)
 
 val guess_mapper : string -> cart_mapper
 (** Guess a ROM's mapper by counting its bank-register writes. [Flat] for a ROM
