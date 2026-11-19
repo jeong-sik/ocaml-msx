@@ -45,11 +45,20 @@ type t = {
 let m8 x = x land 0xff
 let m16 x = x land 0xffff
 
+(* Power-on values as openMSX CPUCore::doReset sets them. A real Z80 starts
+   with AF and SP at 0xFFFF and the other pairs undefined; openMSX fills those
+   and the alternate set with 0xFFFF too. PC, I, R, IM and the interrupt
+   flip-flops start at 0. Dragon Quest 2 (MSX1) reads DE' before it writes
+   it, so a zeroed DE' sends it down another path. *)
+let power_on_byte = 0xff
+let power_on_word = 0xffff
+
 let create ~m1_wait ~read ~write ~port_in ~port_out =
+  let v = power_on_byte in
   {
-    a = 0; f = 0; b = 0; c = 0; d = 0; e = 0; h = 0; l = 0;
-    a2 = 0; f2 = 0; b2 = 0; c2 = 0; d2 = 0; e2 = 0; h2 = 0; l2 = 0;
-    ix = 0; iy = 0; sp = 0xffff; pc = 0;
+    a = v; f = v; b = v; c = v; d = v; e = v; h = v; l = v;
+    a2 = v; f2 = v; b2 = v; c2 = v; d2 = v; e2 = v; h2 = v; l2 = v;
+    ix = power_on_word; iy = power_on_word; sp = power_on_word; pc = 0;
     i = 0; r = 0;
     iff1 = false; iff2 = false; im = 0;
     halted = false;
@@ -116,13 +125,22 @@ let disp8 z =
   let d = imm8 z in
   if d >= 0x80 then d - 256 else d
 
-let rd16 z addr = (z.rb (m16 (addr + 1)) lsl 8) lor z.rb addr
+(* The low byte is read first (openMSX RD_WORD). The two reads are bound
+   in turn because OCaml leaves the operand order of [lor] unspecified. *)
+let rd16 z addr =
+  let lo = z.rb addr in
+  let hi = z.rb (m16 (addr + 1)) in
+  (hi lsl 8) lor lo
 
+(* The low byte goes to the lower address, but a push writes the high
+   byte first: SP-1, then SP-2 (openMSX CPUCore::PUSH, WR_WORD_rev). The
+   order shows when the stack lies on memory-mapped registers: Meikyu no
+   Tobira pushes a return address onto its ASCII16 bank register, and the
+   bank left selected is the low byte's. *)
 let push z v =
-  (* 하위 바이트가 낮은 주소에 — Z80 16비트 메모리 규약 (little-endian). *)
   z.sp <- m16 (z.sp - 2);
-  z.wb z.sp (v land 0xff);
-  z.wb (m16 (z.sp + 1)) (v lsr 8)
+  z.wb (m16 (z.sp + 1)) (v lsr 8);
+  z.wb z.sp (v land 0xff)
 
 let pop z =
   let lo = z.rb z.sp in
@@ -339,10 +357,15 @@ let daa z =
   z.f <- sz53 a1 lor parity a1 lor (f0 land 0x02)
          lor (if h_out then 0x10 else 0) lor (if !c_out then 1 else 0)
 
-(* INI/OUTI 계열: Z(내려간 B) 와 N 만 바뀐다. S/F5/F3/H/PV/C 불변 —
-   superzazu/z80.c 와 같은 선택, 그 코어로 zexall 을 통과했다. *)
-let io_block_flags z =
-  z.f <- (z.f land 0xfd) lor 0x02 lor (if z.b = 0 then 0x40 else 0)
+(* INI/IND/OUTI/OUTD and their repeats set every flag (openMSX CPUCore
+   BLOCK_IN / BLOCK_OUT): S, Z, F5 and F3 from the decremented B; N from bit
+   7 of the byte [v] moved; H and C when [k] -- the byte plus L after the
+   step (OUT), or plus C +/- 1 (IN) -- carries out of 8 bits; P/V the parity
+   of (k & 7) xor B. A Z left over from an earlier instruction is cleared. *)
+let io_block_flags z ~v ~k =
+  z.f <-
+    sz53 z.b lor ((v land 0x80) lsr 6) lor (if k > 0xff then 0x11 else 0)
+    lor parity ((k land 7) lxor z.b)
 
 (* One M1 cycle: R counts it and the machine's M1 wait state is charged.
    R and the wait both follow M1, so an opcode, each prefix (CB, ED, DD,
@@ -427,9 +450,9 @@ and ed_exec z op =
   | 0x40 | 0x48 | 0x50 | 0x58 | 0x60 | 0x68 | 0x70 | 0x78 ->
     (* IN r,(C) — 0x70 은 IN F,(C): 플래그만 갱신. *)
     let v = z.pin ~at:(io_at io_c) ((z.b lsl 8) lor z.c) in
-    (* F3/F5 와 C 는 불변 — S/Z/PV/H/N 만 갱신. *)
-    z.f <- (z.f land 0x29) lor (v land 0x80) lor (if v = 0 then 0x40 else 0)
-           lor parity v;
+    (* C stays; S, Z, X, Y and P/V come from the byte read, H and N clear
+       (openMSX CPUCore::in_R_c on a Z80: (F & C) | ZSPXY[res]). *)
+    z.f <- (z.f land 0x01) lor sz53 v lor parity v;
     if y <> 6 then rset z y v No;
     add_t 12
   | 0x41 | 0x49 | 0x51 | 0x59 | 0x61 | 0x69 | 0x71 | 0x79 ->
@@ -474,16 +497,13 @@ and ed_exec z op =
   | 0x5E -> z.im <- 2; add_t 8
   | 0x47 -> z.i <- z.a; add_t 9
   | 0x4F -> z.r <- z.a; add_t 9
-  | 0x57 ->
-    (* F3/F5/C 불변. *)
-    z.f <- (z.f land 0x29) lor (z.i land 0x80) lor (if z.i = 0 then 0x40 else 0)
-           lor (if z.iff2 then 0x04 else 0);
-    z.a <- z.i;
-    add_t 9
-  | 0x5F ->
-    z.f <- (z.f land 0x29) lor (z.r land 0x80) lor (if z.r = 0 then 0x40 else 0)
-           lor (if z.iff2 then 0x04 else 0);
-    z.a <- z.r;
+  | 0x57 | 0x5F ->
+    (* LD A,I / LD A,R: C stays; S, Z, X and Y come from the value moved,
+       P/V is IFF2, H and N clear (openMSX CPUCore::ld_a_IR on a Z80:
+       (F & C) | ZSXY[A]). Keeping X and Y from the old F is the R800. *)
+    let v = if op = 0x57 then z.i else z.r in
+    z.f <- (z.f land 0x01) lor sz53 v lor (if z.iff2 then 0x04 else 0);
+    z.a <- v;
     add_t 9
   | 0x67 | 0x6F ->
     let addr = hl16 z in
@@ -557,8 +577,8 @@ and ed_exec z op =
     let v = z.pin ~at:(io_at io_ini) port in
     z.wb addr v;
     z.b <- m8 (z.b - 1);
-    io_block_flags z;
     let dir = if op land 0x08 = 0 then 1 else -1 in
+    io_block_flags z ~v ~k:(v + m8 (z.c + dir));
     let hl' = m16 (addr + dir) in
     z.h <- hl' lsr 8;
     z.l <- hl' land 0xff;
@@ -572,11 +592,11 @@ and ed_exec z op =
     let v = z.rb addr in
     z.b <- m8 (z.b - 1);
     z.pout ~at:(io_at io_outi) port v;
-    io_block_flags z;
     let dir = if op land 0x08 = 0 then 1 else -1 in
     let hl' = m16 (addr + dir) in
     z.h <- hl' lsr 8;
     z.l <- hl' land 0xff;
+    io_block_flags z ~v ~k:(v + z.l);
     if op >= 0xB3 && z.b <> 0 then begin
       z.pc <- m16 (z.pc - 2);
       add_t 21
@@ -730,11 +750,13 @@ and main_exec z op p =
       z.a <- m8 (lnot z.a);
       z.f <- (z.f land 0xc5) lor 0x12 lor (z.a land 0x28);
       add_t 4
-    | 0x37 -> z.f <- (z.f land 0xc5) lor (z.a land 0x28) lor 1; add_t 4
+    (* SCF and CCF set X and Y from F or A and never clear them, as openMSX
+       CPUCore::scf/ccf do for an NMOS Z80: (F | A) & 0x28. *)
+    | 0x37 -> z.f <- (z.f land 0xc5) lor ((z.f lor z.a) land 0x28) lor 1; add_t 4
     | 0x3F ->
       (* CCF: 캐리를 토글하고, 옛 캐리가 1이었으면 H 를 세운다. *)
       let c = z.f land 1 in
-      z.f <- (z.f land 0xc4) lor (z.a land 0x28) lor (1 - c)
+      z.f <- (z.f land 0xc4) lor ((z.f lor z.a) land 0x28) lor (1 - c)
              lor (if c = 1 then 0x10 else 0);
       add_t 4
     | 0xC0 | 0xC8 | 0xD0 | 0xD8 | 0xE0 | 0xE8 | 0xF0 | 0xF8 ->
@@ -804,8 +826,9 @@ and main_exec z op p =
     | 0xE3 ->
       let spv = rd16 z z.sp in
       let v = pget z 2 p in
-      z.wb z.sp (v land 0xff);
+      (* High byte first, like a push (openMSX ex_xsp_SS, WR_WORD_rev). *)
       z.wb (m16 (z.sp + 1)) (v lsr 8);
+      z.wb z.sp (v land 0xff);
       pset z 2 spv p;
       add_t (if p <> No then 23 else 19)
     | 0xE9 -> z.pc <- pget z 2 p; add_t (if p <> No then 14 else 4)
