@@ -219,3 +219,8 @@
  (name text2_test)
  (modules text2_test)
  (libraries vdpcore))
+
+(test
+ (name dos1_kernel_test)
+ (modules dos1_kernel_test)
+ (libraries msx))
