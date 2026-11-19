@@ -124,6 +124,11 @@
  (libraries msx))
 
 (test
+ (name z80_write_order_test)
+ (modules z80_write_order_test)
+ (libraries z80core))
+
+(test
  (name core_purity_test)
  (modules core_purity_test)
  (deps
