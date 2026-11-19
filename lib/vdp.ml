@@ -137,6 +137,37 @@ let display_mode t =
   | 0x09 -> Text2
   | code -> Undefined code
 
+(* S#2 HR (bit 5) and VR (bit 6), after openMSX VDP.cc peekStatusReg case 2.
+   A line runs from one right border to the next in this model, so HR is the
+   first stretch of every line: openMSX getHR is 1 for HBLANK_LEN_GFX = 312
+   ticks after the right border, HBLANK_LEN_TXT = 404 in the text modes
+   (DisplayMode::isTextMode: TEXT1, TEXT2 and TEXT1Q, code 0x05, which
+   [display_mode] leaves Undefined). One Z80 cycle is 6 VDP ticks, so that is
+   52 and 67.3 cycles.
+
+   VR is 1 from the display end to one line before the next display start:
+   openMSX [ticksThisFrame < displayStart - TICKS_PER_LINE || ticksThisFrame
+   >= displayEnd]. Here it rises with S#0 F at the end of the last display
+   line and drops 48 cycles into the last line of the frame (1368 - 1282 +
+   202 = 288 ticks). openMSX raises it 48 cycles later than this model's F
+   (issue #63). *)
+let hr_cycles_graphic = 52
+let hr_cycles_text = 68
+let vr_fall_cycle = 48
+
+let text_timing t =
+  match display_mode t with
+  | Text1 | Text2 | Undefined 0x05 -> true
+  | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4 | Graphic5
+  | Graphic6 | Graphic7 | Undefined _ -> false
+
+let horizontal_retrace t =
+  t.cycle_in_line < (if text_timing t then hr_cycles_text else hr_cycles_graphic)
+
+let vertical_retrace t =
+  t.line >= visible_lines t
+  && not (t.line = lines_per_frame - 1 && t.cycle_in_line >= vr_fall_cycle)
+
 let display_mode_to_string = function
   | Text1 -> "TEXT1"
   | Text2 -> "TEXT2"
@@ -439,8 +470,10 @@ let io_read t ~port =
            read next") — 완료 감지는 그다음 읽기부터 TR=0 && CE=0. *)
         let v =
           ((if t.cmd_ce then 1 else 0)
-           lor (if t.cmd_tr || t.tx_active then 0x80 else 0))
-          lor 0x7e
+           lor (if t.cmd_tr || t.tx_active then 0x80 else 0)
+           lor (if vertical_retrace t then 0x40 else 0)
+           lor (if horizontal_retrace t then 0x20 else 0))
+          lor 0x1e
         in
         if not t.tx_active then t.cmd_tr <- false;
         v
