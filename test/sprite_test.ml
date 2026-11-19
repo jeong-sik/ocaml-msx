@@ -89,9 +89,8 @@ let () =
      15행(마지막 행)이 0번 줄에 걸린다 *)
   let t = Vdp.create () in
   screen1 t ~r1:0xe2 ();
-  for row = 0 to 15 do
-    vram_w t (pt + row * 2) (if row = 15 then 0x80 else 0x00);
-    vram_w t (pt + row * 2 + 1) 0x00
+  for b = 0 to 31 do
+    vram_w t (pt + b) (if b = 15 then 0x80 else 0x00)
   done;
   sat_w t 0 0xf0 50 0 9;
   check "wrap: row 15 lands on line 0" (is_col t 50 0 9);
@@ -109,17 +108,28 @@ let () =
   (* 5. 16×16: 패턴번호 하위 2비트는 버리고 번호 ×8 바이트 *)
   let t = Vdp.create () in
   screen1 t ~r1:0xe2 ();
-  (* 패턴 4 의 첫 줄만 왼쪽 픽셀 2개 *)
-  for row = 0 to 15 do
-    vram_w t (pt + (4 * 8) + row * 2) (if row = 0 then 0xc0 else 0x00);
-    vram_w t (pt + (4 * 8) + row * 2 + 1) 0x00
+  (* 패턴 4: 왼쪽 반(바이트 0..15) 의 0행은 왼쪽 픽셀 2개, 9행은 맨 왼쪽
+     픽셀 하나. 오른쪽 반(바이트 16..31) 의 0행은 오른쪽 끝 픽셀 둘, 9행은
+     맨 오른쪽 픽셀 하나. openMSX 와 같은 최소 ROM 으로 확인한 배치다
+     (왼쪽 반만 켜면 8폭×16높이). *)
+  for b = 0 to 31 do
+    let v =
+      match b with 0 -> 0xc0 | 9 -> 0x80 | 16 -> 0x03 | 25 -> 0x01 | _ -> 0x00
+    in
+    vram_w t (pt + (4 * 8) + b) v
   done;
   sat_w t 0 100 50 5 9; (* pat 5 → 4 와 같은 패턴 *)
   check "16x16: (50,101) set" (is_col t 50 101 9);
   check "16x16: (51,101) set" (is_col t 51 101 9);
   check "16x16: (52,101) clear" (is_col t 52 101 0);
   (* 두 번째 줄(row 1)은 0 *)
-  check "16x16: row 1 clear" (is_col t 50 102 0)
+  check "16x16: row 1 clear" (is_col t 50 102 0);
+  check "16x16: right half row 0 (64,101) set" (is_col t 64 101 9);
+  check "16x16: right half row 0 (65,101) set" (is_col t 65 101 9);
+  check "16x16: right half row 0 (63,101) clear" (is_col t 63 101 0);
+  check "16x16: left half row 9 (50,110) set" (is_col t 50 110 9);
+  check "16x16: left half row 1 not the interleaved byte (51,102) clear" (is_col t 51 102 0);
+  check "16x16: right half row 9 (65,110) set" (is_col t 65 110 9)
 
 let () =
   (* 6. EC(컬러 bit7): X 를 32px 왼쪽으로 *)
