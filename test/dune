@@ -174,3 +174,8 @@
  (name rtc_port_test)
  (modules rtc_port_test)
  (libraries msx))
+
+(test
+ (name text2_test)
+ (modules text2_test)
+ (libraries vdpcore))
