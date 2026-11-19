@@ -135,6 +135,11 @@
  (libraries z80core))
 
 (test
+ (name frame_clock_test)
+ (modules frame_clock_test)
+ (libraries msx))
+
+(test
  (name vdp_reg_test)
  (modules vdp_reg_test)
  (libraries vdpcore))
