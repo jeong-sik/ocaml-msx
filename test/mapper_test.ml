@@ -171,7 +171,18 @@ let outer_pages () =
   shows "ascii8" Msx.Ascii8 [] [ 0xff; 0xff; 0xff; 0xff ];
   shows "ascii16" Msx.Ascii16 [] [ 0xff; 0xff; 0xff; 0xff ]
 
+(* Plugging a cart does not touch slot selection: PPI port A stays at its
+   power-on 0x00 (every page on slot 0), as on the real machine and in
+   openMSX. C-BIOS finds the cart by scanning the slots itself; a page 1
+   left on slot 2 would outlive the scan, which only rewrites the page 2
+   and 3 bits. *)
+let ppi_untouched () =
+  let t = machine () in
+  Msx.load_cartridge t (synth 2);
+  check "cart leaves PPI A at 0x00" (Msx.port_in t 0xA8 = 0x00)
+
 let () =
+  ppi_untouched ();
   konami ();
   konami_scc ();
   ascii8 ();
