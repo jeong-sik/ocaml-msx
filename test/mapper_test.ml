@@ -146,6 +146,42 @@ let koei_sram () =
   Msx.mem_write t 0x7000 0x20;
   check "koei sram retained across bank switch" (win t 0x8000 = 0xab)
 
+(* The RAM mapper in slot 3-2 (openMSX MSXMemoryMapperBase). A register
+   keeps bit_ceil(segments) - 1 and reads back with the bits above set; one
+   past the last segment folds with segments - 1. *)
+let ram_mapper () =
+  let ram kb =
+    let t = Msx.create ~machine:{ Msx.ram_kb = kb; vram_kb = 128; roms = [ ""; ""; "" ] } in
+    (* every page in slot 3, every page of slot 3 in subslot 2 *)
+    Msx.port_out t 0xA8 0xff;
+    Msx.mem_write t 0xffff 0xaa;
+    (* byte 0x8000 of each segment holds its index *)
+    for s = 0 to (kb / 16) - 1 do
+      Msx.port_out t 0xFE s;
+      Msx.mem_write t 0x8000 s
+    done;
+    t
+  in
+  let t = ram 512 in
+  Msx.port_out t 0xFE 0x23;
+  check "512KB mapper reads segment 3 as 0xE3" (Msx.port_in t 0xFE = 0xe3);
+  check "512KB mapper keeps 5 bits" (Msx.mem_read t 0x8000 = 3);
+  Msx.port_out t 0xFE 31;
+  check "512KB mapper reaches segment 31" (Msx.mem_read t 0x8000 = 31 && Msx.port_in t 0xFE = 0xff);
+  let t = ram 64 in
+  Msx.port_out t 0xFE 0x05;
+  check "64KB mapper reads segment 1 as 0xFD" (Msx.port_in t 0xFE = 0xfd);
+  check "64KB mapper keeps 2 bits" (Msx.mem_read t 0x8000 = 1);
+  let t = ram 96 in
+  Msx.port_out t 0xFE 7;
+  check "96KB mapper keeps 3 bits" (Msx.port_in t 0xFE = 0xff);
+  check "96KB mapper folds segment 7 to 5" (Msx.mem_read t 0x8000 = 5);
+  Msx.port_out t 0xFE 6;
+  check "96KB mapper folds segment 6 to 4" (Msx.mem_read t 0x8000 = 4);
+  let t = ram 4096 in
+  Msx.port_out t 0xFE 200;
+  check "4MB mapper reaches segment 200" (Msx.mem_read t 0x8000 = 200 && Msx.port_in t 0xFE = 200)
+
 (* Pages 0 and 3 of the cart slot (openMSX RomKonami / RomKonamiSCC
    bankSwitch, RomAscii8kB / RomAscii16kB reset): Konami mirrors the
    0x4000-0x7FFF windows at 0x0000 and the 0x8000-0xBFFF ones at 0xC000,
@@ -189,6 +225,7 @@ let () =
   ascii16 ();
   koei_sram ();
   detection ();
+  ram_mapper ();
   outer_pages ();
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
