@@ -142,17 +142,11 @@ type t = {
   mutable frames : int;
   mutable rtc_reg : int;
       (** RTC(RP5C01) 의 어드레스 래치(포트 0xB4 로 선택한 레지스터 번호). *)
-  rtc_regs : int array;
-      (** RP5C01 레지스터 파일 52니블 = 4뱅크 × 13레지스터(openMSX RP5C01
-          정본: bank = 모드 레지스터 bit0-1, 0=시계 1=알람/RAM 2·3=SRAM).
-          실 sub ROM 부트는 여기에 초기값을 쓰고 읽어 되돌려 검증한다(실측:
-          nms8250_msx2sub 0x0431/0x0440 — reg0 에 0x0A 를 심고 CP 0x0A 로
-          확인) — 읽기가 상수면 검증이 영원히 실패해 BIOS 초기화가 0x04xx
-          루프에 갇힌다. 시계 진행은 없다(부트 검증은 쓴 값의 되돌림만 보고,
-          실시간 비결정성도 만든다). *)
-  mutable rtc_mode : int;
-      (** 모드 레지스터(reg 13): bit0-1=뱅크, bit2=알람, bit3=타이머. 읽기에
-          그대로 드러난다. 전원 인가값은 타이머 동작 자세(0x8). *)
+  rtc : Rtc.t;
+      (** RP5C01 behind ports 0xB4/0xB5. A real MSX2 sub ROM writes values
+          into it at boot and reads them back to check the chip (measured:
+          nms8250_msx2sub 0x0431/0x0440 stores 0x0A in register 0 and
+          compares), so reads must return what was written. *)
   mutable con_esc : int;
       (** VT52 escape-sequence state for the BDOS console: 0=plain, 1=after
           ESC, 2=after "ESC Y" (row byte next), 3=column byte next. *)
@@ -180,12 +174,33 @@ type t = {
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
-  mutable ppi_c : int;
+      (** The primary slot register: what the PPI port A pins drive. While
+          port A is an output these pins are its latch. *)
+  mutable ppi_c : int;  (** PPI port C latch. *)
+  mutable ppi_ctrl : int;
+      (** i8255 control word (openMSX I8255): bits 4, 1, 3 and 0 make port
+          A, port B, port C high and port C low inputs; bits 6-5 and 2 pick
+          mode 1 or 2, which MSX does not use. *)
+  mutable ppi_latch_a : int;
+      (** Port A's latch while port A is an input. The pins keep the value
+          last output, so [ppi_a] stays as it was. *)
+  mutable ppi_b : int;  (** Port B latch, read back while port B is an output. *)
+  mutable ppi_row : int;
+      (** The keyboard row the port C low pins hold while that half is an
+          input: the latch's low nibble when the half last was an output. *)
+  mutable ppi_c_high : int;
+      (** What the port C high pins last drove, as a nibble (openMSX MSXPPI
+          prevBits): all ones at power-on, then the latch's high nibble each
+          time that half drives as an output. Bit 0 low runs the cassette
+          motor. *)
   mutable slot3_sel : int;
   keys : bool array;  (** key_rows × 8, 눌림=true *)
   psg : int array;
   mutable psg_latch : int;
   mutable joy1 : int;  (** 조이스틱 1 입력 6비트, active low — 빈 포트 0x3F *)
+  mutable cassette : Cassette.deck option;
+      (** The tape in the cassette deck. The motor is PPI port C bit 4, so
+          the deck keeps no copy of it. *)
   cpu_ref : t option ref;
 }
 
@@ -199,6 +214,22 @@ let cart_seg8 m w =
   | Konami | Konami_scc | Ascii8 | Ascii8_sram -> m.cart_banks.(w)
   | Ascii16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
   | Flat -> w
+
+(* The window (0..3) a MegaROM shows at CPU address [a] of its slot, or [None]
+   where the cart leaves the bus empty. 0x4000-0xBFFF is windows 0-3 for every
+   mapper. Konami mirrors windows 0-1 at 0x0000 and 2-3 at 0xC000, Konami SCC
+   the other way round (openMSX RomKonami / RomKonamiSCC bankSwitch); the
+   ASCII mappers leave both pages unmapped. A [Flat] cart has no window. *)
+let cart_window m a =
+  let page8 = a lsr 13 in
+  let inside = page8 >= 2 && page8 < 6 in
+  match m.cart_mapper with
+  | Konami ->
+    Some (if page8 < 2 then page8 else if inside then page8 - 2 else page8 - 4)
+  | Konami_scc ->
+    Some (if page8 < 2 then page8 + 2 else if inside then page8 - 2 else page8 - 6)
+  | Ascii8 | Ascii16 | Ascii8_sram -> if inside then Some (page8 - 2) else None
+  | Flat -> None
 
 (* A write into the cart window selects a bank. Each mapper decodes the target
    address differently; a write that hits no register is ignored (ROM is not
@@ -514,13 +545,12 @@ let mem_read m addr =
        with Not_found -> ());
        fdc_note m 0 0xd7 v;
        v)
-  else if
-    a >= 0x4000 && a < 0xc000 && slot = 2 && m.cart_mapper <> Flat
-    && Bytes.length m.cart > 0
-  then begin
-    (* MegaROM: 0x4000-0xBFFF is four 8KB windows, each showing the segment its
-       bank register selects. The cart sits in slot 2 (see load_cartridge). *)
-    let w = (a lsr 13) - 2 in
+  else
+    match if slot = 2 && Bytes.length m.cart > 0 then cart_window m a else None with
+    | Some w ->
+    (* MegaROM: each 8KB window shows the segment its bank register selects
+       ([cart_window] says which window an address falls in). The cart sits in
+       slot 2 (see load_cartridge). *)
     let bank = m.cart_banks.(w) in
     if
       m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
@@ -537,8 +567,8 @@ let mem_read m addr =
       let off = (seg * 0x2000) + (a land 0x1fff) in
       Char.code (Bytes.get m.cart (off mod Bytes.length m.cart))
     end
-  end
-  else begin
+    | None ->
+  begin
     let off = a land 0x3fff in
     match slot with
     | 0 | 1 | 2 ->
@@ -689,63 +719,124 @@ let mem_write m addr v =
   end
 
 (* PSG R#14 = 조이스틱 포트 입력. R#15 bit6 이 포트 선택(0 = 1번), 2번 포트는
-   비어 있다. bit6 = 키배열 점퍼(50on = 0), bit7 = 카세트 입력(0).
-   정본: openMSX MSXPSG::readA, DummyJoystick::read = 0x3F. *)
+   비어 있다. bit6 = 키배열 점퍼(50on = 0), bit7 = 카세트 입력(아래).
+   정본: openMSX MSXPSG::readA, DummyJoystick::read = 0x3F. openMSX 21
+   C-BIOS_MSX2 실측: 테이프 없이 두 포트 모두 0xBF. *)
 let joystick_idle = 0x3f
+
+(* i8255 control word bits (openMSX I8255.cc). Bit 7 set: a mode word.
+   Bit 7 clear: bits 3-1 pick a port C bit and bit 0 sets or clears it. *)
+let ppi_set_mode = 0x80
+let ppi_mode_a = 0x60
+let ppi_mode_b = 0x04
+let ppi_input_a = 0x10
+let ppi_input_b = 0x02
+let ppi_input_c_high = 0x08
+let ppi_input_c_low = 0x01
+
+(* The mode every MSX BIOS sets: port A and C outputs, port B the keyboard
+   input. [create] starts the PPI in it. A real i8255 resets with every
+   port an input (openMSX I8255::reset), but C-BIOS and the NMS 8250 BIOS
+   both write 0x82 to port 0xAB before any other PPI access (openMSX 21.0:
+   at 6.7 us and 31 us), so a BIOS boot cannot tell the two apart. The
+   tests that drive the ports with no BIOS rely on starting here. *)
+let ppi_bios_mode = ppi_set_mode lor ppi_input_b
+
+let ppi_is_input m bit = m.ppi_ctrl land bit <> 0
+
+(* Port C high drives its pins only while it is an output
+   (I8255::outputPortC), after a latch write, a bit set or reset, or a
+   mode word. *)
+let ppi_drive_c_high m =
+  if not (ppi_is_input m ppi_input_c_high) then m.ppi_c_high <- m.ppi_c lsr 4
+
+(* A mode word re-drives the output ports from their latches
+   (I8255::writeControlPort). The pins of a port that turns into an input
+   keep the value they had. *)
+let ppi_write_control m v =
+  if v land ppi_set_mode <> 0 then begin
+    let latch_a = if ppi_is_input m ppi_input_a then m.ppi_latch_a else m.ppi_a in
+    if not (ppi_is_input m ppi_input_c_low) then m.ppi_row <- m.ppi_c land 0x0f;
+    m.ppi_ctrl <- v;
+    if ppi_is_input m ppi_input_a then m.ppi_latch_a <- latch_a else m.ppi_a <- latch_a
+  end else begin
+    let bit = 1 lsl ((v lsr 1) land 7) in
+    m.ppi_c <- if v land 1 <> 0 then m.ppi_c lor bit else m.ppi_c land lnot bit
+  end;
+  ppi_drive_c_high m
+
+(* The keyboard row the port C low pins select: the latch while that half
+   is an output, the value it last drove while it is an input. *)
+let ppi_selected_row m =
+  if ppi_is_input m ppi_input_c_low then m.ppi_row else m.ppi_c land 0x0f
+
+(* Port C bit 4 low runs the cassette motor (openMSX MSXPPI::writeC1). It
+   follows the pins, so the motor stays off until the BIOS first drives
+   port C high: on the NMS 8250, its mode word at cycle 112. *)
+let cassette_motor_bit = 0x1 (* of the port C high nibble *)
+let cassette_motor m = m.ppi_c_high land cassette_motor_bit = 0
+let cassette_input_bit = 0x80
+
+(* The tape moves up to a port C write with the motor as it was. *)
+let cassette_advance m =
+  Option.iter
+    (fun d -> Cassette.advance d ~cycle:(Z80.t_states m.cpu) ~motor:(cassette_motor m))
+    m.cassette
+
+(* With no tape the input reads 1: openMSX's comparator takes a sample >= 0
+   as high, and an empty deck gives silence (0). *)
+let cassette_input m =
+  match m.cassette with
+  | None -> true
+  | Some d -> Cassette.input d ~cycle:(Z80.t_states m.cpu) ~motor:(cassette_motor m)
 
 let psg_read m =
   match m.psg_latch with
-  | 14 -> if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle
+  | 14 ->
+    let joystick = if m.psg.(15) land 0x40 = 0 then m.joy1 else joystick_idle in
+    (joystick land lnot cassette_input_bit)
+    lor (if cassette_input m then cassette_input_bit else 0)
   | r when r < 16 -> m.psg.(r)
   | _ -> 0xff
 
-(* RP5C01 접근 면(openMSX RP5C01.cc peekPort/writePort 정본): 뱅크 = 모드
-   bit0-1, reg 13 은 모드를 그대로, reg 14/15(TEST/RESET) 는 쓰기 전용이라
-   읽으면 0x0F. 뱅크별 니블 마스크는 시계 자릿수의 유효 범위(초 10자리 ≤5
-   등)를 낸다 — 초 1자리(레지스터 0)의 마스크는 0xF 라 0x0A 도 그대로
-   저장되고, sub ROM 의 부트 검증(CP 0x0A)은 이 되돌림을 본다. *)
-let rtc_masks =
-  [| [| 0xf; 0x7; 0xf; 0x7; 0xf; 0x3; 0x7; 0xf; 0x3; 0xf; 0x1; 0xf; 0xf |];
-     [| 0x0; 0x0; 0xf; 0x7; 0xf; 0x3; 0x7; 0xf; 0x3; 0x0; 0x1; 0x3; 0x0 |];
-     Array.make 13 0xf;
-     Array.make 13 0xf |]
+let keyboard_row m row =
+  if row >= key_rows then 0xff
+  else begin
+    let bits = ref 0xff in
+    for b = 0 to 7 do
+      if m.keys.((row * 8) + b) then bits := !bits land lnot (1 lsl b)
+    done;
+    !bits
+  end
 
-let rtc_read_reg m =
-  match m.rtc_reg land 0x0f with
-  | 13 -> m.rtc_mode land 0x0f
-  | 14 | 15 -> 0x0f
-  | r ->
-    let bank = m.rtc_mode land 3 in
-    m.rtc_regs.((bank * 13) + r) land rtc_masks.(bank).(r)
-
-let rtc_write_reg m v =
-  match m.rtc_reg land 0x0f with
-  | 13 -> m.rtc_mode <- v land 0x0f
-  | 14 | 15 -> () (* TEST/RESET: 쓰기 효과(타이머 가속·분수 리셋) 없음 *)
-  | r ->
-    let bank = m.rtc_mode land 3 in
-    m.rtc_regs.((bank * 13) + r) <- (v land 0x0f) land rtc_masks.(bank).(r)
+(* The RP5C01 drives only the low four data lines, so a read of port 0xB5
+   shows the register in the low nibble and 1s above it (openMSX
+   MSXRTC::readIO ORs 0xF0). Port 0xB4 is write-only: the machine maps only
+   0xB5 for input, so a read of 0xB4 finds no device and gets 0xFF. *)
+let rtc_data_high = 0xf0
 
 let port_read m port =
   match port land 0xff with
-  | 0xB4 -> m.rtc_reg land 0x0f
-  | 0xB5 -> rtc_read_reg m
+  | 0xB5 -> Rtc.read m.rtc ~cycle:(Z80.t_states m.cpu) m.rtc_reg lor rtc_data_high
   | 0xD0 | 0xD1 | 0xD2 | 0xD3 -> fdc_read m port
   | 0x98 -> Vdp.io_read m.vdp ~port:0x98
   | 0x99 -> Vdp.io_read m.vdp ~port:0x99
-  | 0xA8 -> m.ppi_a
+  (* openMSX I8255::readPortA/B: mode 1 and 2 read 0xFF, an output port
+     reads its latch, an input reads the device. MSXPPI::peekA is 0; port B
+     is the keyboard row (pressed = 0). *)
+  | 0xA8 ->
+    if m.ppi_ctrl land ppi_mode_a <> 0 then 0xff
+    else if ppi_is_input m ppi_input_a then 0
+    else m.ppi_a
   | 0xA9 ->
-    (* 키보드: PPI C 하위 4비트가 행(0-10), B 가 그 행의 8키 (눌림 = 0). *)
-    let row = m.ppi_c land 0x0f in
-    if row >= key_rows then 0xff
-    else begin
-      let bits = ref 0xff in
-      for b = 0 to 7 do
-        if m.keys.((row * 8) + b) then bits := !bits land lnot (1 lsl b)
-      done;
-      !bits
-    end
-  | 0xAA -> m.ppi_c
+    if m.ppi_ctrl land ppi_mode_b <> 0 then 0xff
+    else if ppi_is_input m ppi_input_b then keyboard_row m (ppi_selected_row m)
+    else m.ppi_b
+  (* readPortC: each input half reads 0xF (MSXPPI::peekC0/C1). *)
+  | 0xAA ->
+    (if ppi_is_input m ppi_input_c_high then 0xf0 else m.ppi_c land 0xf0)
+    lor (if ppi_is_input m ppi_input_c_low then 0x0f else m.ppi_c land 0x0f)
+  | 0xAB -> m.ppi_ctrl
   | 0xFC | 0xFD | 0xFE | 0xFF ->
     m.mapper.(port land 3) lor (lnot (mapper_mask m) land 0xff)
   | 0xA2 -> psg_read m
@@ -771,15 +862,20 @@ let port_write m port v =
     if v = 0x0d then Printf.eprintf "\n%!"
   | 0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xD4 -> fdc_write m port v
   | 0x98 | 0x99 | 0x9A | 0x9B -> Vdp.io_write m.vdp ~port:(port land 0xff) v
-  | 0xA8 -> m.ppi_a <- v land 0xff
-  | 0xAA -> m.ppi_c <- v land 0xff
+  | 0xA8 ->
+    if ppi_is_input m ppi_input_a then m.ppi_latch_a <- v land 0xff
+    else m.ppi_a <- v land 0xff
+  | 0xA9 -> m.ppi_b <- v land 0xff
+  (* Port C bit 4 runs the cassette motor; both ports can change it. *)
+  | 0xAA -> cassette_advance m; m.ppi_c <- v land 0xff; ppi_drive_c_high m
+  | 0xAB -> cassette_advance m; ppi_write_control m (v land 0xff)
   | 0xA0 -> m.psg_latch <- v land 0xff
   | 0xA1 -> if m.psg_latch < 16 then m.psg.(m.psg_latch) <- v land 0xff
   | 0xFC | 0xFD | 0xFE | 0xFF ->
     mapper_writes.(port land 3) <- mapper_writes.(port land 3) + 1;
     m.mapper.(port land 3) <- v land mapper_mask m
   | 0xB4 -> m.rtc_reg <- v land 0xff
-  | 0xB5 -> rtc_write_reg m v
+  | 0xB5 -> Rtc.write m.rtc ~cycle:(Z80.t_states m.cpu) m.rtc_reg v
   | _ -> ()
 
 (* 메모리 쓰기 감시 — write 클로저가 참조하므로 create 보다 앞에. *)
@@ -787,6 +883,14 @@ let watch_mem_on = ref false
 let watch_mem_addrs : int list ref = ref []
 let watch_mem_log : (int * int * int * int) list ref = ref []
 let instr_count = ref 0
+
+(* Every RAM byte reads 0xFF at power-on. openMSX Ram::clear fills RAM with
+   0xFF unless the machine config gives an initialContent pattern, and the
+   C-BIOS machines give none. Eggerland Mystery 2 reads 0xED21 before it
+   writes it and takes another path when the byte is 0x00. Rune Master 1's
+   disk boot ends the same with 0xFF as with the Philips NMS 8250 tile
+   (00 FF)*128 (FF 00)*128 we filled before, and differently with zeros. *)
+let ram_power_on_byte = '\xff'
 
 let create ~machine =
   let main = match machine.roms with x :: _ -> x | [] -> "" in
@@ -824,30 +928,27 @@ let create ~machine =
       bdos_files = Hashtbl.create 4;
       frames = 0;
       rtc_reg = 0;
-      rtc_regs = Array.make 52 0;
-      rtc_mode = 0x8;
+      rtc = Rtc.create ();
       con_esc = 0;
       rst30_pending = [];
       hle_disk = true;
       cart_is_disk_rom = false;
       fdc = fdc_create ();
-      (* 전원 인가 시 RAM 의 실측 패턴(openMSX Philips_NMS_8250 initialContent):
-         (00 FF)*128 (FF 00)*128 의 512 바이트 블록이 전체를 덮는다. 룬마스터
-         1 의 커널 슬롯 프로브는 이 패턴의 보수쌍(byte2 = ~byte1)을 "이 슬롯에
-         신선한 RAM 이 있나" 의 지문으로 쓴다(c611 스캔) — 0 으로 초기화하면
-         (00,00) 쌍만 나와 프로브 16 회 전부 실패, ~270 프레임 재부팅 루프. *)
-      ram = Bytes.init (ram_kb * 1024) (fun i ->
-          let phase = i land 0x1ff in
-          let even = phase land 1 = 0 in
-          if phase < 0x100 = even then '\000' else '\255');
+      ram = Bytes.make (ram_kb * 1024) ram_power_on_byte;
       mapper = Array.make 4 3;
       ppi_a = 0x00;
       ppi_c = 0x00;
+      ppi_ctrl = ppi_bios_mode;
+      ppi_latch_a = 0x00;
+      ppi_b = 0x00;
+      ppi_row = 0;
+      ppi_c_high = 0xf;
       slot3_sel = 0x00;
       keys = Array.make (key_rows * 8) false;
       psg = Array.make 16 0;
       psg_latch = 0;
       joy1 = joystick_idle;
+      cassette = None;
       cpu_ref = m_ref;
     }
   in
@@ -879,11 +980,7 @@ let load_cartridge ?mapper t rom =
      t.cart_sram <- Bytes.make 0x8000 '\000'
    | _ ->
      t.cart_sram_bit <- 0;
-     t.cart_sram <- Bytes.make 0 '\000');
-  (* mem_read 은 카트리지를 슬롯2 페이지0·1 에 둔다. 페이지0 을 슬롯2 로
-     돌리면 BIOS(슬롯0) 를 잃어 부트가 안 되니, 페이지1(bits2-3) 만
-     슬롯2 로 보인다 — C-BIOS 가 0x4000 의 "AB" 헤더를 찾는 자리. *)
-  t.ppi_a <- (t.ppi_a land 0xf3) lor 0x08
+     t.cart_sram <- Bytes.make 0 '\000')
 
 (* --- Disk interface (HLE) -------------------------------------------------
    A game disk boots through a disk interface ROM that rides in the cartridge
@@ -1112,6 +1209,13 @@ let fat12_open t name11 =
     match fat12_find t fs name11 with
     | None -> None
     | Some e -> Some (fat12_read t fs e)
+
+let insert_cassette t cas =
+  match Cassette.of_cas cas with
+  | Error e -> Error e
+  | Ok tape ->
+    t.cassette <- Some (Cassette.insert tape ~cycle:(Z80.t_states t.cpu));
+    Ok ()
 
 let load_disk ?(interface_rom = true) ?(real_rom = false) t dsk =
   t.disk <- Bytes.of_string dsk;
@@ -1990,6 +2094,7 @@ let step t ~frames =
   done
 
 let frame_number t = t.frames
+let set_rtc_time t time = Rtc.set_time t.rtc ~cycle:(Z80.t_states t.cpu) time
 let dump_pc t = Z80.dump_pc t.cpu
 
 let screen_text t =
@@ -2113,8 +2218,7 @@ let serialize t =
   State_codec.put_int w t.cart_sram_bit;
   State_codec.put_int w t.disk_dma;
   State_codec.put_int w t.rtc_reg;
-  State_codec.put_int w t.rtc_mode;
-  State_codec.put_int_array w t.rtc_regs;
+  Rtc.write_registers w t.rtc;
   State_codec.put_int w t.con_esc;
   State_codec.put_int w t.ppi_a;
   State_codec.put_int w t.ppi_c;
@@ -2150,8 +2254,28 @@ let serialize t =
   State_codec.put_int w f.side_reg;
   State_codec.put_int w f.drive_reg;
   State_codec.put_bool w f.intr_fired;
+  (* v4: the i8255 control word and the latches it can expose. *)
+  State_codec.put_int w t.ppi_ctrl;
+  State_codec.put_int w t.ppi_latch_a;
+  State_codec.put_int w t.ppi_b;
+  State_codec.put_int w t.ppi_row;
   Z80.write_state w t.cpu;
   Vdp.write_state w t.vdp;
+  (* v5: the port C high pins, the cassette image and how far its tape has
+     moved. It follows the CPU state because the deck counts CPU cycles
+     from the restored time. *)
+  State_codec.put_int w t.ppi_c_high;
+  (match t.cassette with
+   | None -> State_codec.put_bool w false
+   | Some d ->
+     State_codec.put_bool w true;
+     State_codec.put_bytes w (Bytes.of_string (Cassette.cas (Cassette.tape d)));
+     State_codec.put_int w
+       (Cassette.position d ~cycle:(Z80.t_states t.cpu) ~motor:(cassette_motor t)));
+  (* v6: the RTC's test register, fraction of a second and last counted
+     tick. It follows the CPU state because the tick is a point on the CPU
+     clock and is checked against it on restore. *)
+  Rtc.write_clock w t.rtc;
   State_codec.finish w
 
 let restore_with_reader reader state =
@@ -2183,10 +2307,7 @@ let restore_with_reader reader state =
     t.cart_sram_bit <- State_codec.get_int r ~min:0 ~max:max_int;
     t.disk_dma <- State_codec.get_int r ~min:0 ~max:65535;
     t.rtc_reg <- State_codec.get_int r ~min:0 ~max:255;
-    if State_codec.version r >= 2 then begin
-      t.rtc_mode <- State_codec.get_int r ~min:0 ~max:15;
-      State_codec.fill_int_array r ~min:0 ~max:15 t.rtc_regs
-    end;
+    if State_codec.version r >= 2 then Rtc.read_registers r t.rtc;
     t.con_esc <- State_codec.get_int r ~min:0 ~max:3;
     t.ppi_a <- State_codec.get_int r ~min:0 ~max:255;
     t.ppi_c <- State_codec.get_int r ~min:0 ~max:255;
@@ -2230,8 +2351,34 @@ let restore_with_reader reader state =
       f.drive_reg <- State_codec.get_int r ~min:0 ~max:255;
       f.intr_fired <- State_codec.get_bool r
     end;
+    (* Before v4 the PPI had no control word and always behaved as the
+       BIOS's 0x82 sets it: port A and C outputs, port B the keyboard. *)
+    if State_codec.version r >= 4 then begin
+      t.ppi_ctrl <- State_codec.get_int r ~min:ppi_set_mode ~max:255;
+      t.ppi_latch_a <- State_codec.get_int r ~min:0 ~max:255;
+      t.ppi_b <- State_codec.get_int r ~min:0 ~max:255;
+      t.ppi_row <- State_codec.get_int r ~min:0 ~max:15
+    end else t.ppi_ctrl <- ppi_bios_mode;
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
+    (* Before v5 nothing read the port C high pins. A state saved after the
+       BIOS set up the PPI has them equal to the latch; one saved with port
+       C high as an input may not, but such a state has no tape either. *)
+    t.ppi_c_high <-
+      (if State_codec.version r >= 5 then State_codec.get_int r ~min:0 ~max:15
+       else t.ppi_c lsr 4);
+    if State_codec.version r >= 5 && State_codec.get_bool r then begin
+      let tape =
+        match Cassette.of_cas (Bytes.to_string (State_codec.get_bytes r)) with
+        | Ok tape -> tape
+        | Error e -> State_codec.fail ("invalid saved cassette: " ^ e)
+      in
+      let position = State_codec.get_int r ~min:0 ~max:(Cassette.end_position tape) in
+      t.cassette <- Some (Cassette.resume tape ~position ~cycle:(Z80.t_states t.cpu))
+    end;
+    let cycle = Z80.t_states t.cpu in
+    if State_codec.version r >= 6 then Rtc.read_clock r t.rtc ~cycle
+    else Rtc.start_clock t.rtc ~cycle;
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message
