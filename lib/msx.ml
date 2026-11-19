@@ -1522,6 +1522,32 @@ let serve_rst30 t =
     (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
   addr
 
+(* A slot id as RDSLT, WRSLT, CALSLT and ENASLT take it: bits 1..0 the primary
+   slot, and for an expanded slot 3 bit 7 set with bits 3..2 the sub-slot.
+   Slot 0 is not recognised: 0x00 is also what a stream read passes in A. *)
+let is_slot_id a = a >= 1 && (a land 0x80 <> 0 || a land 3 <> 0)
+
+(* Runs [f] with the page holding [addr] showing the slot [slot] names, then
+   puts the slot registers back. *)
+let with_slot_view t ~slot ~addr f =
+  let shift = ((addr lsr 14) land 3) * 2 in
+  let primary = slot land 3 and sub = (slot lsr 2) land 3 in
+  let saved_ppi = t.ppi_a and saved_sl3 = t.slot3_sel in
+  t.ppi_a <- (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor (primary lsl shift);
+  if primary = 3 then
+    t.slot3_sel <- (t.slot3_sel land lnot (3 lsl shift)) lor (sub lsl shift);
+  let r = f () in
+  t.ppi_a <- saved_ppi;
+  t.slot3_sel <- saved_sl3;
+  r
+
+(* Returns from a vector served in OCaml: pops the return address. *)
+let return_from_vector t =
+  let sp = Z80.dump_sp t.cpu in
+  let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+  Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+  Z80.set_pc t.cpu ret
+
 (* CALSLT (BIOS 0x001C) served in OCaml for the warm-up replay, where page 0
    is RAM and the real BIOS entry is not visible. Contract per the C-BIOS
    source: IY high byte = target slot in RDSLT's A format (0x80 | sub<<2 |
@@ -1570,6 +1596,23 @@ let disk_trap t pc =
     Z80.set_pc t.cpu (serve_calslt t);
     true
   end
+  else if pc = 0x0014 && t.ppi_a land 3 = 3 && is_slot_id (Z80.dump_a t.cpu) then begin
+    (* WRSLT: A = slot id, HL = address, E = byte. Rune Master 1's slot scan
+       (c5ab, run before it loads its own kernel) tests every slot for RAM
+       by writing the complement of what it read and reading it back, through
+       CALL 0x000C / 0x0014. On the real machine page 0 is RAM then, and
+       those two vectors are RDSLT and WRSLT copies the disk ROM's DOS
+       kernel put there (openMSX: the writes at 0x0C and 0x14 come from
+       pc 0x5A91 in the disk ROM). Slot 3-2 passes the test at 0x0000,
+       0x1000, 0x2000 and 0x3000; the scan records it in c702..c705. A scan
+       that finds no RAM leaves the page-1 slot at 0 and the kernel leaves
+       for BASIC, which C-BIOS does not have: the boot restarts in a loop. *)
+    let slot = Z80.dump_a t.cpu and hl = Z80.dump_hl t.cpu in
+    let e = Z80.dump_de t.cpu land 0xff in
+    with_slot_view t ~slot ~addr:hl (fun () -> mem_write t hl e);
+    return_from_vector t;
+    true
+  end
   else if pc = 0x000c && t.ppi_a land 3 = 3 then begin
     (* sec3 커널(룬마스터)의 1바이트 읽기 벡터. 실기는 디스크 인터럽트
        핸들러가 A'(ex af,af') 로 읽은 바이트를 싣고 c1d4 의 얕은 복귀가
@@ -1590,67 +1633,16 @@ let disk_trap t pc =
        HL,BC / LD (0xC70A),HL -- and C709 is (re)computed per call from
        the caller's C (LD A,1 / CP C / JR C,+1 / LD A,C / LD (0xC709),A):
        1 when C>1, else C). Without the advance every call returns the
-       same byte, and the loader's slot probe -- a scan for four
-       consecutive complement pairs (byte2 = ~byte1, at c611) read through
-       raw CALL 0x000C -- can never match, so all 16 probes fail and the
-       kernel reboots in a ~270-frame loop (Rune Master 1 observed). *)
+       same byte. *)
     let off = mem_read t 0xc70a lor (mem_read t 0xc70b lsl 8) in
     let slot_probe = Z80.dump_a t.cpu in
-    if slot_probe >= 1 && (slot_probe land 0x80 <> 0 || slot_probe land 3 <> 0) then begin
-      (* The slot-probe face of the vector: the scanner (c611) calls with
-         A = the candidate slot id (c5f1's 0x80|sub<<2|primary) and HL = the
-         page base, and reads (base + offset) through THAT slot's view --
-         the real c1f5 saves A to C714 (c1bc) and its deep path reads the
-         probed slot, not the DTA. The pairs must be consecutive (the c70A
-         advance) so the complement scan can see fresh RAM's 00 FF
-         pattern. Reading a foreign view: point the page's PPI bits at the
-         primary slot (and slot3's sub-selector) for one read, then
-         restore. *)
+    if is_slot_id slot_probe then begin
+      (* RDSLT: A = slot id, HL = address; the byte comes back in A. The
+         other half of the slot scan WRSLT (0x0014) describes. *)
       let hl = Z80.dump_hl t.cpu in
-      let page = (hl lsr 14) land 3 in
-      let shift = page * 2 in
-      let primary = slot_probe land 3 in
-      let sub = (slot_probe lsr 2) land 3 in
-      let saved_ppi = t.ppi_a and saved_sl3 = t.slot3_sel in
-      let v =
-        if primary = 3 && sub = 2 && Bytes.length t.disk > 0 then
-          (* Reading through the disk interface's own slot: the real
-             vector's deep path (c38f/c3e5/c535 after the c1bc context
-             save) reaches the FDC's data path, not this slot's ROM bytes.
-             The loader's stream position -- the DTA buffer at the c70A
-             offset -- is the closest observable equivalent. The remaining
-             divergence (the c611 complement-pair scan reads kernel
-             scratch here, so all 16 probes fail and the kernel reboots
-             in a ~270-frame loop) is the FDC byte-pump protocol of the
-             real NMS8250 disk ROM: unobservable without that ROM, and
-             C-BIOS's own disk ROM cannot boot this game at all (openMSX
-             21 + cbios_disk.rom falls back to the BASIC screen -- no
-             reference run exists). Diagnostic note: forcing a complement
-             pair here (00/ff by offset parity) unlocks the game past the
-             probe -- it then runs its bytecode VM at 0x74xx with a blank
-             screen, waiting on data conditions -- so this serving is the
-             only blocker, not a structural one. *)
-          mem_read t ((t.disk_dma + off) land 0xffff)
-        else begin
-          t.ppi_a <-
-            (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor (primary lsl shift);
-          if primary = 3 then
-            t.slot3_sel <-
-              (t.slot3_sel land lnot (3 lsl shift))
-              lor (sub lsl shift);
-          let b = mem_read t ((hl + off) land 0xffff) in
-          t.ppi_a <- saved_ppi;
-          t.slot3_sel <- saved_sl3;
-          b
-        end
-      in
-      mem_write t 0xc70a ((off + 1) land 0xff);
-      mem_write t 0xc70b (((off + 1) lsr 8) land 0xff);
+      let v = with_slot_view t ~slot:slot_probe ~addr:hl (fun () -> mem_read t hl) in
       Z80.set_af t.cpu ((v lsl 8) lor Z80.dump_f t.cpu);
-      let sp = Z80.dump_sp t.cpu in
-      let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
-      Z80.set_sp t.cpu ((sp + 2) land 0xffff);
-      Z80.set_pc t.cpu ret;
+      return_from_vector t;
       true
     end
     else begin
@@ -2026,20 +2018,6 @@ let disk_trap t pc =
           for i = 0 to n - 1 do
             mem_write t i (mem_read t ((t.disk_dma + i) land 0xffff))
           done;
-          (* This kernel hardcodes CALL 0x0014 (Rune Master's load loop at
-             c641 reads sectors through the 0x000C/0x0014 primitive pair),
-             but the 3-byte table's entries land on 0x0015 boundaries, so at
-             0x0014 the copied bytes read c3 c3 8c = JP 0x8CC3 -- empty RAM.
-             A real boot's page 0 also carries the 8-byte-spaced vector set
-             (0x000C/0x0014/0x001C/0x0024, the MSX-DOS layout) alongside
-             this table, and the entry 0x0014 must reach is the table's
-             0x0015 one (Rune Master: JP 0xC38C, its DSKRST + SETDTA(0xC728)
-             wrapper -- itself real code already loaded at 0xC38C). Plant it
-             one byte early. Rune Master II's boot never calls 0x0014, so
-             this is inert there. *)
-          mem_write t 0x0014 (mem_read t ((t.disk_dma + 0x15) land 0xffff));
-          mem_write t 0x0015 (mem_read t ((t.disk_dma + 0x16) land 0xffff));
-          mem_write t 0x0016 (mem_read t ((t.disk_dma + 0x17) land 0xffff))
         end;
         0x00
       | 0x27 -> (
