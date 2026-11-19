@@ -122,12 +122,14 @@ let () =
   check "16x16: row 1 clear" (is_col t 50 102 0)
 
 let () =
-  (* 6. EC(컬러 bit7): X 를 16px 왼쪽으로 *)
+  (* 6. EC(컬러 bit7): X 를 32px 왼쪽으로 *)
   let t = Vdp.create () in
   screen1 t ();
   pat8_w t 0 [ 0xff; 0xff; 0xff; 0xff; 0xff; 0xff; 0xff; 0xff ];
   sat_w t 0 100 50 0 (0x80 lor 9);
-  check "EC: (34,101) set (x-16)" (is_col t 34 101 9);
+  check "EC: (18,101) set (x-32)" (is_col t 18 101 9);
+  check "EC: (25,101) set (x-32+7)" (is_col t 25 101 9);
+  check "EC: (34,101) clear (not x-16)" (is_col t 34 101 0);
   check "EC: (50,101) clear" (is_col t 50 101 0)
 
 let () =

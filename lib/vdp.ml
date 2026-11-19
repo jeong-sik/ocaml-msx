@@ -528,7 +528,7 @@ let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
    SIZE(16×16). 맨 윗줄은 Y+1 줄이고(Y=0xFF 가 0번 줄), 줄 번호는
    256 으로 돌아 나가 Y=0xF0 의 16×16 은 아랫부분 한 줄만 0번 줄에 걸린다.
    Y=0xD0 인 엔트리부터 뒤는 없다. 컬러 0 은 투명, 컬러 bit7(EC) 은
-   X 를 16px 왼쪽으로 민다. 우선순위는 번호가 낮은 쪽이 위 — 큰 번호부터
+   X 를 32px 왼쪽으로 민다(openMSX 와 같은 최소 ROM 으로 확인). 우선순위는 번호가 낮은 쪽이 위 — 큰 번호부터
    그린다. 라인당 표시 제한(4/8)과 5th-sprite·충돌 플래그(S#0 bit6/5)
    는 아직 없다. *)
 let render_sprites t ~w ~h put =
@@ -559,7 +559,7 @@ let render_sprites t ~w ~h put =
       let top = (vr e + 1) land 0xff and x_raw = vr (e + 1) in
       let pat = vr (e + 2) and col = vr (e + 3) in
       let c = col land 0x0f in
-      let x0 = if col land 0x80 <> 0 then x_raw - 16 else x_raw in
+      let x0 = if col land 0x80 <> 0 then x_raw - 32 else x_raw in
       if c <> 0 then
         let pbase =
           pt + (if size16 then (pat land 0xfc) * pat_len else pat * pat_len)
