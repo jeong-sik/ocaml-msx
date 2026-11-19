@@ -148,6 +148,9 @@ let () =
   end;
   (try Unix.mkdir !out_dir 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   Msx.set_disk_call_log !trace_disk;
+  let env_on name = match Sys.getenv_opt name with Some v -> v <> "" | None -> false in
+  Msx.set_fdc_trace (env_on "FDC_TRACE");
+  Msx.set_ppi_trace (env_on "PPI_TRACE");
   let initial_frame = Msx.frame_number t in
   List.iter (fun e ->
     if e.at < initial_frame then failwith "ledger entry predates initial machine state";
