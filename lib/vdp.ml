@@ -358,13 +358,18 @@ let prefetch t =
   t.read_buf <- read_vram t (cpu_addr t);
   increment_addr t
 
+(* Port 0x99 takes two bytes, and the VDP drops a first byte left waiting
+   when the CPU writes port 0x98 or reads port 0x98 or 0x99 (openMSX
+   VDP::writeIO case 0 and VDP::readIO clear registerDataStored). The next
+   0x99 byte is then a first byte again. *)
 let io_write t ~port v =
   log_w t (port land 0xff) t.addr v;
   match port with
   | 0x98 ->
     write_vram t (cpu_addr t) v;
     t.read_buf <- v land 0xff;
-    increment_addr t
+    increment_addr t;
+    t.latch_first <- true
   | 0x99 ->
     if t.latch_first then begin
       t.latch_lo <- v land 0xff;
@@ -405,6 +410,7 @@ let io_read t ~port =
   | 0x98 ->
     let v = t.read_buf in
     prefetch t;
+    t.latch_first <- true;
     v
   | 0x99 ->
     let s =

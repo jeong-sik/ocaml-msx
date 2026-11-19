@@ -10,12 +10,53 @@ let watch_mem = ref ""
 let cart = ref ""
 let disk = ref ""
 let disk_warm = ref false
+let rtc_time = ref ""
 let disk_real = ref false
 let cart_mapper = ref ""
 let rom_db = ref ""
 let tap_space : int list ref = ref []
 let tap_keys : (int * Msx.key) list ref = ref []
 let tap_key_spec = ref ""
+let cas = ref ""
+
+(* --type F:TEXT presses each character for [type_hold] frames, one
+   character every [type_period] frames from frame F. A capital letter or
+   a shifted character presses SHIFT with its key (international layout);
+   CR or LF is RETURN.
+   The BIOS reads the keyboard every third interrupt, 3.6 frames apart at
+   50 Hz, so a press and a release each last longer than that. *)
+let type_period = 10
+let type_hold = 5
+let typed : (int * Msx.key * bool) list ref = ref []
+
+let shifted =
+  [ ('!', '1'); ('@', '2'); ('#', '3'); ('$', '4'); ('%', '5'); ('^', '6');
+    ('&', '7'); ('*', '8'); ('(', '9'); (')', '0'); ('_', '-'); ('+', '=');
+    ('|', '\\'); ('{', '['); ('}', ']'); (':', ';'); ('"', '\''); ('~', '`');
+    ('<', ','); ('>', '.'); ('?', '/') ]
+
+let keys_of_char = function
+  | '\r' | '\n' -> [ Msx.Return ]
+  | 'A' .. 'Z' as c -> [ Msx.Shift; Msx.Char c ]
+  | c -> (
+    match List.assoc_opt c shifted with
+    | Some base -> [ Msx.Shift; Msx.Char base ]
+    | None -> [ Msx.Char c ])
+
+let parse_type spec =
+  match String.index_opt spec ':' with
+  | None -> Printf.ksprintf failwith "bad --type %s: expected F:TEXT" spec
+  | Some i ->
+    let start = int_of_string (String.sub spec 0 i) in
+    let text = String.sub spec (i + 1) (String.length spec - i - 1) in
+    List.concat
+      (List.mapi
+         (fun n c ->
+           let f = start + (n * type_period) in
+           let keys = keys_of_char c in
+           List.map (fun k -> (f, k, true)) keys
+           @ List.map (fun k -> (f + type_hold, k, false)) keys)
+         (List.of_seq (String.to_seq text)))
 
 let key_of_name = function
   | "up" -> Msx.Up | "down" -> Msx.Down
@@ -57,6 +98,26 @@ let count_nonblack rgb =
     rgb;
   !n
 
+(* --rtc-time: "host" reads the host's local clock; a fixed
+   YYYY-MM-DDTHH:MM:SS keeps runs repeatable. *)
+let parse_rtc_time spec =
+  let host () =
+    let tm = Unix.localtime (Unix.time ()) in
+    Rtc.time ~year:(tm.tm_year + 1900) ~month:(tm.tm_mon + 1) ~day:tm.tm_mday
+      ~hour:tm.tm_hour ~minute:tm.tm_min ~second:tm.tm_sec
+  in
+  let fixed () =
+    match
+      Scanf.sscanf_opt spec "%4d-%2d-%2dT%2d:%2d:%2d%!"
+        (fun year month day hour minute second -> Rtc.time ~year ~month ~day ~hour ~minute ~second)
+    with
+    | Some result -> result
+    | None -> Error "expected host or YYYY-MM-DDTHH:MM:SS"
+  in
+  match (if spec = "host" then host () else fixed ()) with
+  | Ok time -> time
+  | Error e -> Printf.ksprintf failwith "--rtc-time %s: %s" spec e
+
 let read_file p =
   let ic = open_in_bin p in
   let n = in_channel_length ic in
@@ -70,12 +131,19 @@ let () =
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
       ("--disk", Arg.Set_string disk, "PATH  플로피 이미지(.dsk) — 드라이브 A.");
+      ( "--rtc-time",
+        Arg.Set_string rtc_time,
+        "host|YYYY-MM-DDTHH:MM:SS  RTC 시작 시각 (없으면 00-00-00 00:00:00)" );
+      ("--cas", Arg.Set_string cas, "PATH  카세트 이미지(.cas) — 감아 둔 채 넣는다.");
+      ( "--type",
+        Arg.String (fun spec -> typed := !typed @ parse_type spec),
+        "F:TEXT  프레임 F 부터 글자를 친다 (10프레임마다 한 글자, 5프레임 누름)" );
       ( "--disk-warm",
         Arg.Set disk_warm,
         "  720프레임 워밍업 뒤 Disk ROM 2차 호출 재생 (게임 화면 경로)" );
       ( "--disk-real",
         Arg.Set disk_real,
-        "  실 디스크 ROM 코드를 cart 에 (DISK_ROM env 로 경로, 기본 cbios_disk)" );
+        "  실 디스크 ROM 코드를 cart 에 (DISK_ROM env 로 경로, 기본 --roms 의 cbios_disk.rom)" );
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
         "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc|koei" );
@@ -95,6 +163,9 @@ let () =
       ("--out", Arg.String (fun s -> out_prefix := s), "PREFIX  덤프 접두어") ]
     (fun _ -> ())
     "boot — C-BIOS 부트";
+  let env_on name = match Sys.getenv_opt name with Some v -> v <> "" | None -> false in
+  Msx.set_fdc_trace (env_on "FDC_TRACE");
+  Msx.set_ppi_trace (env_on "PPI_TRACE");
   let roms =
     List.map
       (fun f -> read_file (Filename.concat !rom_dir f))
@@ -103,6 +174,7 @@ let () =
   let t =
     Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms }
   in
+  if !rtc_time <> "" then Msx.set_rtc_time t (parse_rtc_time !rtc_time);
   (* [begin..end] bounds the then-branch: without it the [let mapper = .. in]
      swallows every following statement (run loop, prints), so a no-cart boot
      (BIOS only or disk) ran nothing and exited silently. *)
@@ -130,8 +202,25 @@ let () =
     Msx.load_cartridge ?mapper t rom;
     Printf.printf "cart mapper=%s (%s)\n" (Rom_db.mapper_name (Msx.cart_mapper t)) source
   end;
+  (if !cas <> "" then
+     match Msx.insert_cassette t (read_file !cas) with
+     | Ok () -> ()
+     | Error e -> Printf.ksprintf failwith "--cas %s: %s" !cas e);
   if !disk <> "" then begin
-    Msx.load_disk ~interface_rom:(not !disk_warm) ~real_rom:!disk_real t (read_file !disk);
+    let disk_rom =
+      if not !disk_real then None
+      else begin
+        let path =
+          match Sys.getenv_opt "DISK_ROM" with
+          | Some path -> path
+          | None -> Filename.concat !rom_dir "cbios_disk.rom"
+        in
+        match Msx.disk_rom_of_string (read_file path) with
+        | Ok rom -> Some rom
+        | Error e -> Printf.ksprintf failwith "--disk-real %s: %s" path e
+      end
+    in
+    Msx.load_disk ~interface_rom:(not !disk_warm) ?disk_rom t (read_file !disk);
     if !tap_key_spec <> "" then tap_keys := parse_tap_keys !tap_key_spec;
   Msx.set_disk_call_log true
   end;
@@ -184,6 +273,11 @@ let () =
           if !ridx = f then ignore (Msx.set_key t k ~pressed:true);
           if !ridx = f + 5 then ignore (Msx.set_key t k ~pressed:false))
         !tap_keys;
+      List.iter
+        (fun (f, k, down) ->
+          if !ridx = f && not (Msx.set_key t k ~pressed:down) then
+            failwith "--type: a character has no key on the international layout")
+        !typed;
       ring.(!ridx land 63) <- Msx.dump_pc t;
       incr ridx;
       let dlo, dhi =
