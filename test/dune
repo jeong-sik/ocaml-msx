@@ -119,6 +119,11 @@
  (libraries msx))
 
 (test
+ (name rom_db_test)
+ (modules rom_db_test)
+ (libraries msx))
+
+(test
  (name ym2413_test)
  (modules ym2413_test)
  (deps ym2413/events.txt ym2413/nukeykt.txt)
@@ -128,6 +133,11 @@
  (name z80_timing_test)
  (modules z80_timing_test)
  (libraries z80core))
+
+(test
+ (name frame_clock_test)
+ (modules frame_clock_test)
+ (libraries msx))
 
 (test
  (name vdp_reg_test)
