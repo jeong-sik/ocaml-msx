@@ -1550,6 +1550,15 @@ let serve_calslt t =
   end;
   target
 
+(* True while the byte the CPU would fetch at [addr] is still a power-on fill
+   (0x00 or 0xFF), i.e. nothing was ever planted there. A program that owns
+   page 0 and runs its own code across a BIOS vector address (Europa Sensen's
+   bootstrap executes LD BC,0080 at 0x0156) is not calling the BIOS; its
+   bytes there are not a fill. *)
+let page0_byte_untouched t addr =
+  let b = mem_read t addr in
+  b = 0x00 || b = 0xff
+
 (* Serviced in the step loop before the opcode at [pc] runs. Returns true when
    [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
 let disk_trap t pc =
@@ -1682,7 +1691,8 @@ let disk_trap t pc =
   else if t.ppi_a land 3 = 3
           && (match pc with
               | 0x009c | 0x009f | 0x00a2 | 0x0156 | 0x00d5 | 0x00d8 | 0x0141 -> true
-              | _ -> false) then begin
+              | _ -> false)
+          && page0_byte_untouched t pc then begin
     (* BIOS fixed-page-0 vectors -- CHSNS 0x009C, CHGET 0x009F, CHPUT 0x00A2,
        and 0x0156 (task-1564): some disk kernels call them with a plain CALL
        instead of CALSLT/RST 30h, assuming page 0 still shows BIOS.
@@ -1700,10 +1710,13 @@ let disk_trap t pc =
        30h's inline descriptor, a plain CALL needs no target/slot to parse,
        so this just flips ppi_a and lets the step loop fetch the real BIOS
        opcode that is now at [pc] in the same cycle (no set_pc, no synthetic
-       18 T-states). No byte-guard on the RAM content: a power-on pattern
-       byte at the vector is not an installed vector -- it is exactly the
-       broken shape this trap exists for, and with page 0 deliberately
-       mapped to RAM, a plain CALL to a fixed BIOS vector has one meaning.
+       18 T-states). The one guard on the RAM content is that the byte at the
+       vector is still a power-on fill ([page0_byte_untouched]): a fill byte
+       is not an installed vector -- it is exactly the broken shape this trap
+       exists for, and with page 0 deliberately mapped to RAM, a plain CALL to
+       a fixed BIOS vector then has one meaning. Any other byte is the
+       program's own code (Europa Sensen's bootstrap runs through 0x0156 as
+       straight-line code), and it keeps running.
 
        SNSMAT 0x0141, GTSTCK 0x00D5 and GTTRIG 0x00D8 (ocaml-msx#51) join the
        same list: all three are fixed page-0 entries, and together they are the
