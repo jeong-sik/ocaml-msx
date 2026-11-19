@@ -588,6 +588,7 @@ let frame_dims t =
   match display_mode t with
   | Graphic4 | Graphic5 | Graphic6 | Graphic7 ->
       ((bitmap_layout t).width, if t.regs.(9) land 0x80 = 0 then 192 else 212)
+  | Text2 -> (512, if t.regs.(9) land 0x80 = 0 then 192 else 212)
   | _ -> (256, 192)
 
 let frame_rgb t =
@@ -619,6 +620,35 @@ let frame_rgb t =
             Bytes.set img (i + 1) (Char.chr (((color lsr 5) land 7) * 255 / 7));
             Bytes.set img (i + 2) (Char.chr ((color land 3) * 255 / 3))
           end else put x y color
+        done
+      done
+    end
+    else if display_mode t = Text2 then begin
+      (* TEXT2: 80 columns of 6×8 cells in a 512-wide frame, 16px of R#7
+         background on each side. The name table is 80 bytes a row at
+         (R#2 bits 6-2) × 0x400; with LN (R#9 bit 7) the 212 lines show 26.5
+         rows, the last one cut. The blink colour table (R#3, R#10, R#12,
+         R#13) is not drawn. *)
+      let nt = (r.(2) land 0x7c) lsl 10 in
+      let pt = (r.(4) land 0x3f) lsl 11 in
+      let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
+      for y = 0 to h - 1 do
+        for x = 0 to 15 do put x y bg done;
+        for x = w - 16 to w - 1 do put x y bg done
+      done;
+      for row = 0 to ((h + 7) / 8) - 1 do
+        for col = 0 to 79 do
+          let ch = vr (nt + row * 80 + col) in
+          for py = 0 to 7 do
+            let y = row * 8 + py in
+            if y < h then begin
+              let pat = vr (pt + ch * 8 + py) in
+              for px = 0 to 5 do
+                let x = 16 + col * 6 + px in
+                if (pat lsr (7 - px)) land 1 = 1 then put x y fg else put x y bg
+              done
+            end
+          done
         done
       done
     end
