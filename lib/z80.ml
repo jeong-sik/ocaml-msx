@@ -33,6 +33,9 @@ type t = {
   mutable halted : bool;
   mutable after_ei : bool;
   mutable t : int;
+  (* Wait states added to every M1 (opcode fetch) cycle. 0 is the bare Z80
+     the zexall and trace harnesses measure; an MSX inserts 1. *)
+  m1_wait : int;
   rb : int -> int;
   wb : int -> int -> unit;
   pin : int -> int;
@@ -50,7 +53,7 @@ let m16 x = x land 0xffff
 let power_on_byte = 0xff
 let power_on_word = 0xffff
 
-let create ~read ~write ~port_in ~port_out =
+let create ~m1_wait ~read ~write ~port_in ~port_out =
   let v = power_on_byte in
   {
     a = v; f = v; b = v; c = v; d = v; e = v; h = v; l = v;
@@ -61,6 +64,7 @@ let create ~read ~write ~port_in ~port_out =
     halted = false;
     after_ei = false;
     t = 0;
+    m1_wait;
     rb = read;
     wb = write;
     pin = port_in;
@@ -352,7 +356,13 @@ let io_block_flags z ~v ~k =
     sz53 z.b lor ((v land 0x80) lsr 6) lor (if k > 0xff then 0x11 else 0)
     lor parity ((k land 7) lxor z.b)
 
-let inc_r z = z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f)
+(* One M1 cycle: R counts it and the machine's M1 wait state is charged.
+   R and the wait both follow M1, so an opcode, each prefix (CB, ED, DD,
+   FD) and a HALT repetition each count once; the displacement and the
+   final opcode of DD CB d op are plain reads (openMSX CPUCore incR). *)
+let inc_r z =
+  z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
+  add_t z.m1_wait
 
 let rec exec z op p =
   match op with
@@ -360,10 +370,11 @@ let rec exec z op p =
   | 0xDD -> inc_r z; exec z (fetch z) IXp
   | 0xFD -> inc_r z; exec z (fetch z) IYp
   | 0xCB ->
-    (* DDCB/FDCB 은 [CB d op]: 변위를 먼저 읽고 opcode 가 나중. *)
-    inc_r z;
+    (* DDCB/FDCB 은 [CB d op]: 변위를 먼저 읽고 opcode 가 나중. 그 op 는
+       M1 이 아니라 메모리 읽기라 R 을 올리지 않는다: DD CB d op 의 R 은
+       2 다 (Sean Young, "The Undocumented Z80 Documented" 6.1). *)
     (match p with
-     | No -> cb_exec z (fetch z) No None
+     | No -> inc_r z; cb_exec z (fetch z) No None
      | IXp | IYp ->
        let a = m16 (idx_reg z p + disp8 z) in
        cb_exec z (fetch z) p (Some a))
@@ -833,27 +844,39 @@ and main_exec z op p =
 
 let step z =
   dt := 0;
-  if z.halted then begin z.t <- z.t + 4; 4 end
+  inc_r z;
+  if z.halted then
+    (* HALT 는 NOP 을 되풀이한다: M1 마다 R 이 오른다 (openMSX advanceHalt). *)
+    add_t 4
   else begin
-    z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
     let op = fetch z in
     exec z op No;
     (* 이 명령이 EI 였으면 그 명령 자체는 INT 를 못 받는다 —
        다음 step 에서 플래그를 소비한다. *)
-    if not (op = 0xFB) then z.after_ei <- false;
-    z.t <- z.t + !dt;
-    !dt
-  end
+    if not (op = 0xFB) then z.after_ei <- false
+  end;
+  z.t <- z.t + !dt;
+  !dt
+
+(* Interrupt acknowledge, wait states included (openMSX Z80.hh CC_IRQ0,
+   CC_IRQ1 = 7+3+3, CC_IRQ2 = 7+3+3+3+3). IM 0 runs the RST 38h an idle
+   bus (0xFF) supplies. *)
+let irq_cycles_rst = 13
+let irq_cycles_vector = 19
 
 let interrupt z =
   (* HALT 는 인터럽트가 아니어도 깨어난다 (VBlank 대기 루프). *)
   z.halted <- false;
-  if (not z.iff1) || z.after_ei then false
+  if (not z.iff1) || z.after_ei then 0
   else begin
-    (match z.im with
+    (* The acknowledge cycle is an M1: R counts it. *)
+    z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
+    let cycles =
+    match z.im with
      | 0 | 1 ->
        push z z.pc;
-       z.pc <- 0x38
+       z.pc <- 0x38;
+       irq_cycles_rst
      | _ ->
        (* IM2: 벡터 테이블에서 핸들러 주소를 읽는다 — I<<8 | 데이터 버스
           (아무것도 올리지 않으면 0xFF). 실기 Z80 은 그 주소의 word 를
@@ -864,10 +887,13 @@ let interrupt z =
        let lo = z.rb vec in
        let hi = z.rb (m16 (vec + 1)) in
        push z z.pc;
-       z.pc <- (hi lsl 8) lor lo);
+       z.pc <- (hi lsl 8) lor lo;
+       irq_cycles_vector
+    in
     z.iff1 <- false;
     z.iff2 <- false;
-    true
+    z.t <- z.t + cycles;
+    cycles
   end
 
 let write_state w z =
