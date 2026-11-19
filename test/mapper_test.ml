@@ -92,9 +92,12 @@ let ascii16 () =
   check "ascii16 0x7000 low half is seg6" (win t 0x8000 = 6);
   check "ascii16 0x7000 high half is seg7" (win t 0xA000 = 7)
 
-(* A ROM whose code writes to the given register addresses via [ld (nn),a]. *)
+(* A 64KB ROM whose code writes to the given register addresses via
+   [ld (nn),a]. It starts with an "AB" header, as a MegaROM's segment 0 does:
+   a 64KB ROM without one is plain (openMSX RomFactory). *)
 let rom_with_writes addrs =
   let b = Bytes.of_string (synth 8) in
+  Bytes.blit_string "AB" 0 b 0 2;
   List.iteri
     (fun i addr ->
       let p = 0x100 + (i * 3) in
@@ -120,6 +123,8 @@ let detection () =
      = Msx.Ascii8_sram);
   check "ascii16 from 0x6000/0x7000"
     (Msx.guess_mapper (rom_with_writes [ 0x6000; 0x7000 ]) = Msx.Ascii16);
+  check "a 64KB rom without a header at its first byte is plain"
+    (Msx.guess_mapper (synth 8) = Msx.Flat);
   (* a flat 32KB cart reads through the flat path, not a bank register *)
   let t = machine () in
   Msx.load_cartridge t (synth 4);
@@ -146,13 +151,154 @@ let koei_sram () =
   Msx.mem_write t 0x7000 0x20;
   check "koei sram retained across bank switch" (win t 0x8000 = 0xab)
 
+(* Plain ROMs (openMSX RomPlain, type Mirrored). Each 8KB page of the file
+   holds its own index at offset 0x100; the "AB" header at file offset
+   [header] with routine pointers [ptrs] (INIT, STATEMENT, ...) decides where
+   the ROM starts. All four CPU pages are switched to slot 2 and each 8KB page
+   is read at +0x100. *)
+let plain_rom ~size ~header ptrs =
+  let b = Bytes.make size '\000' in
+  for p = 0 to (size / 0x2000) - 1 do
+    Bytes.set b ((p * 0x2000) + 0x100) (Char.chr p)
+  done;
+  Bytes.blit_string "AB" 0 b header 2;
+  List.iteri
+    (fun i ptr ->
+      Bytes.set b (header + 2 + (2 * i)) (Char.chr (ptr land 0xff));
+      Bytes.set b (header + 3 + (2 * i)) (Char.chr (ptr lsr 8)))
+    ptrs;
+  Bytes.to_string b
+
+let plain () =
+  let shows name rom expect =
+    let t = machine () in
+    Msx.load_cartridge t rom;
+    Msx.port_out t 0xA8 0xAA;
+    let got = List.init 8 (fun p -> Msx.mem_read t ((p * 0x2000) + 0x100)) in
+    check (name ^ " is plain") (Msx.cart_mapper t = Msx.Flat);
+    check
+      (Printf.sprintf "%s: pages %s" name (String.concat "," (List.map string_of_int got)))
+      (got = expect)
+  in
+  let at_4000 = [ 2; 3; 0; 1; 2; 3; 0; 1 ] and at_8000 = [ 0; 1; 2; 3; 0; 1; 2; 3 ] in
+  shows "8KB at 0x4000" (plain_rom ~size:0x2000 ~header:0 [ 0x4010 ]) [ 0; 0; 0; 0; 0; 0; 0; 0 ];
+  shows "16KB at 0x4000" (plain_rom ~size:0x4000 ~header:0 [ 0x4010 ]) [ 0; 1; 0; 1; 0; 1; 0; 1 ];
+  shows "32KB at 0x4000" (plain_rom ~size:0x8000 ~header:0 [ 0x4010 ]) at_4000;
+  shows "32KB at 0x8000" (plain_rom ~size:0x8000 ~header:0 [ 0x8010 ]) at_8000;
+  (* A pointer counts from its header's place in the file: a header at file
+     offset 0x4000 pointing into 0x8000 votes for the file starting at 0x4000. *)
+  shows "32KB, header at 0x4000 into 0x8000" (plain_rom ~size:0x8000 ~header:0x4000 [ 0x8010 ]) at_4000;
+  (* One vote each for 0x0000 and 0x4000: 0x4000 wins the tie. One each for
+     0x0000 and 0x8000: 0x0000 wins. A 24KB ROM tells the two apart: from
+     0x0000 page 3 shows 3 land 2 = 2; from 0x8000 page 1 shows -3 land 2 = 0. *)
+  shows "32KB, tie 0x0000/0x4000" (plain_rom ~size:0x8000 ~header:0 [ 0x0010; 0x4020 ]) at_4000;
+  shows "24KB, tie 0x0000/0x8000"
+    (plain_rom ~size:0x6000 ~header:0 [ 0x0010; 0x8020 ])
+    [ 0; 1; 2; 2; 0; 0; 2; 2 ];
+  shows "24KB at 0x8000" (plain_rom ~size:0x6000 ~header:0 [ 0x8020 ]) [ 0; 0; 2; 2; 0; 1; 2; 2 ];
+  (* The header sits at file offset 0x4000 and points into 0x4000: the file
+     starts at 0x0000. 48KB is six pages: page 6 shows 6 land 5 = 4. *)
+  shows "48KB at 0x0000" (plain_rom ~size:0xc000 ~header:0x4000 [ 0x4010 ]) [ 0; 1; 2; 3; 4; 5; 4; 5 ];
+  shows "64KB at 0x0000" (plain_rom ~size:0x10000 ~header:0x4000 [ 0x4010 ]) [ 0; 1; 2; 3; 4; 5; 6; 7 ]
+
+(* A MegaROM is no plain ROM: outside 0x4000-0xBFFF the ASCII mappers show
+   an empty bus, not a mirror of the file (openMSX RomAscii8kB, RomAscii16kB,
+   RomAscii8_8 reset). *)
+let megarom_outside () =
+  List.iter
+    (fun (name, mapper) ->
+      let t = machine () in
+      Msx.load_cartridge ~mapper t (synth 8);
+      Msx.port_out t 0xA8 0xAA;
+      List.iter
+        (fun a ->
+          check (Printf.sprintf "%s: 0x%04x reads 0xFF" name a) (win t a = 0xff))
+        [ 0x0000; 0x2000; 0xc000; 0xe000 ])
+    [ ("ascii8", Msx.Ascii8); ("ascii16", Msx.Ascii16); ("koei", Msx.Ascii8_sram) ]
+
+(* The RAM mapper in slot 3-2 (openMSX MSXMemoryMapperBase). A register
+   keeps bit_ceil(segments) - 1 and reads back with the bits above set; one
+   past the last segment folds with segments - 1. *)
+let ram_mapper () =
+  let ram kb =
+    let t = Msx.create ~machine:{ Msx.ram_kb = kb; vram_kb = 128; roms = [ ""; ""; "" ] } in
+    (* every page in slot 3, every page of slot 3 in subslot 2 *)
+    Msx.port_out t 0xA8 0xff;
+    Msx.mem_write t 0xffff 0xaa;
+    (* byte 0x8000 of each segment holds its index *)
+    for s = 0 to (kb / 16) - 1 do
+      Msx.port_out t 0xFE s;
+      Msx.mem_write t 0x8000 s
+    done;
+    t
+  in
+  let t = ram 512 in
+  Msx.port_out t 0xFE 0x23;
+  check "512KB mapper reads segment 3 as 0xE3" (Msx.port_in t 0xFE = 0xe3);
+  check "512KB mapper keeps 5 bits" (Msx.mem_read t 0x8000 = 3);
+  Msx.port_out t 0xFE 31;
+  check "512KB mapper reaches segment 31" (Msx.mem_read t 0x8000 = 31 && Msx.port_in t 0xFE = 0xff);
+  let t = ram 64 in
+  Msx.port_out t 0xFE 0x05;
+  check "64KB mapper reads segment 1 as 0xFD" (Msx.port_in t 0xFE = 0xfd);
+  check "64KB mapper keeps 2 bits" (Msx.mem_read t 0x8000 = 1);
+  let t = ram 96 in
+  Msx.port_out t 0xFE 7;
+  check "96KB mapper keeps 3 bits" (Msx.port_in t 0xFE = 0xff);
+  check "96KB mapper folds segment 7 to 5" (Msx.mem_read t 0x8000 = 5);
+  Msx.port_out t 0xFE 6;
+  check "96KB mapper folds segment 6 to 4" (Msx.mem_read t 0x8000 = 4);
+  let t = ram 4096 in
+  Msx.port_out t 0xFE 200;
+  check "4MB mapper reaches segment 200" (Msx.mem_read t 0x8000 = 200 && Msx.port_in t 0xFE = 200)
+
+(* Pages 0 and 3 of the cart slot (openMSX RomKonami / RomKonamiSCC
+   bankSwitch, RomAscii8kB / RomAscii16kB reset): Konami mirrors the
+   0x4000-0x7FFF windows at 0x0000 and the 0x8000-0xBFFF ones at 0xC000,
+   Konami SCC the other way round, and an ASCII cart leaves both pages empty.
+   Byte 0 of each 8KB segment is its number (see [synth]). *)
+let outer_pages () =
+  let shows name mapper switch expect =
+    let t = machine () in
+    Msx.load_cartridge ~mapper t (synth 8);
+    Msx.port_out t 0xA8 0xAA;
+    List.iter (fun (a, v) -> Msx.mem_write t a v) switch;
+    let got = List.map (win t) [ 0x0000; 0x2000; 0xc000; 0xe000 ] in
+    check
+      (Printf.sprintf "%s: 0000 2000 c000 e000 show %s" name
+         (String.concat "," (List.map string_of_int got)))
+      (got = expect)
+  in
+  shows "konami at reset" Msx.Konami [] [ 0; 1; 2; 3 ];
+  shows "konami after 0x6000=5 0x8000=6" Msx.Konami [ (0x6000, 5); (0x8000, 6) ] [ 0; 5; 6; 3 ];
+  shows "konami scc at reset" Msx.Konami_scc [] [ 2; 3; 0; 1 ];
+  shows "konami scc after 0x5000=4 0x9000=6" Msx.Konami_scc [ (0x5000, 4); (0x9000, 6) ]
+    [ 6; 3; 4; 1 ];
+  shows "ascii8" Msx.Ascii8 [] [ 0xff; 0xff; 0xff; 0xff ];
+  shows "ascii16" Msx.Ascii16 [] [ 0xff; 0xff; 0xff; 0xff ]
+
+(* Plugging a cart does not touch slot selection: PPI port A stays at its
+   power-on 0x00 (every page on slot 0), as on the real machine and in
+   openMSX. C-BIOS finds the cart by scanning the slots itself; a page 1
+   left on slot 2 would outlive the scan, which only rewrites the page 2
+   and 3 bits. *)
+let ppi_untouched () =
+  let t = machine () in
+  Msx.load_cartridge t (synth 2);
+  check "cart leaves PPI A at 0x00" (Msx.port_in t 0xA8 = 0x00)
+
 let () =
+  ppi_untouched ();
   konami ();
   konami_scc ();
   ascii8 ();
   ascii16 ();
   koei_sram ();
   detection ();
+  plain ();
+  megarom_outside ();
+  ram_mapper ();
+  outer_pages ();
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1
