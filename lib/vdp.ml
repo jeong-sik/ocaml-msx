@@ -525,8 +525,9 @@ let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
 
 (* 스프라이트 모드 1 — SCREEN1-3. SAT = R#5<<7 (32엔트리 × 4바이트:
    Y, X, 패턴번호, 컬러), PT = R#6<<11. R#1 bit0 = MAG(2배), bit1 =
-   SIZE(16×16). Y 값은 실제보다 1 크고, 0xD0 인 엔트리부터 뒤는 없으며
-   0xFF 는 그 엔트리만 화면 밖이다. 컬러 0 은 투명, 컬러 bit7(EC) 은
+   SIZE(16×16). 맨 윗줄은 Y+1 줄이고(Y=0xFF 가 0번 줄), 줄 번호는
+   256 으로 돌아 나가 Y=0xF0 의 16×16 은 아랫부분 한 줄만 0번 줄에 걸린다.
+   Y=0xD0 인 엔트리부터 뒤는 없다. 컬러 0 은 투명, 컬러 bit7(EC) 은
    X 를 16px 왼쪽으로 민다. 우선순위는 번호가 낮은 쪽이 위 — 큰 번호부터
    그린다. 라인당 표시 제한(4/8)과 5th-sprite·충돌 플래그(S#0 bit6/5)
    는 아직 없다. *)
@@ -548,16 +549,14 @@ let render_sprites t ~w ~h put =
   (try
      for i = 0 to 31 do
        let e = sat + i * 4 in
-       match vr e with
-       | 0xd0 -> raise Exit
-       | 0xff -> () (* 이 엔트리만 화면 밖 *)
-       | _ -> active := i :: !active
+       if vr e = 0xd0 then raise Exit;
+       active := i :: !active
      done
    with Exit -> ());
   List.iter
     (fun i ->
       let e = sat + i * 4 in
-      let y0 = ((vr e - 1) land 0xff) and x_raw = vr (e + 1) in
+      let top = (vr e + 1) land 0xff and x_raw = vr (e + 1) in
       let pat = vr (e + 2) and col = vr (e + 3) in
       let c = col land 0x0f in
       let x0 = if col land 0x80 <> 0 then x_raw - 16 else x_raw in
@@ -565,20 +564,20 @@ let render_sprites t ~w ~h put =
         let pbase =
           pt + (if size16 then (pat land 0xfc) * pat_len else pat * pat_len)
         in
-        for row = 0 to edge - 1 do
+        for dy = 0 to (edge * step) - 1 do
+          let row = dy / step in
+          let line = (top + dy) land 0xff in
           (* 16×16 은 한 줄이 2바이트: 상위 바이트가 왼쪽 8px. *)
           let bits =
             if size16 then
               (vr (pbase + row * 2) lsl 8) lor vr (pbase + row * 2 + 1)
             else vr (pbase + row)
           in
-          let top = if size16 then 15 else 7 in
+          let msb = if size16 then 15 else 7 in
           for b = 0 to edge - 1 do
-            if (bits lsr (top - b)) land 1 = 1 then
-              for my = 0 to step - 1 do
-                for mx = 0 to step - 1 do
-                  sput (x0 + b * step + mx) (y0 + row * step + my) c
-                done
+            if (bits lsr (msb - b)) land 1 = 1 then
+              for mx = 0 to step - 1 do
+                sput (x0 + b * step + mx) line c
               done
           done
         done)
