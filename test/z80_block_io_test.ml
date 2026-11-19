@@ -12,9 +12,9 @@ let ram = Bytes.make 0x10000 '\000'
 let read a = Char.code (Bytes.get ram a)
 let write a v = Bytes.set ram a (Char.chr (v land 0xff))
 let port_value = ref 0
-let pin _ = !port_value
+let pin ~at:_ _ = !port_value
 let outs = ref []
-let pout port v = outs := (port, v) :: !outs
+let pout ~at:_ port v = outs := (port, v) :: !outs
 let failures = ref 0
 
 let check name cond =

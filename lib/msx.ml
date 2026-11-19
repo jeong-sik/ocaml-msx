@@ -122,6 +122,11 @@ type fdc_state = {
 type t = {
   cpu : Z80.t;
   vdp : Vdp.t;
+  mutable vdp_ahead : int;
+      (** cycles of the instruction in progress the VDP has already run. A
+          port access runs it up to the access cycle first, as openMSX
+          CPUCore READ_PORT/WRITE_PORT schedule up to that time; [step] runs
+          the rest when the instruction ends. 0 between instructions. *)
   mutable main_rom : Bytes.t;
   mutable logo_rom : Bytes.t;
   mutable sub_rom : Bytes.t;
@@ -930,6 +935,14 @@ let watch_mem_addrs : int list ref = ref []
 let watch_mem_log : (int * int * int * int) list ref = ref []
 let instr_count = ref 0
 
+(* Run the VDP to cycle [at] of the instruction in progress, so a port
+   access sees the VDP as it is at that cycle (issue #76). *)
+let vdp_catch_up m ~at =
+  if at > m.vdp_ahead then begin
+    ignore (Vdp.advance m.vdp ~cycles:(at - m.vdp_ahead));
+    m.vdp_ahead <- at
+  end
+
 (* Every RAM byte reads 0xFF at power-on. openMSX Ram::clear fills RAM with
    0xFF unless the machine config gives an initialContent pattern, and the
    C-BIOS machines give none. Eggerland Mystery 2 reads 0xED21 before it
@@ -955,8 +968,12 @@ let create ~machine =
         watch_mem_log :=
           (!instr_count, a, v land 0xff, Z80.dump_pc m.cpu) :: !watch_mem_log
     | None -> () in
-  let pin p = match !m_ref with Some m -> port_read m p | None -> 0xff in
-  let pout p v = match !m_ref with Some m -> port_write m p v | None -> () in
+  let pin ~at p =
+    match !m_ref with Some m -> vdp_catch_up m ~at; port_read m p | None -> 0xff
+  in
+  let pout ~at p v =
+    match !m_ref with Some m -> vdp_catch_up m ~at; port_write m p v | None -> ()
+  in
   let m =
     {
       cpu =
@@ -964,6 +981,7 @@ let create ~machine =
            WAIT_CYCLES = 1). 없으면 CPU 가 실기보다 빨리 돈다. *)
         Z80.create ~m1_wait:1 ~read ~write ~port_in:pin ~port_out:pout;
       vdp = Vdp.create ();
+      vdp_ahead = 0;
       main_rom = rom_or_empty main;
       logo_rom = rom_or_empty logo;
       sub_rom = rom_or_empty sub;
@@ -2116,6 +2134,9 @@ let step t ~frames =
          (실측 09-11: 64명령 안에 KEYINT 2.5바퀴, PUSH12/POP12 가 FDC 창을
          유린). fdc.intr 는 0x7FFF 폴링 비트용 상태로만 남는다. *)
       let irq_used = if Vdp.int_active t.vdp then Z80.interrupt t.cpu else 0 in
+      (* The acknowledge comes before the instruction: port cycles count
+         from the instruction start. *)
+      if irq_used > 0 then ignore (Vdp.advance t.vdp ~cycles:irq_used);
       let pc0 = Z80.dump_pc t.cpu in
       (match !trace_from with
        | Some (target, n) when pc0 = target && !trace_remaining = 0 ->
@@ -2152,15 +2173,15 @@ let step t ~frames =
       (* A disk BIOS entry is served in OCaml (HLE), not by fetching the ROM's
          opcode there; the trap moves PC on, so charge a nominal call's cycles. *)
       let used =
-        irq_used
-        + if disk_trap t pc then begin
-            Z80.charge t.cpu trap_cycles;
-            trap_cycles
-          end
-          else Z80.step t.cpu
+        if disk_trap t pc then begin
+          Z80.charge t.cpu trap_cycles;
+          trap_cycles
+        end
+        else Z80.step t.cpu
       in
       incr instr_count;
-      ignore (Vdp.advance t.vdp ~cycles:used)
+      ignore (Vdp.advance t.vdp ~cycles:(used - t.vdp_ahead));
+      t.vdp_ahead <- 0
     done;
     t.frames <- t.frames + 1
   done

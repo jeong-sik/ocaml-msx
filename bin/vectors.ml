@@ -10,8 +10,8 @@ let run ~prog ~af ~bc ~de ~hl ~sp =
     Z80.create ~m1_wait:0
       ~read:(fun a -> Char.code (Bytes.get mem (a land 0xffff)))
       ~write:(fun a v -> Bytes.set mem (a land 0xffff) (Char.chr (v land 0xff)))
-      ~port_in:(fun _ -> 0xff)
-      ~port_out:(fun _ _ -> ())
+      ~port_in:(fun ~at:_ _ -> 0xff)
+      ~port_out:(fun ~at:_ _ _ -> ())
   in
   Z80.set_af z af;
   Z80.set_bc z bc;

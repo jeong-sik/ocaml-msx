@@ -46,10 +46,10 @@ let () =
   cpu :=
     Some
       (Z80.create ~m1_wait:0 ~read:mem_read ~write:mem_write
-         ~port_in:(fun _ ->
+         ~port_in:(fun ~at:_ _ ->
            bdos ();
            0xff)
-         ~port_out:(fun _ _ -> finished := true))
+         ~port_out:(fun ~at:_ _ _ -> finished := true))
 
 let z () = match !cpu with Some z -> z | None -> assert false
 
@@ -68,10 +68,10 @@ let run_test path =
   cpu :=
     Some
       (Z80.create ~m1_wait:0 ~read:mem_read ~write:mem_write
-         ~port_in:(fun _ ->
+         ~port_in:(fun ~at:_ _ ->
            bdos ();
            0xff)
-         ~port_out:(fun _ _ -> finished := true));
+         ~port_out:(fun ~at:_ _ _ -> finished := true));
   (* 주입: 0x0000 = out (0),a / 0x0005 = in a,(0) ; ret *)
   Bytes.set mem 0x00 '\xd3';
   Bytes.set mem 0x01 '\x00';

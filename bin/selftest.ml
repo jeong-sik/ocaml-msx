@@ -31,10 +31,10 @@ let () =
   cpu :=
     Some
       (Z80.create ~m1_wait:0 ~read:mem_read ~write:mem_write
-         ~port_in:(fun _ ->
+         ~port_in:(fun ~at:_ _ ->
            bdos ();
            0xff)
-         ~port_out:(fun _ _ -> finished := true));
+         ~port_out:(fun ~at:_ _ _ -> finished := true));
   let z = match !cpu with Some z -> z | None -> assert false in
   (* 종료 신호 *)
   Bytes.set mem 0x00 '\xd3';
@@ -69,8 +69,8 @@ let () =
   List.iteri (fun i b -> Bytes.set mem (0x100 + i) (Char.chr b)) prog2;
   let cpu2 =
     Z80.create ~m1_wait:0 ~read:mem_read ~write:mem_write
-      ~port_in:(fun _ -> 0xff)
-      ~port_out:(fun _ _ -> finished := true)
+      ~port_in:(fun ~at:_ _ -> 0xff)
+      ~port_out:(fun ~at:_ _ _ -> finished := true)
   in
   Z80.set_pc cpu2 0x0100;
   let n2 = ref 0 in

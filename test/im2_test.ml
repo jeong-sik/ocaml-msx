@@ -6,8 +6,8 @@
 let ram = Bytes.make 0x10000 '\000'
 let read a = Char.code (Bytes.get ram a)
 let write a v = Bytes.set ram a (Char.chr (v land 0xff))
-let pin _ = 0xff
-let pout _ _ = ()
+let pin ~at:_ _ = 0xff
+let pout ~at:_ _ _ = ()
 
 let poke a bs = String.iteri (fun i c -> Bytes.set ram (a + i) c) bs
 
