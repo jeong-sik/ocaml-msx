@@ -1496,6 +1496,15 @@ let disk_entry_pc = function
   | 0x4013 | 0x4016 | 0x4019 | 0x401c | 0x401f -> true
   | _ -> false
 
+(* True while the byte the CPU would fetch at [addr] is still a power-on fill
+   (0x00 or 0xFF), i.e. nothing was ever planted there. A program that owns
+   page 0 and runs its own code across a BIOS vector address (Europa Sensen's
+   bootstrap executes LD BC,0080 at 0x0156) is not calling the BIOS; its
+   bytes there are not a fill. *)
+let page0_byte_untouched t addr =
+  let b = mem_read t addr in
+  b = 0x00 || b = 0xff
+
 (* RST 30h 트램펄린 — 실기의 디스크 ROM 이 0x0030 에 깔아 두던 인터슬롯
    핸들러 대역. RST 30h 가 push 한 반환주소는 서술자(slot 1 + 주소 2)를
    가리킨다: 서술자를 읽고, 그 자리에 서술자 건너뛴 복귀 주소를 심은 뒤
@@ -1549,15 +1558,6 @@ let serve_calslt t =
       (t.slot3_sel land lnot (3 lsl shift)) lor (((slot lsr 2) land 3) lsl shift)
   end;
   target
-
-(* True while the byte the CPU would fetch at [addr] is still a power-on fill
-   (0x00 or 0xFF), i.e. nothing was ever planted there. A program that owns
-   page 0 and runs its own code across a BIOS vector address (Europa Sensen's
-   bootstrap executes LD BC,0080 at 0x0156) is not calling the BIOS; its
-   bytes there are not a fill. *)
-let page0_byte_untouched t addr =
-  let b = mem_read t addr in
-  b = 0x00 || b = 0xff
 
 (* Serviced in the step loop before the opcode at [pc] runs. Returns true when
    [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
