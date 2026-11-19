@@ -124,6 +124,12 @@
  (libraries z80core))
 
 (test
+ (name core_purity_test)
+ (modules core_purity_test)
+ (deps
+  (glob_files %{project_root}/lib/*.ml)))
+
+(test
  (name printer_port_test)
  (modules printer_port_test)
  (libraries msx))
