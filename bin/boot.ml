@@ -9,6 +9,7 @@ let vlog = ref false
 let watch_mem = ref ""
 let cart = ref ""
 let disk = ref ""
+let ram_cart = ref false
 let disk_warm = ref false
 let rtc_time = ref ""
 let disk_real = ref false
@@ -130,6 +131,9 @@ let () =
       ("--assert-boot", Arg.Set assert_boot, "  부트 완주 판정 (로고 렌더 + No cartridge), 어긋나면 exit 1");
       ("--cart", Arg.Set_string cart, "PATH  카트리지 ROM — 슬롯2 페이지1 에.");
       ("--disk", Arg.Set_string disk, "PATH  플로피 이미지(.dsk) — 드라이브 A.");
+      ( "--ram-cart",
+        Arg.Set ram_cart,
+        "  슬롯 2 에 64KB RAM 카트 (openMSX -extb ram64k). --cart·--disk 와 같이 못 쓴다." );
       ( "--rtc-time",
         Arg.Set_string rtc_time,
         "host|YYYY-MM-DDTHH:MM:SS  RTC 시작 시각 (없으면 00-00-00 00:00:00)" );
@@ -174,6 +178,11 @@ let () =
   (* [begin..end] bounds the then-branch: without it the [let mapper = .. in]
      swallows every following statement (run loop, prints), so a no-cart boot
      (BIOS only or disk) ran nothing and exited silently. *)
+  if !ram_cart then begin
+    if !cart <> "" || !disk <> "" then
+      failwith "--ram-cart takes slot 2: it cannot be used with --cart or --disk";
+    Msx.insert_ram_cartridge t
+  end;
   if !cart <> "" then begin
     let mapper = match !cart_mapper with
       | "plain" -> Some Msx.Flat
