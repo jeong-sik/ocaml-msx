@@ -1522,6 +1522,32 @@ let serve_rst30 t =
     (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
   addr
 
+(* A slot id as RDSLT, WRSLT, CALSLT and ENASLT take it: bits 1..0 the primary
+   slot, and for an expanded slot 3 bit 7 set with bits 3..2 the sub-slot.
+   Slot 0 is not recognised: 0x00 is also what a stream read passes in A. *)
+let is_slot_id a = a >= 1 && (a land 0x80 <> 0 || a land 3 <> 0)
+
+(* Runs [f] with the page holding [addr] showing the slot [slot] names, then
+   puts the slot registers back. *)
+let with_slot_view t ~slot ~addr f =
+  let shift = ((addr lsr 14) land 3) * 2 in
+  let primary = slot land 3 and sub = (slot lsr 2) land 3 in
+  let saved_ppi = t.ppi_a and saved_sl3 = t.slot3_sel in
+  t.ppi_a <- (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor (primary lsl shift);
+  if primary = 3 then
+    t.slot3_sel <- (t.slot3_sel land lnot (3 lsl shift)) lor (sub lsl shift);
+  let r = f () in
+  t.ppi_a <- saved_ppi;
+  t.slot3_sel <- saved_sl3;
+  r
+
+(* Returns from a vector served in OCaml: pops the return address. *)
+let return_from_vector t =
+  let sp = Z80.dump_sp t.cpu in
+  let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+  Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+  Z80.set_pc t.cpu ret
+
 (* CALSLT (BIOS 0x001C) served in OCaml for the warm-up replay, where page 0
    is RAM and the real BIOS entry is not visible. Contract per the C-BIOS
    source: IY high byte = target slot in RDSLT's A format (0x80 | sub<<2 |
@@ -1549,32 +1575,6 @@ let serve_calslt t =
       (t.slot3_sel land lnot (3 lsl shift)) lor (((slot lsr 2) land 3) lsl shift)
   end;
   target
-
-(* A slot id as RDSLT, WRSLT, CALSLT and ENASLT take it: bits 1..0 the primary
-   slot, and for an expanded slot 3 bit 7 set with bits 3..2 the sub-slot.
-   Slot 0 is not recognised: 0x00 is also what a stream read passes in A. *)
-let is_slot_id a = a >= 1 && (a land 0x80 <> 0 || a land 3 <> 0)
-
-(* Runs [f] with the page holding [addr] showing the slot [slot] names, then
-   puts the slot registers back. *)
-let with_slot_view t ~slot ~addr f =
-  let shift = ((addr lsr 14) land 3) * 2 in
-  let primary = slot land 3 and sub = (slot lsr 2) land 3 in
-  let saved_ppi = t.ppi_a and saved_sl3 = t.slot3_sel in
-  t.ppi_a <- (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor (primary lsl shift);
-  if primary = 3 then
-    t.slot3_sel <- (t.slot3_sel land lnot (3 lsl shift)) lor (sub lsl shift);
-  let r = f () in
-  t.ppi_a <- saved_ppi;
-  t.slot3_sel <- saved_sl3;
-  r
-
-(* Returns from a vector served in OCaml: pops the return address. *)
-let return_from_vector t =
-  let sp = Z80.dump_sp t.cpu in
-  let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
-  Z80.set_sp t.cpu ((sp + 2) land 0xffff);
-  Z80.set_pc t.cpu ret
 
 (* Serviced in the step loop before the opcode at [pc] runs. Returns true when
    [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)

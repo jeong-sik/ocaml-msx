@@ -89,11 +89,6 @@
  (libraries msx))
 
 (test
- (name slot_rdslt_wrslt_test)
- (modules slot_rdslt_wrslt_test)
- (libraries msx))
-
-(test
  (name direction_hle_call_test)
  (modules direction_hle_call_test)
  (libraries msx))
@@ -111,6 +106,11 @@
 (test
  (name ram_power_on_test)
  (modules ram_power_on_test)
+ (libraries msx))
+
+(test
+ (name slot_rdslt_wrslt_test)
+ (modules slot_rdslt_wrslt_test)
  (libraries msx))
 
 (test
