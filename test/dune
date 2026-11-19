@@ -125,6 +125,11 @@
  (libraries ym2413core))
 
 (test
+ (name z80_timing_test)
+ (modules z80_timing_test)
+ (libraries z80core))
+
+(test
  (name vdp_reg_test)
  (modules vdp_reg_test)
  (libraries vdpcore))

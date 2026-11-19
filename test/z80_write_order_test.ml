@@ -29,7 +29,7 @@ let write a v =
 let writes ?(pc = 0x0100) ?(steps = 1) ?(setup = fun _ -> ()) code =
   Bytes.fill ram 0 0x10000 '\000';
   String.iteri (fun i c -> Bytes.set ram (pc + i) c) code;
-  let z = Z80.create ~read ~write ~port_in:(fun _ -> 0xff) ~port_out:(fun _ _ -> ()) in
+  let z = Z80.create ~m1_wait:0 ~read ~write ~port_in:(fun _ -> 0xff) ~port_out:(fun _ _ -> ()) in
   Z80.set_pc z pc;
   Z80.set_sp z 0x8000;
   setup z;
@@ -54,7 +54,7 @@ let () =
   (* IM 1, EI, NOP from 0x1230: the interrupt pushes 0x1234. *)
   let z, _ = writes ~pc:0x1230 ~steps:3 "\xed\x56\xfb\x00\x00" in
   log := [];
-  check "the interrupt is taken" (Z80.interrupt z);
+  check "the interrupt is taken" (Z80.interrupt z <> 0);
   check "an interrupt pushes the high byte first" (List.rev !log = high_first);
   (* EX (SP),rr with rr = 0x1234: (SP+1) first, then (SP). *)
   let ex = [ (0x8001, 0x12); (0x8000, 0x34) ] in
