@@ -216,7 +216,79 @@ let megarom_outside () =
         [ 0x0000; 0x2000; 0xc000; 0xe000 ])
     [ ("ascii8", Msx.Ascii8); ("ascii16", Msx.Ascii16); ("koei", Msx.Ascii8_sram) ]
 
+(* The RAM mapper in slot 3-2 (openMSX MSXMemoryMapperBase). A register
+   keeps bit_ceil(segments) - 1 and reads back with the bits above set; one
+   past the last segment folds with segments - 1. *)
+let ram_mapper () =
+  let ram kb =
+    let t = Msx.create ~machine:{ Msx.ram_kb = kb; vram_kb = 128; roms = [ ""; ""; "" ] } in
+    (* every page in slot 3, every page of slot 3 in subslot 2 *)
+    Msx.port_out t 0xA8 0xff;
+    Msx.mem_write t 0xffff 0xaa;
+    (* byte 0x8000 of each segment holds its index *)
+    for s = 0 to (kb / 16) - 1 do
+      Msx.port_out t 0xFE s;
+      Msx.mem_write t 0x8000 s
+    done;
+    t
+  in
+  let t = ram 512 in
+  Msx.port_out t 0xFE 0x23;
+  check "512KB mapper reads segment 3 as 0xE3" (Msx.port_in t 0xFE = 0xe3);
+  check "512KB mapper keeps 5 bits" (Msx.mem_read t 0x8000 = 3);
+  Msx.port_out t 0xFE 31;
+  check "512KB mapper reaches segment 31" (Msx.mem_read t 0x8000 = 31 && Msx.port_in t 0xFE = 0xff);
+  let t = ram 64 in
+  Msx.port_out t 0xFE 0x05;
+  check "64KB mapper reads segment 1 as 0xFD" (Msx.port_in t 0xFE = 0xfd);
+  check "64KB mapper keeps 2 bits" (Msx.mem_read t 0x8000 = 1);
+  let t = ram 96 in
+  Msx.port_out t 0xFE 7;
+  check "96KB mapper keeps 3 bits" (Msx.port_in t 0xFE = 0xff);
+  check "96KB mapper folds segment 7 to 5" (Msx.mem_read t 0x8000 = 5);
+  Msx.port_out t 0xFE 6;
+  check "96KB mapper folds segment 6 to 4" (Msx.mem_read t 0x8000 = 4);
+  let t = ram 4096 in
+  Msx.port_out t 0xFE 200;
+  check "4MB mapper reaches segment 200" (Msx.mem_read t 0x8000 = 200 && Msx.port_in t 0xFE = 200)
+
+(* Pages 0 and 3 of the cart slot (openMSX RomKonami / RomKonamiSCC
+   bankSwitch, RomAscii8kB / RomAscii16kB reset): Konami mirrors the
+   0x4000-0x7FFF windows at 0x0000 and the 0x8000-0xBFFF ones at 0xC000,
+   Konami SCC the other way round, and an ASCII cart leaves both pages empty.
+   Byte 0 of each 8KB segment is its number (see [synth]). *)
+let outer_pages () =
+  let shows name mapper switch expect =
+    let t = machine () in
+    Msx.load_cartridge ~mapper t (synth 8);
+    Msx.port_out t 0xA8 0xAA;
+    List.iter (fun (a, v) -> Msx.mem_write t a v) switch;
+    let got = List.map (win t) [ 0x0000; 0x2000; 0xc000; 0xe000 ] in
+    check
+      (Printf.sprintf "%s: 0000 2000 c000 e000 show %s" name
+         (String.concat "," (List.map string_of_int got)))
+      (got = expect)
+  in
+  shows "konami at reset" Msx.Konami [] [ 0; 1; 2; 3 ];
+  shows "konami after 0x6000=5 0x8000=6" Msx.Konami [ (0x6000, 5); (0x8000, 6) ] [ 0; 5; 6; 3 ];
+  shows "konami scc at reset" Msx.Konami_scc [] [ 2; 3; 0; 1 ];
+  shows "konami scc after 0x5000=4 0x9000=6" Msx.Konami_scc [ (0x5000, 4); (0x9000, 6) ]
+    [ 6; 3; 4; 1 ];
+  shows "ascii8" Msx.Ascii8 [] [ 0xff; 0xff; 0xff; 0xff ];
+  shows "ascii16" Msx.Ascii16 [] [ 0xff; 0xff; 0xff; 0xff ]
+
+(* Plugging a cart does not touch slot selection: PPI port A stays at its
+   power-on 0x00 (every page on slot 0), as on the real machine and in
+   openMSX. C-BIOS finds the cart by scanning the slots itself; a page 1
+   left on slot 2 would outlive the scan, which only rewrites the page 2
+   and 3 bits. *)
+let ppi_untouched () =
+  let t = machine () in
+  Msx.load_cartridge t (synth 2);
+  check "cart leaves PPI A at 0x00" (Msx.port_in t 0xA8 = 0x00)
+
 let () =
+  ppi_untouched ();
   konami ();
   konami_scc ();
   ascii8 ();
@@ -225,6 +297,8 @@ let () =
   detection ();
   plain ();
   megarom_outside ();
+  ram_mapper ();
+  outer_pages ();
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1
