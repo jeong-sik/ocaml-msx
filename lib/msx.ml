@@ -802,8 +802,15 @@ let keyboard_row m row =
    0xB5 for input, so a read of 0xB4 finds no device and gets 0xFF. *)
 let rtc_data_high = 0xf0
 
+(* The printer port as the NMS 8250's S-3527 has it (openMSX MSXPrinterPort
+   with Philips_NMS_8250.xml): 0x90-0x97 all read the status, the unused
+   bits read 0 (measured on an NMS 8250), and bit 1 is BUSY. No printer is
+   plugged, so BUSY stays high: not ready. *)
+let printer_not_ready = 0x02
+
 let port_read m port =
   match port land 0xff with
+  | 0x90 | 0x91 | 0x92 | 0x93 | 0x94 | 0x95 | 0x96 | 0x97 -> printer_not_ready
   | 0xB5 -> Rtc.read m.rtc ~cycle:(Z80.t_states m.cpu) m.rtc_reg lor rtc_data_high
   | 0xD0 | 0xD1 | 0xD2 | 0xD3 -> fdc_read m port
   | 0x98 -> Vdp.io_read m.vdp ~port:0x98

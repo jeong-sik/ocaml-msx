@@ -119,6 +119,11 @@
  (libraries msx))
 
 (test
+ (name printer_port_test)
+ (modules printer_port_test)
+ (libraries msx))
+
+(test
  (name cassette_test)
  (modules cassette_test)
  (libraries msx))
