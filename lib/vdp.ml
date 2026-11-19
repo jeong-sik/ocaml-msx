@@ -450,6 +450,42 @@ let io_read t ~port =
     s
   | _ -> 0xff
 
+(* 스프라이트 모드: SCREEN1~3 은 모드 1, SCREEN4~7 은 모드 2, 텍스트는 없다. *)
+let sprite_mode t =
+  match display_mode t with
+  | Graphic1 | Graphic2 | Multicolor -> Some Sprites.Mode1
+  | Graphic3 | Graphic4 | Graphic5 | Graphic6 | Graphic7 -> Some Sprites.Mode2
+  | Text1 | Text2 | Undefined _ -> None
+
+let sprite_env t mode =
+  { Sprites.regs = t.regs;
+    vr = (fun a -> Char.code (Bytes.get t.vram (physical_addr t a)));
+    mode }
+
+(* 프레임 끝에서 S#0 의 스프라이트 비트를 갱신한다. 충돌(bit5)은 읽기 전까지
+   쌓이고, 5번째 스프라이트(bit6 + 하위 5비트 번호)는 읽기 전까지 처음 값이
+   남는다. 5번째가 없으면 하위 5비트는 목록을 끝낸 번호(종결자가 없으면
+   31)다. 스프라이트를 처리하지 않는 상태(SPD, 표시 끔, 텍스트)는 31.
+   플래그는 프레임이 끝날 때의 VRAM 으로 한 번에 계산한다 — 화면 중간에
+   속성 테이블을 바꾸는 게임은 그 줄의 충돌을 놓친다. *)
+let sprite_status t s0 =
+  let with_low n = (s0 land lnot 0x1f) lor n in
+  let frozen = s0 land 0x40 <> 0 in
+  match sprite_mode t with
+  | Some mode when t.regs.(8) land 0x02 = 0 && t.regs.(1) land 0x40 <> 0 ->
+      let scan =
+        Sprites.scan (sprite_env t mode)
+          ~opaque0:(t.regs.(8) land 0x20 <> 0)
+          ~lines:(visible_lines t)
+      in
+      let s0 = if scan.collided then s0 lor 0x20 else s0 in
+      if frozen then s0
+      else (
+        match scan.fifth with
+        | Some i -> (s0 land lnot 0x1f) lor 0x40 lor i
+        | None -> (s0 land lnot 0x1f) lor min 31 scan.stop)
+  | _ -> if frozen then s0 else with_low 0x1f
+
 let advance t ~cycles =
   let hit = ref false in
   t.cycle_in_line <- t.cycle_in_line + cycles;
@@ -457,16 +493,9 @@ let advance t ~cycles =
     t.cycle_in_line <- t.cycle_in_line - cycles_per_line;
     t.line <- t.line + 1;
     if t.line = visible_lines t then begin
-      t.status0 <- t.status0 lor 0x80;
+      t.status0 <- sprite_status t t.status0 lor 0x80;
       t.int_pending <- true;
-      hit := true;
-      (* 인터럽트 발생 시 상태 레지스터 선택(R#15)을 0 으로 되돌린다 —
-         V9938 계약. BIOS KEYINT 는 `in a,(0x99)` 후 `jp p,int_end` 로
-         VBlank 플래그(S#0 bit7)를 검사하는데, 게임이 S#1 선택(R#15=1)을
-         남긴 채 인터럽트가 걸리면 이 리셋이 없는 한 KEYINT 는 S#1 을
-         읽고 스캔 없이 종료한다 — 키가 영원히 KEYBUF 에 들어가지 않는다
-         (룬마스터 1 의 CONIN 이 비는 경로). *)
-      t.regs.(15) <- 0
+      hit := true
     end;
     (* 라인 인터럽트: 표시 라인이 R#19 와 같아질 때 S#1 bit0. FH 플래그는
        IE1(R#0 bit4) 이 켜져 있을 때만 래치된다 — V9938 정본(openMSX
@@ -483,6 +512,14 @@ let advance t ~cycles =
     if t.line >= lines_per_frame then t.line <- 0
   done;
   !hit
+
+(* CPU 가 VBlank 인터럽트를 받으면 상태 레지스터 선택(R#15)을 0 으로 되돌린다.
+   BIOS KEYINT 는 `in a,(0x99)` 후 `jp p,int_end` 로 VBlank 플래그(S#0 bit7)를
+   검사하는데, 게임이 S#1 선택(R#15=1)을 남긴 채 인터럽트가 걸리면 KEYINT 는
+   S#1 을 읽고 스캔 없이 종료한다 — 키가 영원히 KEYBUF 에 들어가지 않는다(룬
+   마스터 1 의 CONIN 이 비는 경로). 받는 시점에 되돌리므로 DI 구간에서 S#2 를
+   고른 채 VBlank 가 지나가도 선택은 그대로다(MSXgl 의 CE 대기 루프). *)
+let interrupt_accepted t = if t.status0 land 0x80 <> 0 then t.regs.(15) <- 0
 
 let int_active t =
   let ie0 = t.regs.(1) land 0x20 <> 0 and ie1 = t.regs.(0) land 0x10 <> 0 in
@@ -526,140 +563,30 @@ let mode_bitmap_hi t = not (mode_text t) && t.regs.(0) land 0x08 <> 0
 
 let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
 
-(* 스프라이트 모드 1 — SCREEN1-3. SAT = R#5<<7 (32엔트리 × 4바이트:
-   Y, X, 패턴번호, 컬러), PT = R#6<<11. R#1 bit0 = MAG(2배), bit1 =
-   SIZE(16×16, 패턴번호 하위 2비트는 버리고 번호 ×8 바이트, 왼쪽 반 16바이트 뒤에 오른쪽 반 16바이트). 맨 윗줄은 Y+1 줄이고(Y=0xFF 가 0번 줄), 줄 번호는
-   256 으로 돌아 나가 Y=0xF0 의 16×16 은 아랫부분 한 줄만 0번 줄에 걸린다.
-   Y=0xD0 인 엔트리부터 뒤는 없다. 컬러 0 은 투명, 컬러 bit7(EC) 은
-   X 를 32px 왼쪽으로 민다(openMSX 와 같은 최소 ROM 으로 확인). 우선순위는 번호가 낮은 쪽이 위 — 큰 번호부터
-   그린다. 라인당 표시 제한(4/8)과 5th-sprite·충돌 플래그(S#0 bit6/5)
-   는 아직 없다. *)
-let render_sprites t ~w ~h put =
-  let vr a = Char.code (Bytes.get t.vram a) in
-  let sat = (t.regs.(5) land 0x7f) lsl 7 in
-  let pt = (t.regs.(6) land 0x07) lsl 11 in
-  let size16 = t.regs.(1) land 0x02 <> 0 in
-  let mag = t.regs.(1) land 0x01 <> 0 in
-  let edge = if size16 then 16 else 8 in
-  let step = if mag then 2 else 1 in
-  let opaque0 = t.regs.(8) land 0x20 <> 0 in
-  let sput x y c =
-    if x >= 0 && x < w && y >= 0 && y < h then put x y c
-  in
-  (* 표시할 엔트리를 번호순으로 모은 뒤 역순으로 그린다 — 0xD0 는
-     목록 수집 자체를 끝낸다. *)
-  let active = ref [] in
-  (try
-     for i = 0 to 31 do
-       let e = sat + i * 4 in
-       if vr e = 0xd0 then raise Exit;
-       active := i :: !active
-     done
-   with Exit -> ());
-  List.iter
-    (fun i ->
-      let e = sat + i * 4 in
-      let top = (vr e + 1) land 0xff and x_raw = vr (e + 1) in
-      let pat = vr (e + 2) and col = vr (e + 3) in
-      let c = col land 0x0f in
-      let x0 = if col land 0x80 <> 0 then x_raw - 32 else x_raw in
-      if c <> 0 || opaque0 then
-        let pbase = pt + ((if size16 then pat land 0xfc else pat) * 8) in
-        for dy = 0 to (edge * step) - 1 do
-          let row = dy / step in
-          let line = (top + dy) land 0xff in
-          (* 16×16 은 4개의 8×8 을 위왼·아래왼·위오·아래오 순으로 둔다:
-             왼쪽 8px 는 바이트 0..15, 오른쪽 8px 는 바이트 16..31. *)
-          let bits =
-            if size16 then (vr (pbase + row) lsl 8) lor vr (pbase + 16 + row)
-            else vr (pbase + row)
-          in
-          let msb = if size16 then 15 else 7 in
-          for b = 0 to edge - 1 do
-            if (bits lsr (msb - b)) land 1 = 1 then
-              for mx = 0 to step - 1 do
-                sput (x0 + b * step + mx) line c
+(* 스프라이트 그리기. 모드·줄 선택·패턴 기하는 [Sprites] 가 정한다 — 한 줄에
+   모드 1 은 4개, 모드 2 는 8개까지 보이고 번호가 낮은 쪽이 위다. SPD(R#8
+   bit1)가 켜지면 그리지 않는다. [xscale] 은 512폭 모드(SCREEN6/7)에서 2. *)
+let render_sprites t ~h ~xscale put =
+  match sprite_mode t with
+  | Some mode when t.regs.(8) land 0x02 = 0 ->
+      let e = sprite_env t mode in
+      let opaque0 = t.regs.(8) land 0x20 <> 0 in
+      let indices, _ = Sprites.entries e in
+      let px = Array.make 256 (-1) in
+      for line = 0 to h - 1 do
+        let rows, _ = Sprites.displayed e indices line in
+        if rows <> [] then begin
+          Sprites.paint e ~opaque0 rows px;
+          for x = 0 to 255 do
+            let c = px.(x) in
+            if c >= 0 then
+              for k = 0 to xscale - 1 do
+                put ((x * xscale) + k) line c
               done
           done
-        done)
-    !active
-
-(* 스프라이트 모드 2 — SCREEN4~7. 패턴 테이블 = (R#6&0x3F)<<11. 속성
-   32엔트리(Y, X, 패턴번호, 예약)는 Y=0xD8 에서 끝난다. 컬러 테이블은
-   스프라이트마다 16바이트 — 패턴 행마다 한 바이트: bit0-3 컬러, bit6 CC
-   (번호가 앞선 스프라이트 픽셀과 OR), bit7 EC(X 를 32px 왼쪽으로). 한 줄에는
-   번호순 처음 8개만 보이고, 겹치면 번호가 낮은 쪽이 위다. 컬러 0 은 R#8
-   bit5(TP)=0 이면 투명이고 TP=1 이면 팔레트 0 색으로 칠한다(openMSX
-   SpriteConverter, 모드 1 도 같다). 위치·패턴
-   주소·16×16 바이트 배치는 모드 1 과 같다. 5번째(9번째) 스프라이트와 충돌
-   플래그(S#0)는 아직 없다. [xscale] 은 512폭 모드(SCREEN6/7)에서 2. *)
-let render_sprites2 t ~h ~xscale put =
-  (* SCREEN7 은 CPU 주소가 물리 뱅크에 섞여 있어 테이블 읽기도 같은 사상을 탄다. *)
-  let vr a = Char.code (Bytes.get t.vram (physical_addr t a)) in
-  let r = t.regs in
-  (* 컬러·속성 테이블 주소 = (R#11<<15 | R#5<<7 | 0x7F) & (오프셋 | ~0x3FF).
-     R#5 의 bit2..0 이 1 이어야 속성(+0x200)·컬러 테이블이 서로 다른 자리에
-     선다. 0 이면 그 비트가 오프셋을 지워 두 테이블이 같은 128바이트로
-     접힌다(openMSX VDP::updateSpriteAttributeBase). *)
-  let table_mask = (r.(11) lsl 15) lor (r.(5) lsl 7) lor 0x7f in
-  let table_addr offset = table_mask land (offset lor lnot 0x3ff) in
-  let color_addr i row = table_addr ((i * 16) + row) in
-  let attr_addr i k = table_addr (0x200 + (i * 4) + k) in
-  let pt = (r.(6) land 0x3f) lsl 11 in
-  let size16 = r.(1) land 0x02 <> 0 and mag = r.(1) land 0x01 <> 0 in
-  let edge = if size16 then 16 else 8 in
-  let step = if mag then 2 else 1 in
-  let height = edge * step in
-  let opaque0 = r.(8) land 0x20 <> 0 in
-  let entries =
-    let rec collect i acc =
-      if i = 32 || vr (attr_addr i 0) = 0xd8 then List.rev acc
-      else collect (i + 1) (i :: acc)
-    in
-    collect 0 []
-  in
-  let top i = (vr (attr_addr i 0) + 1) land 0xff in
-  (* X 는 EC 로 -32 까지 내려가고 16×16 MAG 로 +31 까지 나간다. *)
-  let origin = 32 in
-  let px = Array.make (256 + origin + 32) (-1) in
-  for line = 0 to h - 1 do
-    let on_line =
-      List.filter (fun i -> (line - top i) land 0xff < height) entries
-    in
-    let shown = List.filteri (fun k _ -> k < 8) on_line in
-    if shown <> [] then begin
-      Array.fill px 0 (Array.length px) (-1);
-      List.iter
-        (fun i ->
-          let row = ((line - top i) land 0xff) / step in
-          let cb = vr (color_addr i row) in
-          let c = cb land 0x0f and cc = cb land 0x40 <> 0 in
-          let x0 = vr (attr_addr i 1) - if cb land 0x80 <> 0 then 32 else 0 in
-          let pat = vr (attr_addr i 2) in
-          let pbase = pt + ((if size16 then pat land 0xfc else pat) * 8) in
-          let bits =
-            if size16 then (vr (pbase + row) lsl 8) lor vr (pbase + 16 + row)
-            else vr (pbase + row)
-          in
-          if c <> 0 || opaque0 then
-            for b = 0 to edge - 1 do
-              if (bits lsr (edge - 1 - b)) land 1 = 1 then
-                for mx = 0 to step - 1 do
-                  let k = x0 + (b * step) + mx + origin in
-                  if px.(k) < 0 then px.(k) <- c
-                  else if cc then px.(k) <- px.(k) lor c
-                done
-            done)
-        shown;
-      for x = 0 to 255 do
-        let c = px.(x + origin) in
-        if c >= 0 then
-          for k = 0 to xscale - 1 do
-            put ((x * xscale) + k) line c
-          done
+        end
       done
-    end
-  done
+  | _ -> ()
 
 let frame_dims t =
   match display_mode t with
@@ -717,7 +644,7 @@ let frame_rgb t =
       done;
       (* SCREEN8 의 스프라이트는 고정 팔레트라 아직 없다. *)
       if display_mode t <> Graphic7 then
-        render_sprites2 t ~h ~xscale:(w / 256) put
+        render_sprites t ~h ~xscale:(w / 256) put
     end
     else if mode_text t then begin
       (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
@@ -779,9 +706,7 @@ let frame_rgb t =
           done
         done
       done;
-      (* TEXT 는 스프라이트가 없다. SCREEN1·2 는 모드 1, SCREEN4 는 모드 2. *)
-      if display_mode t = Graphic3 then render_sprites2 t ~h ~xscale:1 put
-      else render_sprites t ~w ~h put
+      render_sprites t ~h ~xscale:1 put
     end;
     Bytes.to_string img
   end

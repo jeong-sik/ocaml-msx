@@ -15,6 +15,10 @@ val io_read : t -> port:int -> int
 (** 0x98 VRAM 읽기(버퍼) / 0x99 status0 — 읽으면 VBlank 비트와
     인터럽트 요청이 지워진다. *)
 
+val interrupt_accepted : t -> unit
+(** CPU 가 VBlank 인터럽트를 받은 시점에 상태 레지스터 선택(R#15)을 0 으로
+    되돌린다. 받지 못한 VBlank(DI 구간)는 선택을 건드리지 않는다. *)
+
 val advance : t -> cycles:int -> bool
 (** 경과 T-state 만큼 스캔라인을 진행한다. VBlank 시작(라인 192)에서
     반환값이 [true] 가 되고 인터럽트 요청이 걸린다 — 호출자는 Z80 에
