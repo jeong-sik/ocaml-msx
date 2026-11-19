@@ -14,6 +14,11 @@
  (libraries vdpcore))
 
 (test
+ (name text1_test)
+ (modules text1_test)
+ (libraries vdpcore))
+
+(test
  (name mode_test)
  (modules mode_test)
  (libraries msx))
