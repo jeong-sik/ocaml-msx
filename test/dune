@@ -69,6 +69,11 @@
  (libraries z80core))
 
 (test
+ (name z80_block_io_test)
+ (modules z80_block_io_test)
+ (libraries z80core))
+
+(test
  (name z80_xy_flags_test)
  (modules z80_xy_flags_test)
  (libraries z80core))
@@ -117,6 +122,17 @@
  (name vdp_reg_test)
  (modules vdp_reg_test)
  (libraries vdpcore))
+
+(test
+ (name core_purity_test)
+ (modules core_purity_test)
+ (deps
+  (glob_files %{project_root}/lib/*.ml)))
+
+(test
+ (name printer_port_test)
+ (modules printer_port_test)
+ (libraries msx))
 
 (test
  (name cassette_test)

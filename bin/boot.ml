@@ -142,7 +142,7 @@ let () =
         "  720프레임 워밍업 뒤 Disk ROM 2차 호출 재생 (게임 화면 경로)" );
       ( "--disk-real",
         Arg.Set disk_real,
-        "  실 디스크 ROM 코드를 cart 에 (DISK_ROM env 로 경로, 기본 cbios_disk)" );
+        "  실 디스크 ROM 코드를 cart 에 (DISK_ROM env 로 경로, 기본 --roms 의 cbios_disk.rom)" );
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
         "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc" );
@@ -159,6 +159,9 @@ let () =
       ("--out", Arg.String (fun s -> out_prefix := s), "PREFIX  덤프 접두어") ]
     (fun _ -> ())
     "boot — C-BIOS 부트";
+  let env_on name = match Sys.getenv_opt name with Some v -> v <> "" | None -> false in
+  Msx.set_fdc_trace (env_on "FDC_TRACE");
+  Msx.set_ppi_trace (env_on "PPI_TRACE");
   let roms =
     List.map
       (fun f -> read_file (Filename.concat !rom_dir f))
@@ -189,7 +192,20 @@ let () =
      | Ok () -> ()
      | Error e -> Printf.ksprintf failwith "--cas %s: %s" !cas e);
   if !disk <> "" then begin
-    Msx.load_disk ~interface_rom:(not !disk_warm) ~real_rom:!disk_real t (read_file !disk);
+    let disk_rom =
+      if not !disk_real then None
+      else begin
+        let path =
+          match Sys.getenv_opt "DISK_ROM" with
+          | Some path -> path
+          | None -> Filename.concat !rom_dir "cbios_disk.rom"
+        in
+        match Msx.disk_rom_of_string (read_file path) with
+        | Ok rom -> Some rom
+        | Error e -> Printf.ksprintf failwith "--disk-real %s: %s" path e
+      end
+    in
+    Msx.load_disk ~interface_rom:(not !disk_warm) ?disk_rom t (read_file !disk);
     if !tap_key_spec <> "" then tap_keys := parse_tap_keys !tap_key_spec;
   Msx.set_disk_call_log true
   end;
