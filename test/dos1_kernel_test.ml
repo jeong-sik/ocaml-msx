@@ -12,7 +12,8 @@
    - SFIRST with ????????TXT finds HELLO.TXT; DTA = drive 1 + the 32-byte entry
    - FCB opened at one address, copied, then read through the copy (_RDBLK) --
      what COMMAND.COM does with the entry a search leaves in its DTA
-   - SFIRST of a name that is not there fails
+   - SFIRST of a name that is not there fails; SFIRST and SNEXT over every
+     file return them in directory order and then fail
    - _CONOUT, _STROUT, _CONIN and _BUFIN reach the BIOS CHPUT and CHGET with
      the default DTA (0080h-00FFh, which overlaps the fixed vectors at 009Fh
      and 00A2h) full of file data. CHGET hands out the keys K a b c d BS e CR in
@@ -80,13 +81,18 @@ let stub_code =
 
 (* COMMAND.COM: code, then the three FCBs, then the page 1 stub. *)
 let command_com () =
-  let code ~pat ~hello ~none ~msg ~keys ~stub =
+  let code ~pat ~hello ~none ~all ~msg ~keys ~stub =
     di
     @ ld_a 0x5a @ st_a result
     (* SFIRST ????????TXT *)
     @ ld_de pat @ ld_c 0x11 @ call bdos @ st_a 0xc101
     @ ld_a_mem dta @ st_a 0xc10a
     @ ld_a_mem (dta + 1) @ st_a 0xc102
+    (* SFIRST and SNEXT over every file: MSXDOS.SYS, COMMAND.COM, HELLO.TXT *)
+    @ ld_de all @ ld_c 0x11 @ call bdos @ ld_a_mem (dta + 1) @ st_a 0xc180
+    @ ld_de all @ ld_c 0x12 @ call bdos @ ld_a_mem (dta + 1) @ st_a 0xc181
+    @ ld_de all @ ld_c 0x12 @ call bdos @ ld_a_mem (dta + 1) @ st_a 0xc182
+    @ ld_de all @ ld_c 0x12 @ call bdos @ st_a 0xc183
     (* open HELLO.TXT, copy the FCB, read one record through the copy *)
     @ ld_de hello @ ld_c 0x0f @ call bdos @ st_a 0xc103
     @ ld_hl hello @ ld_de fcb_copy @ ld_bc fcb_size @ ldir
@@ -109,15 +115,16 @@ let command_com () =
     @ ld_hl stub @ ld_de page1_stub @ ld_bc (List.length stub_code) @ ldir
     @ jp page1_stub
   in
-  let code_len = List.length (code ~pat:0 ~hello:0 ~none:0 ~msg:0 ~keys:0 ~stub:0) in
+  let code_len = List.length (code ~pat:0 ~hello:0 ~none:0 ~all:0 ~msg:0 ~keys:0 ~stub:0) in
   let pat = 0x100 + code_len in
   let hello = pat + fcb_size in
   let none = hello + fcb_size in
-  let msg = none + fcb_size in
+  let all = none + fcb_size in
+  let msg = all + fcb_size in
   let keys = msg + 3 in
   let stub = keys + List.length key_queue in
-  code ~pat ~hello ~none ~msg ~keys ~stub
-  @ fcb "????????TXT" @ fcb "HELLO   TXT" @ fcb "NOSUCH  TXT"
+  code ~pat ~hello ~none ~all ~msg ~keys ~stub
+  @ fcb "????????TXT" @ fcb "HELLO   TXT" @ fcb "NOSUCH  TXT" @ fcb "???????????"
   @ [ Char.code 'B'; Char.code 'C'; Char.code '$' ]
   @ key_queue
   @ stub_code
@@ -151,10 +158,11 @@ let kernel_sys () =
   put 0x138 [ 0x31; 0x00; 0x90; 0x21; 0xc9; 0xf1; 0xcd; 0x30; 0x40 ];
   b
 
-(* A first file that is not the kernel: it just stores a marker. *)
+(* A first file that is not the kernel: it stores a marker and calls SNEXT at
+   the legacy BDOS entry (0F37Dh), which has no search to continue. *)
 let other_sys () =
   let b = Bytes.make 2432 '\000' in
-  List.iteri (fun i v -> Bytes.set b i (Char.chr v)) (ld_a 0x77 @ st_a result @ halt);
+  List.iteri (fun i v -> Bytes.set b i (Char.chr v)) (ld_a 0x77 @ st_a result @ ld_c 0x12 @ call 0xf37d @ st_a 0xc190 @ halt);
   b
 
 let word b i = Char.code (Bytes.get b i) lor (Char.code (Bytes.get b (i + 1)) lsl 8)
@@ -232,6 +240,9 @@ let () =
   check "the copy's read filled the DMA with the file"
     (byte 0xc105 = Char.code 'H' && byte 0xc106 = Char.code 'E');
   check "SFIRST of an absent name fails" (byte 0xc107 = 0xff);
+  check "SFIRST and SNEXT walk MSXDOS, COMMAND, HELLO and then fail"
+    (List.init 4 (fun i -> byte (0xc180 + i))
+     = [ Char.code 'M'; Char.code 'C'; Char.code 'H'; 0xff ]);
   check "_CONOUT, _STROUT, _CONIN and _BUFIN printed A, BC and every echoed key through CHPUT"
     (List.init 10 (fun i -> byte (0xc140 + i))
      = List.map Char.code [ 'A'; 'B'; 'C'; 'K'; 'a'; 'b'; 'c'; '\b'; 'e'; '\r' ]);
@@ -265,6 +276,7 @@ let () =
   let t = boot (other_sys ()) in
   check "a first file without the kernel bytes runs as it is" (Msx.mem_read t result = 0x77);
   check "COMMAND.COM did not run" (Msx.mem_read t 0xc101 = 0x00);
+  check "SNEXT through the legacy BDOS entry fails" (Msx.mem_read t 0xc190 = 0xff);
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1

@@ -1363,6 +1363,10 @@ let dos1_conout_stub = 0xe500
 let dos1_strout_stub = 0xe504
 let dos1_conin_stub = 0xe520
 let dos1_linein_stub = 0xe560
+
+(* Where a directory search stands: the number of entries it has returned,
+   a word in the kernel's data area, which a program does not touch. *)
+let dos1_search_count = 0xe310
 let dos1_console_stubs =
   [ dos1_conout_stub,
     [ 0x7b; 0xc3; dos1_chput land 0xff; dos1_chput lsr 8 ];
@@ -2381,19 +2385,29 @@ and disk_trap_serve t pc =
       | 0x0e ->
         (* _SELDSK: the drive count. The image is the only drive. *)
         0x01
-      | 0x11 ->
-        (* _SFIRST: the first root entry matching the FCB's name ('?' = any
-           byte). The DTA gets the drive number (1 = A:) and the 32-byte
-           entry, the shape COMMAND.COM then opens a file from. *)
+      | 0x12 when not dos1_entry -> 0xff
+      | 0x11 | 0x12 ->
+        (* _SFIRST / _SNEXT: the next root entry matching the FCB's name
+           ('?' = any byte). The DTA gets the drive number (1 = A:) and the
+           32-byte entry, the shape COMMAND.COM then opens a file from. A
+           DOS 1 search continues after the entries already returned, counted
+           at [dos1_search_count]. *)
         let pattern = String.init 11 (fun i -> Char.chr (fcb (1 + i))) in
-        let fs = fat12_of t in
-        (match fat12_search t fs pattern with
-         | [] -> 0xff
-         | e :: _ ->
+        let returned =
+          if c = 0x12 then mem_read t dos1_search_count lor (mem_read t (dos1_search_count + 1) lsl 8)
+          else 0
+        in
+        (match List.nth_opt (fat12_search t (fat12_of t) pattern) returned with
+         | None -> 0xff
+         | Some e ->
            mem_write t t.disk_dma 0x01;
            for i = 0 to 31 do
              mem_write t ((t.disk_dma + 1 + i) land 0xffff) (dsk_u8 t (e + i))
            done;
+           if dos1_entry then begin
+             mem_write t dos1_search_count ((returned + 1) land 0xff);
+             mem_write t (dos1_search_count + 1) (((returned + 1) lsr 8) land 0xff)
+           end;
            0x00)
       | _ -> 0xff
     in
