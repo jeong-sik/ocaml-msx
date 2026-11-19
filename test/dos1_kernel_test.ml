@@ -13,9 +13,11 @@
    - FCB opened at one address, copied, then read through the copy (_RDBLK) --
      what COMMAND.COM does with the entry a search leaves in its DTA
    - SFIRST of a name that is not there fails
-   - _CONOUT, _STROUT and _CONIN reach the BIOS CHPUT and CHGET with the
-     default DTA (0080h-00FFh, which overlaps the fixed vectors at 009Fh and
-     00A2h) full of file data
+   - _CONOUT, _STROUT, _CONIN and _BUFIN reach the BIOS CHPUT and CHGET with
+     the default DTA (0080h-00FFh, which overlaps the fixed vectors at 009Fh
+     and 00A2h) full of file data. CHGET hands out the keys K a b c d BS e CR in
+     turn; _BUFIN (3 keys at most) must end with "abe" and echo every key
+     it kept.
    - CALSLT into a ROM routine that runs at the address it will return to:
      the caller sits in page 1 RAM at 410Bh, the ROM routine jumps to 410Bh
      of the ROM and returns from there. The wiring must come back only when
@@ -58,6 +60,12 @@ let calslt_vector = 0x001c
 let rom_routine = 0x4000
 let chget_vector = 0x009f
 let chput_vector = 0x00a2
+let chget_routine = 0x0200
+let line_buffer = 0x0500
+
+(* What CHGET hands out: the key for _CONIN, then a line for a 3 key buffer: a
+   key past the limit (d) is dropped and BS takes one back. *)
+let key_queue = List.map Char.code [ 'K'; 'a'; 'b'; 'c'; 'd'; '\b'; 'e'; '\r' ]
 
 let fcb name = 0x00 :: List.init 11 (fun i -> Char.code name.[i]) @ List.init (fcb_size - 12) (fun _ -> 0)
 
@@ -72,7 +80,7 @@ let stub_code =
 
 (* COMMAND.COM: code, then the three FCBs, then the page 1 stub. *)
 let command_com () =
-  let code ~pat ~hello ~none ~msg ~stub =
+  let code ~pat ~hello ~none ~msg ~keys ~stub =
     di
     @ ld_a 0x5a @ st_a result
     (* SFIRST ????????TXT *)
@@ -87,24 +95,31 @@ let command_com () =
     @ ld_a_mem (dta + 1) @ st_a 0xc106
     (* SFIRST of a name that is not on the disk *)
     @ ld_de none @ ld_c 0x11 @ call bdos @ st_a 0xc107
-    (* console: CHPUT stores each character at (C130), CHGET answers 'K' *)
+    (* console: CHPUT stores each character at (C130), CHGET reads the keys
+       copied to (C170) *)
+    @ ld_hl keys @ ld_de 0xc170 @ ld_bc (List.length key_queue) @ ldir
+    @ ld_hl 0xc170 @ [ 0x22; 0x32; 0xc1 ]
     @ ld_hl 0xc140 @ [ 0x22; 0x30; 0xc1 ]
     @ [ 0x1e; Char.code 'A' ] @ ld_c 0x02 @ call bdos
     @ ld_de msg @ ld_c 0x09 @ call bdos
     @ ld_c 0x01 @ call bdos @ st_a 0xc12f
+    @ ld_a 3 @ st_a line_buffer @ ld_a 0 @ st_a (line_buffer + 1)
+    @ ld_de line_buffer @ ld_c 0x0a @ call bdos
     (* CALSLT whose callee runs at the return address *)
     @ ld_hl stub @ ld_de page1_stub @ ld_bc (List.length stub_code) @ ldir
     @ jp page1_stub
   in
-  let code_len = List.length (code ~pat:0 ~hello:0 ~none:0 ~msg:0 ~stub:0) in
+  let code_len = List.length (code ~pat:0 ~hello:0 ~none:0 ~msg:0 ~keys:0 ~stub:0) in
   let pat = 0x100 + code_len in
   let hello = pat + fcb_size in
   let none = hello + fcb_size in
   let msg = none + fcb_size in
-  let stub = msg + 3 in
-  code ~pat ~hello ~none ~msg ~stub
+  let keys = msg + 3 in
+  let stub = keys + List.length key_queue in
+  code ~pat ~hello ~none ~msg ~keys ~stub
   @ fcb "????????TXT" @ fcb "HELLO   TXT" @ fcb "NOSUCH  TXT"
   @ [ Char.code 'B'; Char.code 'C'; Char.code '$' ]
+  @ key_queue
   @ stub_code
 
 (* Slot 0 page 1: the ROM routine jumps to the address its caller will return
@@ -112,7 +127,9 @@ let command_com () =
 let main_rom ?(wait = false) () =
   let rom = Bytes.make 0x8000 '\000' in
   let put addr bytes = List.iteri (fun i b -> Bytes.set rom (addr + i) (Char.chr b)) bytes in
-  put chget_vector (ld_a (Char.code 'K') @ [ 0xc9 ]);
+  (* CHGET: the next key of the queue at (C132) *)
+  put chget_vector (jp chget_routine);
+  put chget_routine [ 0x2a; 0x32; 0xc1; 0x7e; 0x23; 0x22; 0x32; 0xc1; 0xc9 ];
   (* CHPUT: store A at (C130) and advance it *)
   put chput_vector
     [ 0xe5; 0x2a; 0x30; 0xc1; 0x77; 0x23; 0x22; 0x30; 0xc1; 0xe1; 0xc9 ];
@@ -215,8 +232,13 @@ let () =
   check "the copy's read filled the DMA with the file"
     (byte 0xc105 = Char.code 'H' && byte 0xc106 = Char.code 'E');
   check "SFIRST of an absent name fails" (byte 0xc107 = 0xff);
-  check "_CONOUT, _STROUT and _CONIN printed A, BC and the echoed key through CHPUT"
-    (List.init 4 (fun i -> byte (0xc140 + i)) = [ 0x41; 0x42; 0x43; 0x4b ]);
+  check "_CONOUT, _STROUT, _CONIN and _BUFIN printed A, BC and every echoed key through CHPUT"
+    (List.init 10 (fun i -> byte (0xc140 + i))
+     = List.map Char.code [ 'A'; 'B'; 'C'; 'K'; 'a'; 'b'; 'c'; '\b'; 'e'; '\r' ]);
+  check "_BUFIN ended with the line abe"
+    (byte (line_buffer + 1) = 3
+     && List.init 3 (fun i -> byte (line_buffer + 2 + i))
+        = List.map Char.code [ 'a'; 'b'; 'e' ]);
   check "_CONIN returned the key CHGET gave" (byte 0xc12f = Char.code 'K');
   check "the DTA holds file data where the fixed vectors are" (byte 0x9f = Char.code 'x' && byte 0xa2 = Char.code 'x');
   check "CALSLT: the ROM routine ran at the return address under its own wiring"

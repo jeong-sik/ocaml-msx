@@ -1356,12 +1356,13 @@ let dos1_vectors =
    The fixed BIOS vectors in page 0 cannot carry this: a DOS program's
    default DTA (0080h-00FFh) overlaps 009Fh and 00A2h, and its data is not a
    vector. CONOUT: LD A,E / JP CHPUT. STROUT: print (DE) up to '$'. CONIN:
-   CHGET, then the key is echoed. *)
+   CHGET, then the key is echoed. BUFIN: a line of keys. *)
 let dos1_chput = 0xe540
 let dos1_chget = 0xe543
 let dos1_conout_stub = 0xe500
 let dos1_strout_stub = 0xe504
 let dos1_conin_stub = 0xe520
+let dos1_linein_stub = 0xe560
 let dos1_console_stubs =
   [ dos1_conout_stub,
     [ 0x7b; 0xc3; dos1_chput land 0xff; dos1_chput lsr 8 ];
@@ -1379,7 +1380,23 @@ let dos1_console_stubs =
       0xf5;                   (* PUSH AF *)
       0xcd; dos1_chput land 0xff; dos1_chput lsr 8;  (* _CONIN echoes the key *)
       0xf1;                   (* POP AF *)
-      0xc9 ] ]
+      0xc9 ];
+    (* _BUFIN: DE = [max; length; text...]. Keys come from CHGET and echo
+       through CHPUT; CR ends the line, BS takes the last key back, control
+       keys and keys past [max] are dropped. The routine at 0E5A0h (CHPUT
+       with HL, BC and DE kept) is called by it. *)
+    dos1_linein_stub,
+    [
+      0x62; 0x6b; 0x23; 0x23; 0x06; 0x00; 0xe5; 0xc5;
+      0xd5; 0xcd; 0x43; 0xe5; 0xd1; 0xc1; 0xe1; 0xfe;
+      0x0d; 0x28; 0x23; 0xfe; 0x08; 0x28; 0x12; 0xfe;
+      0x20; 0x38; 0xeb; 0x4f; 0x1a; 0xb8; 0x28; 0xe6;
+      0x79; 0x77; 0x23; 0x04; 0xcd; 0xa0; 0xe5; 0x18;
+      0xdd; 0x78; 0xb7; 0x28; 0xd9; 0x05; 0x2b; 0x3e;
+      0x08; 0xcd; 0xa0; 0xe5; 0x18; 0xd0; 0x3e; 0x0d;
+      0xcd; 0xa0; 0xe5; 0x13; 0x78; 0x12; 0x1b; 0xc9;
+      0xe5; 0xc5; 0xd5; 0xcd; 0x40; 0xe5; 0xd1; 0xc1;
+      0xe1; 0xc9 ] ]
 
 (* The bytes of MSXDOS.SYS that identify the standard kernel: the JP 0200h at
    its start and, at 0238h, LD SP,9000h / LD HL,F1C9h / CALL 4030h. *)
@@ -2083,12 +2100,13 @@ and disk_trap_serve t pc =
       else if c = 0x02 || (c = 0x06 && de land 0xff <> 0xff) then Some dos1_conout_stub
       else if c = 0x09 then Some dos1_strout_stub
       else if c = 0x01 then Some dos1_conin_stub
+      else if c = 0x0a then Some dos1_linein_stub
       else None
     in
     match console_stub with
     | Some stub ->
-      (* _CONIN, _CONOUT, _DIRIO output and _STROUT go through the BIOS; the
-         stub returns to the caller itself. *)
+      (* _CONIN, _BUFIN, _CONOUT, _DIRIO output and _STROUT go through the BIOS;
+         the stub returns to the caller itself. *)
       Z80.set_pc t.cpu stub;
       true
     | None ->
