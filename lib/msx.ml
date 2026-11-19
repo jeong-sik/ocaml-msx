@@ -1352,6 +1352,23 @@ let boot_disk t =
       mem_write t (0xfcc5 + i) 0x00;
       mem_write t (0xf340 + i) 0x8b
     done;
+    (* What a real disk ROM's INIT leaves for the BIOS, which the warm-up
+       replay skips (#147). Europa Sensen's boot sector needs both:
+       - DRVTBL (0xFB21): drive count, then the interface's slot id. It halts
+         on "Reset and hold CTRL!" unless the count is 1. This machine has one
+         floppy drive, mounted here in slot 2 (not expanded).
+       - H.PHYD (0xFFA7), the BIOS's physical-disk-I/O hook: RST 30h, the slot
+         byte, the address of DSKIO in the interface ROM, RET. The boot sector
+         loads its program with CALL 0xFFA7 and the standard DSKIO registers.
+       A real ROM (cart_is_disk_rom) writes both itself. *)
+    if not t.cart_is_disk_rom then begin
+      let drvtbl = 0xfb21 and h_phyd = 0xffa7 in
+      mem_write t drvtbl 1;
+      mem_write t (drvtbl + 1) 0x02;
+      List.iteri
+        (fun i b -> mem_write t (h_phyd + i) b)
+        [ 0xf7; 0x02; disk_dskio_entry land 0xff; disk_dskio_entry lsr 8; 0xc9 ]
+    end;
     t.rst30_pending <- [];
     (* KEYBUF 에 스페이스 하나를 미리 넣어둔다 — 룬마스터 1 의 커널은
        워밍업 재생 구간(720 프레임) 안에서 CONIN 을 부르고(실측 ≈409) 빈
