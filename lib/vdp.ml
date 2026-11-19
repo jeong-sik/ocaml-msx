@@ -525,7 +525,7 @@ let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
 
 (* 스프라이트 모드 1 — SCREEN1-3. SAT = R#5<<7 (32엔트리 × 4바이트:
    Y, X, 패턴번호, 컬러), PT = R#6<<11. R#1 bit0 = MAG(2배), bit1 =
-   SIZE(16×16). 맨 윗줄은 Y+1 줄이고(Y=0xFF 가 0번 줄), 줄 번호는
+   SIZE(16×16, 패턴번호 하위 2비트는 버리고 번호 ×8 바이트). 맨 윗줄은 Y+1 줄이고(Y=0xFF 가 0번 줄), 줄 번호는
    256 으로 돌아 나가 Y=0xF0 의 16×16 은 아랫부분 한 줄만 0번 줄에 걸린다.
    Y=0xD0 인 엔트리부터 뒤는 없다. 컬러 0 은 투명, 컬러 bit7(EC) 은
    X 를 32px 왼쪽으로 민다(openMSX 와 같은 최소 ROM 으로 확인). 우선순위는 번호가 낮은 쪽이 위 — 큰 번호부터
@@ -537,7 +537,6 @@ let render_sprites t ~w ~h put =
   let pt = (t.regs.(6) land 0x07) lsl 11 in
   let size16 = t.regs.(1) land 0x02 <> 0 in
   let mag = t.regs.(1) land 0x01 <> 0 in
-  let pat_len = if size16 then 32 else 8 in
   let edge = if size16 then 16 else 8 in
   let step = if mag then 2 else 1 in
   let sput x y c =
@@ -561,9 +560,7 @@ let render_sprites t ~w ~h put =
       let c = col land 0x0f in
       let x0 = if col land 0x80 <> 0 then x_raw - 32 else x_raw in
       if c <> 0 then
-        let pbase =
-          pt + (if size16 then (pat land 0xfc) * pat_len else pat * pat_len)
-        in
+        let pbase = pt + ((if size16 then pat land 0xfc else pat) * 8) in
         for dy = 0 to (edge * step) - 1 do
           let row = dy / step in
           let line = (top + dy) land 0xff in

@@ -106,13 +106,13 @@ let () =
   check "transparent: color 0 draws nothing" (is_col t 50 101 0)
 
 let () =
-  (* 5. 16×16: 패턴번호 하위 2비트는 버리고 ×32 바이트 *)
+  (* 5. 16×16: 패턴번호 하위 2비트는 버리고 번호 ×8 바이트 *)
   let t = Vdp.create () in
   screen1 t ~r1:0xe2 ();
   (* 패턴 4 의 첫 줄만 왼쪽 픽셀 2개 *)
   for row = 0 to 15 do
-    vram_w t (pt + 4 * 32 + row * 2) (if row = 0 then 0xc0 else 0x00);
-    vram_w t (pt + 4 * 32 + row * 2 + 1) 0x00
+    vram_w t (pt + (4 * 8) + row * 2) (if row = 0 then 0xc0 else 0x00);
+    vram_w t (pt + (4 * 8) + row * 2 + 1) 0x00
   done;
   sat_w t 0 100 50 5 9; (* pat 5 → 4 와 같은 패턴 *)
   check "16x16: (50,101) set" (is_col t 50 101 9);
