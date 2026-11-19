@@ -13,6 +13,9 @@
    - FCB opened at one address, copied, then read through the copy (_RDBLK) --
      what COMMAND.COM does with the entry a search leaves in its DTA
    - SFIRST of a name that is not there fails
+   - _CONOUT, _STROUT and _CONIN reach the BIOS CHPUT and CHGET with the
+     default DTA (0080h-00FFh, which overlaps the fixed vectors at 009Fh and
+     00A2h) full of file data
    - CALSLT into a ROM routine that runs at the address it will return to:
      the caller sits in page 1 RAM at 410Bh, the ROM routine jumps to 410Bh
      of the ROM and returns from there. The wiring must come back only when
@@ -53,6 +56,8 @@ let fcb_size = 0x25
 let page1_stub = 0x4100
 let calslt_vector = 0x001c
 let rom_routine = 0x4000
+let chget_vector = 0x009f
+let chput_vector = 0x00a2
 
 let fcb name = 0x00 :: List.init 11 (fun i -> Char.code name.[i]) @ List.init (fcb_size - 12) (fun _ -> 0)
 
@@ -67,7 +72,7 @@ let stub_code =
 
 (* COMMAND.COM: code, then the three FCBs, then the page 1 stub. *)
 let command_com () =
-  let code ~pat ~hello ~none ~stub =
+  let code ~pat ~hello ~none ~msg ~stub =
     di
     @ ld_a 0x5a @ st_a result
     (* SFIRST ????????TXT *)
@@ -82,17 +87,24 @@ let command_com () =
     @ ld_a_mem (dta + 1) @ st_a 0xc106
     (* SFIRST of a name that is not on the disk *)
     @ ld_de none @ ld_c 0x11 @ call bdos @ st_a 0xc107
+    (* console: CHPUT stores each character at (C130), CHGET answers 'K' *)
+    @ ld_hl 0xc140 @ [ 0x22; 0x30; 0xc1 ]
+    @ [ 0x1e; Char.code 'A' ] @ ld_c 0x02 @ call bdos
+    @ ld_de msg @ ld_c 0x09 @ call bdos
+    @ ld_c 0x01 @ call bdos @ st_a 0xc12f
     (* CALSLT whose callee runs at the return address *)
     @ ld_hl stub @ ld_de page1_stub @ ld_bc (List.length stub_code) @ ldir
     @ jp page1_stub
   in
-  let code_len = List.length (code ~pat:0 ~hello:0 ~none:0 ~stub:0) in
+  let code_len = List.length (code ~pat:0 ~hello:0 ~none:0 ~msg:0 ~stub:0) in
   let pat = 0x100 + code_len in
   let hello = pat + fcb_size in
   let none = hello + fcb_size in
-  let stub = none + fcb_size in
-  code ~pat ~hello ~none ~stub
+  let msg = none + fcb_size in
+  let stub = msg + 3 in
+  code ~pat ~hello ~none ~msg ~stub
   @ fcb "????????TXT" @ fcb "HELLO   TXT" @ fcb "NOSUCH  TXT"
+  @ [ Char.code 'B'; Char.code 'C'; Char.code '$' ]
   @ stub_code
 
 (* Slot 0 page 1: the ROM routine jumps to the address its caller will return
@@ -100,6 +112,10 @@ let command_com () =
 let main_rom () =
   let rom = Bytes.make 0x8000 '\000' in
   let put addr bytes = List.iteri (fun i b -> Bytes.set rom (addr + i) (Char.chr b)) bytes in
+  put chget_vector (ld_a (Char.code 'K') @ [ 0xc9 ]);
+  (* CHPUT: store A at (C130) and advance it *)
+  put chput_vector
+    [ 0xe5; 0x2a; 0x30; 0xc1; 0x77; 0x23; 0x22; 0x30; 0xc1; 0xe1; 0xc9 ];
   put rom_routine (jp stub_return);
   put stub_return (ld_a 0x11 @ st_a 0xc111 @ [ 0xc9 ]);
   Bytes.to_string rom
@@ -153,7 +169,7 @@ let image ~sys =
   let b = blank_image () in
   let b = put b "MSXDOS  SYS" sys in
   let b = put b "COMMAND COM" (bytes_of (command_com ())) in
-  let b = put b "HELLO   TXT" (Bytes.of_string "HELLO") in
+  let b = put b "HELLO   TXT" (Bytes.of_string ("HELLO" ^ String.make 123 'x')) in
   let cluster = word b ((root_sector * 512) + 26) in
   let sector = data_sector + ((cluster - 2) * sectors_per_cluster) in
   let boot =
@@ -196,6 +212,10 @@ let () =
   check "the copy's read filled the DMA with the file"
     (byte 0xc105 = Char.code 'H' && byte 0xc106 = Char.code 'E');
   check "SFIRST of an absent name fails" (byte 0xc107 = 0xff);
+  check "_CONOUT, _STROUT and _CONIN printed A, BC and the echoed key through CHPUT"
+    (List.init 4 (fun i -> byte (0xc140 + i)) = [ 0x41; 0x42; 0x43; 0x4b ]);
+  check "_CONIN returned the key CHGET gave" (byte 0xc12f = Char.code 'K');
+  check "the DTA holds file data where the fixed vectors are" (byte 0x9f = Char.code 'x' && byte 0xa2 = Char.code 'x');
   check "CALSLT: the ROM routine ran at the return address under its own wiring"
     (byte 0xc111 = 0x11);
   check "CALSLT: the caller continued after the return" (byte 0xc110 = 0x99);

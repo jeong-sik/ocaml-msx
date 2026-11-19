@@ -1342,6 +1342,38 @@ let dos1_vectors =
   [ 0x0c, dos1_rdslt; 0x14, dos1_wrslt; 0x1c, dos1_calslt; 0x24, dos1_enaslt;
     0x38, dos1_irq ]
 
+(* Console output goes through the BIOS, as the DOS kernel sends it. The
+   BDOS trap jumps into one of three routines with the caller's return
+   address on the stack. They call [dos1_chput] and [dos1_chget], addresses
+   [disk_trap] serves by running the BIOS routine with page 0 on the BIOS.
+   The fixed BIOS vectors in page 0 cannot carry this: a DOS program's
+   default DTA (0080h-00FFh) overlaps 009Fh and 00A2h, and its data is not a
+   vector. CONOUT: LD A,E / JP CHPUT. STROUT: print (DE) up to '$'. CONIN:
+   CHGET, then the key is echoed. *)
+let dos1_chput = 0xe540
+let dos1_chget = 0xe543
+let dos1_conout_stub = 0xe500
+let dos1_strout_stub = 0xe504
+let dos1_conin_stub = 0xe520
+let dos1_console_stubs =
+  [ dos1_conout_stub,
+    [ 0x7b; 0xc3; dos1_chput land 0xff; dos1_chput lsr 8 ];
+    dos1_strout_stub,
+    [ 0x1a;                   (* LD A,(DE) *)
+      0xfe; 0x24;             (* CP '$' *)
+      0xc8;                   (* RET Z *)
+      0xd5;                   (* PUSH DE *)
+      0xcd; dos1_chput land 0xff; dos1_chput lsr 8;
+      0xd1;                   (* POP DE *)
+      0x13;                   (* INC DE *)
+      0x18; 0xf4 ];           (* JR STROUT *)
+    dos1_conin_stub,
+    [ 0xcd; dos1_chget land 0xff; dos1_chget lsr 8;  (* waits for a key *)
+      0xf5;                   (* PUSH AF *)
+      0xcd; dos1_chput land 0xff; dos1_chput lsr 8;  (* _CONIN echoes the key *)
+      0xf1;                   (* POP AF *)
+      0xc9 ] ]
+
 (* The bytes of MSXDOS.SYS that identify the standard kernel: the JP 0200h at
    its start and, at 0238h, LD SP,9000h / LD HL,F1C9h / CALL 4030h. *)
 let dos1_kernel_image t =
@@ -1371,6 +1403,7 @@ let dos1_start t ~cold =
     plant 0x00 [ 0xc3; dos1_warm_boot land 0xff; dos1_warm_boot lsr 8; 0x00; 0x00;
                  0xc3; dos1_bdos land 0xff; dos1_bdos lsr 8 ];
     List.iter (fun (a, dest) -> plant a [ 0xc3; dest land 0xff; dest lsr 8 ]) dos1_vectors;
+    List.iter (fun (a, bytes) -> plant a bytes) dos1_console_stubs;
     List.iter
       (fun fcb ->
         mem_write t fcb 0;
@@ -1809,6 +1842,16 @@ and disk_trap_serve t pc =
     Z80.set_pc t.cpu (serve_enaslt t);
     true
   end
+  else if (pc = dos1_chput || pc = dos1_chget) && dos1_planted t then begin
+    (* A call of the console stubs: run CHPUT or CHGET with page 0 on the
+       BIOS; the routine's RET comes back through the trampoline. *)
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+    defer_return t ~ret;
+    t.ppi_a <- t.ppi_a land 0xfc;
+    Z80.set_pc t.cpu (if pc = dos1_chput then 0x00a2 else 0x009f);
+    true
+  end
   else if pc = disk_rst30_entry && t.ppi_a land 3 = 3 then begin
     Z80.set_pc t.cpu (serve_rst30 t);
     true
@@ -2028,6 +2071,21 @@ and disk_trap_serve t pc =
     if !disk_call_log then
       disk_calls := (pc, c, Z80.dump_bc t.cpu, de, Z80.dump_hl t.cpu, Z80.dump_f t.cpu)
                     :: !disk_calls;
+    let dos1_entry = pc = dos1_bdos in
+    let console_stub =
+      if not dos1_entry then None
+      else if c = 0x02 || (c = 0x06 && de land 0xff <> 0xff) then Some dos1_conout_stub
+      else if c = 0x09 then Some dos1_strout_stub
+      else if c = 0x01 then Some dos1_conin_stub
+      else None
+    in
+    match console_stub with
+    | Some stub ->
+      (* _CONIN, _CONOUT, _DIRIO output and _STROUT go through the BIOS; the
+         stub returns to the caller itself. *)
+      Z80.set_pc t.cpu stub;
+      true
+    | None ->
     let a =
       match c with
       | 0x06 ->
