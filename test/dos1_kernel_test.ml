@@ -159,10 +159,15 @@ let kernel_sys () =
   b
 
 (* A first file that is not the kernel: it stores a marker and calls SNEXT at
-   the legacy BDOS entry (0F37Dh), which has no search to continue. *)
+   the legacy BDOS entry (0F37Dh), which has no search to continue, with the
+   DOS 1 search count at zero. *)
 let other_sys () =
   let b = Bytes.make 2432 '\000' in
-  List.iteri (fun i v -> Bytes.set b i (Char.chr v)) (ld_a 0x77 @ st_a result @ ld_c 0x12 @ call 0xf37d @ st_a 0xc190 @ halt);
+  List.iteri (fun i v -> Bytes.set b i (Char.chr v)) (ld_a 0x77 @ st_a result
+     (* an FCB that matches every file, then SNEXT *)
+     @ ld_hl 0x0501 @ [ 0x36; 0x3f ] @ ld_de 0x0502 @ ld_bc 10 @ ldir
+     @ ld_a 0 @ st_a 0xe310 @ st_a 0xe311
+     @ ld_de 0x0500 @ ld_c 0x12 @ call 0xf37d @ st_a 0xc190 @ halt);
   b
 
 let word b i = Char.code (Bytes.get b i) lor (Char.code (Bytes.get b (i + 1)) lsl 8)
