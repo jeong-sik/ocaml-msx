@@ -233,7 +233,9 @@ let () =
    | Error e -> check ("restore: " ^ e) false
    | Ok r ->
      Msx.mem_write r 0xc150 1;
+     Msx.mem_write r result 0x00;
      Msx.step r ~frames:2;
+     check "restored: the program was not started again" (Msx.mem_read r result = 0x00);
      check "restored: the callee returned through the trampoline" (Msx.mem_read r 0xc111 = 0x11);
      check "restored: the caller continued after the return" (Msx.mem_read r 0xc110 = 0x99);
      check "restored: all four pages are RAM again" (Msx.ppi_a r = 0xff));
