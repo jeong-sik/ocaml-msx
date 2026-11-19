@@ -42,11 +42,20 @@ type t = {
 let m8 x = x land 0xff
 let m16 x = x land 0xffff
 
+(* Power-on values as openMSX CPUCore::doReset sets them. A real Z80 starts
+   with AF and SP at 0xFFFF and the other pairs undefined; openMSX fills those
+   and the alternate set with 0xFFFF too. PC, I, R, IM and the interrupt
+   flip-flops start at 0. Dragon Quest 2 (MSX1) reads DE' before it writes
+   it, so a zeroed DE' sends it down another path. *)
+let power_on_byte = 0xff
+let power_on_word = 0xffff
+
 let create ~read ~write ~port_in ~port_out =
+  let v = power_on_byte in
   {
-    a = 0; f = 0; b = 0; c = 0; d = 0; e = 0; h = 0; l = 0;
-    a2 = 0; f2 = 0; b2 = 0; c2 = 0; d2 = 0; e2 = 0; h2 = 0; l2 = 0;
-    ix = 0; iy = 0; sp = 0xffff; pc = 0;
+    a = v; f = v; b = v; c = v; d = v; e = v; h = v; l = v;
+    a2 = v; f2 = v; b2 = v; c2 = v; d2 = v; e2 = v; h2 = v; l2 = v;
+    ix = power_on_word; iy = power_on_word; sp = power_on_word; pc = 0;
     i = 0; r = 0;
     iff1 = false; iff2 = false; im = 0;
     halted = false;
