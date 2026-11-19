@@ -42,11 +42,20 @@ type t = {
 let m8 x = x land 0xff
 let m16 x = x land 0xffff
 
+(* Power-on values as openMSX CPUCore::doReset sets them. A real Z80 starts
+   with AF and SP at 0xFFFF and the other pairs undefined; openMSX fills those
+   and the alternate set with 0xFFFF too. PC, I, R, IM and the interrupt
+   flip-flops start at 0. Dragon Quest 2 (MSX1) reads DE' before it writes
+   it, so a zeroed DE' sends it down another path. *)
+let power_on_byte = 0xff
+let power_on_word = 0xffff
+
 let create ~read ~write ~port_in ~port_out =
+  let v = power_on_byte in
   {
-    a = 0; f = 0; b = 0; c = 0; d = 0; e = 0; h = 0; l = 0;
-    a2 = 0; f2 = 0; b2 = 0; c2 = 0; d2 = 0; e2 = 0; h2 = 0; l2 = 0;
-    ix = 0; iy = 0; sp = 0xffff; pc = 0;
+    a = v; f = v; b = v; c = v; d = v; e = v; h = v; l = v;
+    a2 = v; f2 = v; b2 = v; c2 = v; d2 = v; e2 = v; h2 = v; l2 = v;
+    ix = power_on_word; iy = power_on_word; sp = power_on_word; pc = 0;
     i = 0; r = 0;
     iff1 = false; iff2 = false; im = 0;
     halted = false;
@@ -414,9 +423,9 @@ and ed_exec z op =
   | 0x40 | 0x48 | 0x50 | 0x58 | 0x60 | 0x68 | 0x70 | 0x78 ->
     (* IN r,(C) — 0x70 은 IN F,(C): 플래그만 갱신. *)
     let v = z.pin ((z.b lsl 8) lor z.c) in
-    (* F3/F5 와 C 는 불변 — S/Z/PV/H/N 만 갱신. *)
-    z.f <- (z.f land 0x29) lor (v land 0x80) lor (if v = 0 then 0x40 else 0)
-           lor parity v;
+    (* C stays; S, Z, X, Y and P/V come from the byte read, H and N clear
+       (openMSX CPUCore::in_R_c on a Z80: (F & C) | ZSPXY[res]). *)
+    z.f <- (z.f land 0x01) lor sz53 v lor parity v;
     if y <> 6 then rset z y v No;
     add_t 12
   | 0x41 | 0x49 | 0x51 | 0x59 | 0x61 | 0x69 | 0x71 | 0x79 ->
@@ -461,16 +470,13 @@ and ed_exec z op =
   | 0x5E -> z.im <- 2; add_t 8
   | 0x47 -> z.i <- z.a; add_t 9
   | 0x4F -> z.r <- z.a; add_t 9
-  | 0x57 ->
-    (* F3/F5/C 불변. *)
-    z.f <- (z.f land 0x29) lor (z.i land 0x80) lor (if z.i = 0 then 0x40 else 0)
-           lor (if z.iff2 then 0x04 else 0);
-    z.a <- z.i;
-    add_t 9
-  | 0x5F ->
-    z.f <- (z.f land 0x29) lor (z.r land 0x80) lor (if z.r = 0 then 0x40 else 0)
-           lor (if z.iff2 then 0x04 else 0);
-    z.a <- z.r;
+  | 0x57 | 0x5F ->
+    (* LD A,I / LD A,R: C stays; S, Z, X and Y come from the value moved,
+       P/V is IFF2, H and N clear (openMSX CPUCore::ld_a_IR on a Z80:
+       (F & C) | ZSXY[A]). Keeping X and Y from the old F is the R800. *)
+    let v = if op = 0x57 then z.i else z.r in
+    z.f <- (z.f land 0x01) lor sz53 v lor (if z.iff2 then 0x04 else 0);
+    z.a <- v;
     add_t 9
   | 0x67 | 0x6F ->
     let addr = hl16 z in
@@ -717,11 +723,13 @@ and main_exec z op p =
       z.a <- m8 (lnot z.a);
       z.f <- (z.f land 0xc5) lor 0x12 lor (z.a land 0x28);
       add_t 4
-    | 0x37 -> z.f <- (z.f land 0xc5) lor (z.a land 0x28) lor 1; add_t 4
+    (* SCF and CCF set X and Y from F or A and never clear them, as openMSX
+       CPUCore::scf/ccf do for an NMOS Z80: (F | A) & 0x28. *)
+    | 0x37 -> z.f <- (z.f land 0xc5) lor ((z.f lor z.a) land 0x28) lor 1; add_t 4
     | 0x3F ->
       (* CCF: 캐리를 토글하고, 옛 캐리가 1이었으면 H 를 세운다. *)
       let c = z.f land 1 in
-      z.f <- (z.f land 0xc4) lor (z.a land 0x28) lor (1 - c)
+      z.f <- (z.f land 0xc4) lor ((z.f lor z.a) land 0x28) lor (1 - c)
              lor (if c = 1 then 0x10 else 0);
       add_t 4
     | 0xC0 | 0xC8 | 0xD0 | 0xD8 | 0xE0 | 0xE8 | 0xF0 | 0xF8 ->
