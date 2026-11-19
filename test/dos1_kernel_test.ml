@@ -109,7 +109,7 @@ let command_com () =
 
 (* Slot 0 page 1: the ROM routine jumps to the address its caller will return
    to and returns from there. *)
-let main_rom () =
+let main_rom ?(wait = false) () =
   let rom = Bytes.make 0x8000 '\000' in
   let put addr bytes = List.iteri (fun i b -> Bytes.set rom (addr + i) (Char.chr b)) bytes in
   put chget_vector (ld_a (Char.code 'K') @ [ 0xc9 ]);
@@ -117,7 +117,10 @@ let main_rom () =
   put chput_vector
     [ 0xe5; 0x2a; 0x30; 0xc1; 0x77; 0x23; 0x22; 0x30; 0xc1; 0xe1; 0xc9 ];
   put rom_routine (jp stub_return);
-  put stub_return (ld_a 0x11 @ st_a 0xc111 @ [ 0xc9 ]);
+  (* [wait]: the routine spins until (C150) is non-zero, so a save can be
+     taken while the call is pending. *)
+  let spin = if wait then ld_a_mem 0xc150 @ [ 0xb7; 0x28; 0xfa ] else [] in
+  put stub_return (spin @ ld_a 0x11 @ st_a 0xc111 @ [ 0xc9 ]);
   Bytes.to_string rom
 
 let bytes_of l = Bytes.of_string (String.init (List.length l) (fun i -> Char.chr (List.nth l i)))
@@ -179,9 +182,9 @@ let image ~sys =
   List.iteri (fun i v -> Bytes.set b (0x1e + i) (Char.chr v)) boot;
   Bytes.to_string b
 
-let boot sys =
+let boot ?wait sys =
   let t =
-    Msx.create ~machine:{ Msx.ram_kb = 64; vram_kb = 128; roms = [ main_rom (); ""; "" ] }
+    Msx.create ~machine:{ Msx.ram_kb = 64; vram_kb = 128; roms = [ main_rom ?wait (); ""; "" ] }
   in
   (* The C-BIOS leaves the mapper on segments 3,2,1,0; at power-on all four
      pages see segment 0, and the stub copied to page 1 would overwrite the
@@ -221,6 +224,19 @@ let () =
   check "CALSLT: the caller continued after the return" (byte 0xc110 = 0x99);
   check "all four pages are RAM again" (Msx.ppi_a t = 0xff && Msx.slot3_sel t = 0xaa);
   check "the program ended in its HALT" (Msx.cpu_halted t);
+  (* A save taken while the CALSLT callee runs keeps the pending return: the
+     restored machine finishes the call and puts the wiring back. *)
+  let t = boot ~wait:true (kernel_sys ()) in
+  check "the callee is still running when the save is taken"
+    (Msx.mem_read t 0xc110 = 0x00 && Msx.ppi_a t land 0x0c = 0x00);
+  (match Msx.restore ~state:(Msx.serialize t) with
+   | Error e -> check ("restore: " ^ e) false
+   | Ok r ->
+     Msx.mem_write r 0xc150 1;
+     Msx.step r ~frames:2;
+     check "restored: the callee returned through the trampoline" (Msx.mem_read r 0xc111 = 0x11);
+     check "restored: the caller continued after the return" (Msx.mem_read r 0xc110 = 0x99);
+     check "restored: all four pages are RAM again" (Msx.ppi_a r = 0xff));
   (* A first file without the kernel's bytes is code, not MSXDOS.SYS. *)
   let t = boot (other_sys ()) in
   check "a first file without the kernel bytes runs as it is" (Msx.mem_read t result = 0x77);

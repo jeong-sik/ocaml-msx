@@ -119,6 +119,13 @@ type fdc_state = {
   mutable intr_fired : bool;  (** 이번 INTRQ 펄스를 이미 CPU 에 전달했나 *)
 }
 
+(* How an inter-slot callee gets back to its caller. [Return_at pc]: the
+   callee returns to the caller's own address and the trap compares the PC.
+   [Return_via_trap pc]: the callee returns to [slot_return_trap] and the trap
+   continues at [pc]; for callers whose return address may also be an address
+   BIOS code runs at under the other wiring. *)
+type pending_return = Return_at of int | Return_via_trap of int
+
 type t = {
   cpu : Z80.t;
   vdp : Vdp.t;
@@ -163,8 +170,8 @@ type t = {
   mutable con_esc : int;
       (** VT52 escape-sequence state for the BDOS console: 0=plain, 1=after
           ESC, 2=after "ESC Y" (row byte next), 3=column byte next. *)
-  mutable rst30_pending : (int * int) list;
-      (** RST 30h 인터슬롯의 복귀 대기: (복귀 PC, 저장한 ppi_a) 최근 것 먼저.
+  mutable rst30_pending : (pending_return * int) list;
+      (** RST 30h 인터슬롯의 복귀 대기: (복귀 방식, 저장한 ppi_a) 최근 것 먼저.
           워밍업 재생 경로(page0 = RAM)에서 디스크 로더가 쓰는 벡터를
           트램페린이 대신 서기 위한 상태. *)
   mutable hle_disk : bool;
@@ -1669,7 +1676,6 @@ let page0_byte_untouched t addr =
    to [slot_return_trap], an address no code runs at, and the trap there
    restores the wiring and continues at the real return address. *)
 let slot_return_trap = 0xfffe
-let trampoline_tag = 0x10000
 
 (* Replaces the return address at SP with [slot_return_trap] and remembers
    [ret] and the current wiring. *)
@@ -1677,7 +1683,7 @@ let defer_return t ~ret =
   let sp = Z80.dump_sp t.cpu in
   mem_write t sp (slot_return_trap land 0xff);
   mem_write t ((sp + 1) land 0xffff) (slot_return_trap lsr 8);
-  t.rst30_pending <- (ret lor trampoline_tag, t.ppi_a) :: t.rst30_pending
+  t.rst30_pending <- (Return_via_trap ret, t.ppi_a) :: t.rst30_pending
 
 (* RST 30h 트램펄린 — 실기의 디스크 ROM 이 0x0030 에 깔아 두던 인터슬롯
    핸들러 대역. RST 30h 가 push 한 반환주소는 서술자(slot 1 + 주소 2)를
@@ -1700,7 +1706,7 @@ let serve_rst30 t =
   wr16 sp ((desc + 3) land 0xffff);
   let page = addr lsr 14 in
   let shift = page * 2 in
-  t.rst30_pending <- ((desc + 3) land 0xffff, t.ppi_a) :: t.rst30_pending;
+  t.rst30_pending <- (Return_at ((desc + 3) land 0xffff), t.ppi_a) :: t.rst30_pending;
   t.ppi_a <-
     (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
   addr
@@ -1745,7 +1751,7 @@ let serve_calslt t =
   let sp = Z80.dump_sp cpu in
   let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
   Z80.set_sp cpu ((sp + 2) land 0xffff);
-  t.rst30_pending <- (ret, t.ppi_a) :: t.rst30_pending;
+  t.rst30_pending <- (Return_at ret, t.ppi_a) :: t.rst30_pending;
   t.ppi_a <-
     (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
   (* An expanded slot 3 target also selects its sub-slot for the target's
@@ -1803,14 +1809,14 @@ let serve_enaslt t =
    [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
 let rec disk_trap t pc =
   match t.rst30_pending with
-  | (cont, saved) :: rest when cont land trampoline_tag <> 0 && pc = slot_return_trap ->
+  | (Return_via_trap cont, saved) :: rest when pc = slot_return_trap ->
     (* A DOS inter-slot callee came back: put the wiring back and go on at the
        real return address. *)
     t.rst30_pending <- rest;
     t.ppi_a <- saved;
-    Z80.set_pc t.cpu (cont land 0xffff);
+    Z80.set_pc t.cpu cont;
     true
-  | (cont, saved) :: rest when cont land trampoline_tag = 0 && pc = cont ->
+  | (Return_at cont, saved) :: rest when pc = cont ->
     (* 인터슬롯 대상이 복귀했다 — 슬롯 배선을 되돌리고 실행 계속. *)
     t.rst30_pending <- rest;
     t.ppi_a <- saved;
@@ -1995,7 +2001,7 @@ and disk_trap_serve t pc =
     let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
     if !bios_vector_log then
       bios_vector_calls := (pc, ret, bios_vector_origin t ret) :: !bios_vector_calls;
-    t.rst30_pending <- (ret, t.ppi_a) :: t.rst30_pending;
+    t.rst30_pending <- (Return_at ret, t.ppi_a) :: t.rst30_pending;
     t.ppi_a <- t.ppi_a land 0xfc;
     false
   end
@@ -2620,6 +2626,10 @@ let mapper_of_code = function
   | 6 -> Ram64
   | _ -> State_codec.fail "invalid cartridge mapper"
 
+(* A saved pending return is one integer: the return PC, plus this bit for
+   [Return_via_trap]. *)
+let pending_via_trap_bit = 0x10000
+
 let serialize t =
   let w = State_codec.writer () in
   (* RAM/media first so restore can create correctly bound CPU callbacks. *)
@@ -2644,7 +2654,12 @@ let serialize t =
   State_codec.put_int w t.psg_latch;
   State_codec.put_int w t.joy1;
   State_codec.put_int w (List.length t.rst30_pending);
-  List.iter (fun (pc, slots) -> State_codec.put_int w pc; State_codec.put_int w slots) t.rst30_pending;
+  List.iter
+    (fun (ret, slots) ->
+      State_codec.put_int w
+        (match ret with Return_at pc -> pc | Return_via_trap pc -> pending_via_trap_bit lor pc);
+      State_codec.put_int w slots)
+    t.rst30_pending;
   let files = Hashtbl.to_seq t.bdos_files |> List.of_seq |> List.sort (fun (a,_) (b,_) -> compare a b) in
   State_codec.put_int w (List.length files);
   List.iter (fun (fcb, (data, pos)) ->
@@ -2738,8 +2753,13 @@ let restore_with_reader reader state =
     t.joy1 <- State_codec.get_int r ~min:0 ~max:255;
     let pending = State_codec.get_int r ~min:0 ~max:(State_codec.remaining r / 16) in
     t.rst30_pending <- List.init pending (fun _ ->
-      let pc = State_codec.get_int r ~min:0 ~max:0x1ffff in
-      let slots = State_codec.get_int r ~min:0 ~max:255 in pc, slots);
+      let saved = State_codec.get_int r ~min:0 ~max:0x1ffff in
+      let slots = State_codec.get_int r ~min:0 ~max:255 in
+      let ret =
+        if saved land pending_via_trap_bit <> 0 then Return_via_trap (saved land 0xffff)
+        else Return_at saved
+      in
+      ret, slots);
     let files = State_codec.get_int r ~min:0 ~max:65536 in
     for _ = 1 to files do
       let fcb = State_codec.get_int r ~min:0 ~max:65535 in
