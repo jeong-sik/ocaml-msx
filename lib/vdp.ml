@@ -542,6 +542,7 @@ let render_sprites t ~w ~h put =
   let mag = t.regs.(1) land 0x01 <> 0 in
   let edge = if size16 then 16 else 8 in
   let step = if mag then 2 else 1 in
+  let opaque0 = t.regs.(8) land 0x20 <> 0 in
   let sput x y c =
     if x >= 0 && x < w && y >= 0 && y < h then put x y c
   in
@@ -562,7 +563,7 @@ let render_sprites t ~w ~h put =
       let pat = vr (e + 2) and col = vr (e + 3) in
       let c = col land 0x0f in
       let x0 = if col land 0x80 <> 0 then x_raw - 32 else x_raw in
-      if c <> 0 then
+      if c <> 0 || opaque0 then
         let pbase = pt + ((if size16 then pat land 0xfc else pat) * 8) in
         for dy = 0 to (edge * step) - 1 do
           let row = dy / step in
@@ -583,35 +584,41 @@ let render_sprites t ~w ~h put =
         done)
     !active
 
-(* 스프라이트 모드 2 — SCREEN4~7. 컬러 테이블 = (R#11&3)<<15 | (R#5&0xF8)<<7,
-   속성 테이블 = 컬러 테이블 + 0x200, 패턴 테이블 = (R#6&0x3F)<<11. 속성
+(* 스프라이트 모드 2 — SCREEN4~7. 패턴 테이블 = (R#6&0x3F)<<11. 속성
    32엔트리(Y, X, 패턴번호, 예약)는 Y=0xD8 에서 끝난다. 컬러 테이블은
    스프라이트마다 16바이트 — 패턴 행마다 한 바이트: bit0-3 컬러, bit6 CC
    (번호가 앞선 스프라이트 픽셀과 OR), bit7 EC(X 를 32px 왼쪽으로). 한 줄에는
    번호순 처음 8개만 보이고, 겹치면 번호가 낮은 쪽이 위다. 컬러 0 은 R#8
-   bit5(TP)=1 일 때만 투명이고 TP=0 이면 팔레트 0 색으로 칠한다. 위치·패턴
+   bit5(TP)=0 이면 투명이고 TP=1 이면 팔레트 0 색으로 칠한다(openMSX
+   SpriteConverter, 모드 1 도 같다). 위치·패턴
    주소·16×16 바이트 배치는 모드 1 과 같다. 5번째(9번째) 스프라이트와 충돌
    플래그(S#0)는 아직 없다. [xscale] 은 512폭 모드(SCREEN6/7)에서 2. *)
 let render_sprites2 t ~h ~xscale put =
   (* SCREEN7 은 CPU 주소가 물리 뱅크에 섞여 있어 테이블 읽기도 같은 사상을 탄다. *)
   let vr a = Char.code (Bytes.get t.vram (physical_addr t a)) in
   let r = t.regs in
-  let color_base = ((r.(11) land 0x03) lsl 15) lor ((r.(5) land 0xf8) lsl 7) in
-  let attr_base = color_base + 0x200 in
+  (* 컬러·속성 테이블 주소 = (R#11<<15 | R#5<<7 | 0x7F) & (오프셋 | ~0x3FF).
+     R#5 의 bit2..0 이 1 이어야 속성(+0x200)·컬러 테이블이 서로 다른 자리에
+     선다. 0 이면 그 비트가 오프셋을 지워 두 테이블이 같은 128바이트로
+     접힌다(openMSX VDP::updateSpriteAttributeBase). *)
+  let table_mask = (r.(11) lsl 15) lor (r.(5) lsl 7) lor 0x7f in
+  let table_addr offset = table_mask land (offset lor lnot 0x3ff) in
+  let color_addr i row = table_addr ((i * 16) + row) in
+  let attr_addr i k = table_addr (0x200 + (i * 4) + k) in
   let pt = (r.(6) land 0x3f) lsl 11 in
   let size16 = r.(1) land 0x02 <> 0 and mag = r.(1) land 0x01 <> 0 in
   let edge = if size16 then 16 else 8 in
   let step = if mag then 2 else 1 in
   let height = edge * step in
-  let transparent0 = r.(8) land 0x20 <> 0 in
+  let opaque0 = r.(8) land 0x20 <> 0 in
   let entries =
     let rec collect i acc =
-      if i = 32 || vr (attr_base + (i * 4)) = 0xd8 then List.rev acc
+      if i = 32 || vr (attr_addr i 0) = 0xd8 then List.rev acc
       else collect (i + 1) (i :: acc)
     in
     collect 0 []
   in
-  let top i = (vr (attr_base + (i * 4)) + 1) land 0xff in
+  let top i = (vr (attr_addr i 0) + 1) land 0xff in
   (* X 는 EC 로 -32 까지 내려가고 16×16 MAG 로 +31 까지 나간다. *)
   let origin = 32 in
   let px = Array.make (256 + origin + 32) (-1) in
@@ -624,18 +631,17 @@ let render_sprites2 t ~h ~xscale put =
       Array.fill px 0 (Array.length px) (-1);
       List.iter
         (fun i ->
-          let a = attr_base + (i * 4) in
           let row = ((line - top i) land 0xff) / step in
-          let cb = vr (color_base + (i * 16) + row) in
+          let cb = vr (color_addr i row) in
           let c = cb land 0x0f and cc = cb land 0x40 <> 0 in
-          let x0 = vr (a + 1) - if cb land 0x80 <> 0 then 32 else 0 in
-          let pat = vr (a + 2) in
+          let x0 = vr (attr_addr i 1) - if cb land 0x80 <> 0 then 32 else 0 in
+          let pat = vr (attr_addr i 2) in
           let pbase = pt + ((if size16 then pat land 0xfc else pat) * 8) in
           let bits =
             if size16 then (vr (pbase + row) lsl 8) lor vr (pbase + 16 + row)
             else vr (pbase + row)
           in
-          if c <> 0 || not transparent0 then
+          if c <> 0 || opaque0 then
             for b = 0 to edge - 1 do
               if (bits lsr (edge - 1 - b)) land 1 = 1 then
                 for mx = 0 to step - 1 do
@@ -671,6 +677,23 @@ let frame_rgb t =
     Bytes.set img (i + 1) (Char.chr g);
     Bytes.set img (i + 2) (Char.chr b)
   in
+  (* 타일·비트맵·텍스트 픽셀의 컬러 0 은 R#8 bit5(TP)=0 이면 R#7 하위 4비트가
+     가리키는 백드롭 색이다. 텍스트는 TP 와 무관하게 늘 백드롭이다(SCREEN8 은
+     TP 를 쓰지 않아 이 함수를 거치지 않는다). SCREEN6(2비트 픽셀)은 R#7 을 두 팔레트 번호로 나눠
+     짝수·홀수 픽셀에 하나씩 쓴다(openMSX SDLRasterizer::precalcColorIndex0). *)
+  let backdrop = t.regs.(7) land 0x0f in
+  let mode_now = display_mode t in
+  let tp_clear = mode_text t || t.regs.(8) land 0x20 = 0 in
+  let put_px x y c =
+    let c =
+      if c <> 0 || not tp_clear then c
+      else
+        match mode_now with
+        | Graphic5 -> if x land 1 = 0 then backdrop lsr 2 else backdrop land 3
+        | _ -> backdrop
+    in
+    put x y c
+  in
   if blanked t then Bytes.to_string img
   else begin
     let vr addr = Char.code (Bytes.get t.vram (addr land 0x1ffff)) in
@@ -689,7 +712,7 @@ let frame_rgb t =
             Bytes.set img i (Char.chr (((color lsr 2) land 7) * 255 / 7));
             Bytes.set img (i + 1) (Char.chr (((color lsr 5) land 7) * 255 / 7));
             Bytes.set img (i + 2) (Char.chr ((color land 3) * 255 / 3))
-          end else put x y color
+          end else put_px x y color
         done
       done;
       (* SCREEN8 의 스프라이트는 고정 팔레트라 아직 없다. *)
@@ -702,8 +725,8 @@ let frame_rgb t =
       let pt = (r.(4) land 0x7) lsl 8 in
       let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
       for y = 0 to h - 1 do
-        for x = 0 to 7 do put x y bg done;
-        for x = w - 8 to w - 1 do put x y bg done
+        for x = 0 to 7 do put_px x y bg done;
+        for x = w - 8 to w - 1 do put_px x y bg done
       done;
       for row = 0 to 23 do
         for col = 0 to 39 do
@@ -713,7 +736,7 @@ let frame_rgb t =
             for px = 0 to 5 do
               let x = 8 + col * 6 + px in
               let y = row * 8 + py in
-              if (pat lsr (7 - px)) land 1 = 1 then put x y fg else put x y bg
+              if (pat lsr (7 - px)) land 1 = 1 then put_px x y fg else put_px x y bg
             done
           done
         done
@@ -751,7 +774,7 @@ let frame_rgb t =
             for px = 0 to 7 do
               let x = (col * 8) + px in
               let y = (row * 8) + py in
-              if (bits lsr (7 - px)) land 1 = 1 then put x y fg else put x y bg
+              if (bits lsr (7 - px)) land 1 = 1 then put_px x y fg else put_px x y bg
             done
           done
         done
