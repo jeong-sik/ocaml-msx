@@ -6,7 +6,8 @@
 
     Sound output remains unimplemented. Versioned save states include CPU,
     VDP, memory, mounted media, the WD2793 drive state (format v3,
-    ocaml-msx #46) and device state; file IO belongs to callers. *)
+    ocaml-msx #46), the i8255 PPI control word and latches (format v4) and
+    device state; file IO belongs to callers. *)
 
 type key =
   | Up
@@ -74,6 +75,12 @@ val mem_read : t -> int -> int
 val mem_write : t -> int -> int -> unit
 (** Write a byte at a 16-bit address as the Z80 would — into RAM, or as a bank
     select in a MegaROM's cart window. For tests and debugging. *)
+
+val insert_cassette : t -> string -> (unit, string) result
+(** Put a CAS image in the cassette deck, rewound, from the current CPU
+    cycle on. The tape moves while software runs the motor (PPI port C bit
+    4 = 0) and shows on PSG R#14 bit 7. Error when the image holds no CAS
+    block header; the machine is unchanged then. *)
 
 val load_disk : ?interface_rom:bool -> ?real_rom:bool -> t -> string -> unit
 (** Plug a floppy image (raw .dsk, 512 bytes a sector) into drive A. By
@@ -144,6 +151,10 @@ val step : t -> frames:int -> unit
 
 val frame_number : t -> int
 (** Completed frames since creation; preserved by save states. *)
+
+val set_rtc_time : t -> Rtc.time -> unit
+(** Set the RP5C01 date and time from the current CPU cycle on. A machine
+    whose time is never set starts at 00-00-00 00:00:00. *)
 
 val dump_pc : t -> int
 (** 현재 PC — 부트 하네스 판정용. *)
