@@ -625,7 +625,7 @@ let frame_rgb t =
     else if mode_text t then begin
       (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
       let nt = (r.(2) land 0x7f) lsl 10 in
-      let pt = (r.(4) land 0x7) lsl 8 in
+      let pt = (r.(4) land 0x3f) lsl 11 in
       let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
       for y = 0 to h - 1 do
         for x = 0 to 7 do put x y bg done;
