@@ -308,7 +308,9 @@ let () =
   check "SCREEN5: outside (58,101)" (is_col t 58 101 0)
 
 let () =
-  (* 10. SCREEN6 (512폭) 은 스프라이트 픽셀 하나가 가로 두 픽셀이다 *)
+  (* 10. SCREEN6 (512폭) 은 스프라이트 점 하나가 가로 두 픽셀이고, 색 코드 9
+     (0b1001) 의 윗 2비트(2)가 왼쪽 픽셀, 아랫 2비트(1)가 오른쪽 픽셀의 팔레트
+     항목이다 (openMSX SpriteConverter::drawMode2, GRAPHIC5). *)
   let t = Vdp.create () in
   set_reg t 0 0x08;
   set_reg t 1 0x60;
@@ -318,9 +320,9 @@ let () =
   sat_w t 0 100 50 0;
   all_rows t 0 9;
   let c = is_col_w t 512 in
-  check "SCREEN6: first sprite pixel is 2 wide (100,101)" (c 100 101 9);
-  check "SCREEN6: first sprite pixel is 2 wide (101,101)" (c 101 101 9);
-  check "SCREEN6: last pixel (115,101)" (c 115 101 9);
+  check "SCREEN6: first sprite dot, left pixel (100,101) is palette 2" (c 100 101 2);
+  check "SCREEN6: first sprite dot, right pixel (101,101) is palette 1" (c 101 101 1);
+  check "SCREEN6: last pixel (115,101) is palette 1" (c 115 101 1);
   check "SCREEN6: left of it (99,101) clear" (c 99 101 0);
   check "SCREEN6: right of it (116,101) clear" (c 116 101 0)
 
