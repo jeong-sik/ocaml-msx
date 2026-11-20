@@ -119,6 +119,13 @@ type fdc_state = {
   mutable intr_fired : bool;  (** 이번 INTRQ 펄스를 이미 CPU 에 전달했나 *)
 }
 
+(* How an inter-slot callee gets back to its caller. [Return_at pc]: the
+   callee returns to the caller's own address and the trap compares the PC.
+   [Return_via_trap pc]: the callee returns to [slot_return_trap] and the trap
+   continues at [pc]; for callers whose return address may also be an address
+   BIOS code runs at under the other wiring. *)
+type pending_return = Return_at of int | Return_via_trap of int
+
 type t = {
   cpu : Z80.t;
   vdp : Vdp.t;
@@ -163,8 +170,8 @@ type t = {
   mutable con_esc : int;
       (** VT52 escape-sequence state for the BDOS console: 0=plain, 1=after
           ESC, 2=after "ESC Y" (row byte next), 3=column byte next. *)
-  mutable rst30_pending : (int * int) list;
-      (** RST 30h 인터슬롯의 복귀 대기: (복귀 PC, 저장한 ppi_a) 최근 것 먼저.
+  mutable rst30_pending : (pending_return * int) list;
+      (** RST 30h 인터슬롯의 복귀 대기: (복귀 방식, 저장한 ppi_a) 최근 것 먼저.
           워밍업 재생 경로(page0 = RAM)에서 디스크 로더가 쓰는 벡터를
           트램페린이 대신 서기 위한 상태. *)
   mutable hle_disk : bool;
@@ -1286,6 +1293,166 @@ let fat12_open t name11 =
     | None -> None
     | Some e -> Some (fat12_read t fs e)
 
+(* Root-directory entries (byte offsets into the image) whose 8+3 name matches
+   [pattern11], '?' standing for any byte, in directory order. Deleted entries
+   and the volume label are skipped. *)
+let fat12_search t fs pattern11 =
+  let hits = ref [] in
+  (try
+     for i = 0 to fs.root_entries - 1 do
+       let e = (fs.root_start_sec * fs.bytes_per_sec) + (i * 32) in
+       let first = dsk_u8 t e in
+       if first = 0x00 then raise Exit;
+       if first <> 0xe5 && dsk_u8 t (e + 11) land 0x08 = 0 then begin
+         let ok = ref true in
+         for k = 0 to 10 do
+           let p = pattern11.[k] in
+           if p <> '?' && Char.code p <> dsk_u8 t (e + k) then ok := false
+         done;
+         if !ok then hits := e :: !hits
+       end
+     done
+   with Exit -> ());
+  List.rev !hits
+
+(* MSX-DOS 1 kernel, served in OCaml.
+
+   A DOS 1 disk boots through a standard MSXDOS.SYS, which only runs on a
+   machine whose disk ROM leaves RAM work areas and driver entry points the
+   kernel then calls (a CALL 4030h answers where the DOS may relocate itself;
+   openMSX shows the kernel jumping into the NMS8250 ROM's internals after
+   that). A disk ROM that is not the real one cannot answer. What the kernel
+   gives its programs is small: it loads COMMAND.COM at 0100h and COMMAND.COM
+   runs AUTOEXEC.BAT through BDOS calls, which [disk_trap] already serves at
+   0F37Dh. So when the boot sector jumps into the loaded MSXDOS.SYS, this
+   plants what the kernel would leave in page 0, loads COMMAND.COM the way the
+   kernel does and runs it, instead of running the kernel image.
+
+   The planted addresses are the ones openMSX shows for the NMS8250 DOS: the
+   warm boot vector at 0000h jumps to E203h, the BDOS entry at 0005h to
+   DC06h (so (0006h), the top of the TPA, reads DC06h), RDSLT, WRSLT, CALSLT
+   and ENASLT at 000Ch, 0014h, 001Ch and 0024h to E404h, E425h, E465h and
+   E4ACh, the interrupt vector at 0038h to E3BFh. [disk_trap] serves each
+   target address; RST 30h is left to the trap that serves it for the
+   warm-up replay. *)
+let dos1_warm_boot = 0xe203
+let dos1_bdos = 0xdc06
+let dos1_irq = 0xe3bf
+let dos1_rdslt = 0xe404
+let dos1_wrslt = 0xe425
+let dos1_calslt = 0xe465
+let dos1_enaslt = 0xe4ac
+
+(* Page-0 vectors the DOS kernel installs, and where they lead. RST 30h is
+   left to the trap that already serves it. *)
+let dos1_vectors =
+  [ 0x0c, dos1_rdslt; 0x14, dos1_wrslt; 0x1c, dos1_calslt; 0x24, dos1_enaslt;
+    0x38, dos1_irq ]
+
+(* Console output goes through the BIOS, as the DOS kernel sends it. The
+   BDOS trap jumps into one of three routines with the caller's return
+   address on the stack. They call [dos1_chput] and [dos1_chget], addresses
+   [disk_trap] serves by running the BIOS routine with page 0 on the BIOS.
+   The fixed BIOS vectors in page 0 cannot carry this: a DOS program's
+   default DTA (0080h-00FFh) overlaps 009Fh and 00A2h, and its data is not a
+   vector. CONOUT: LD A,E / JP CHPUT. STROUT: print (DE) up to '$'. CONIN:
+   CHGET, then the key is echoed. BUFIN: a line of keys. *)
+let dos1_chput = 0xe540
+let dos1_chget = 0xe543
+let dos1_conout_stub = 0xe500
+let dos1_strout_stub = 0xe504
+let dos1_conin_stub = 0xe520
+let dos1_linein_stub = 0xe560
+
+(* Where a directory search stands: the number of entries it has returned,
+   a word in the kernel's data area, which a program does not touch. *)
+let dos1_search_count = 0xe310
+let dos1_console_stubs =
+  [ dos1_conout_stub,
+    [ 0x7b; 0xc3; dos1_chput land 0xff; dos1_chput lsr 8 ];
+    dos1_strout_stub,
+    [ 0x1a;                   (* LD A,(DE) *)
+      0xfe; 0x24;             (* CP '$' *)
+      0xc8;                   (* RET Z *)
+      0xd5;                   (* PUSH DE *)
+      0xcd; dos1_chput land 0xff; dos1_chput lsr 8;
+      0xd1;                   (* POP DE *)
+      0x13;                   (* INC DE *)
+      0x18; 0xf4 ];           (* JR STROUT *)
+    dos1_conin_stub,
+    [ 0xcd; dos1_chget land 0xff; dos1_chget lsr 8;  (* waits for a key *)
+      0xf5;                   (* PUSH AF *)
+      0xcd; dos1_chput land 0xff; dos1_chput lsr 8;  (* _CONIN echoes the key *)
+      0xf1;                   (* POP AF *)
+      0xc9 ];
+    (* _BUFIN: DE = [max; length; text...]. Keys come from CHGET and echo
+       through CHPUT; CR ends the line, BS takes the last key back, control
+       keys and keys past [max] are dropped. The routine at 0E5A0h (CHPUT
+       with HL, BC and DE kept) is called by it. *)
+    dos1_linein_stub,
+    [
+      0x62; 0x6b; 0x23; 0x23; 0x06; 0x00; 0xe5; 0xc5;
+      0xd5; 0xcd; 0x43; 0xe5; 0xd1; 0xc1; 0xe1; 0xfe;
+      0x0d; 0x28; 0x23; 0xfe; 0x08; 0x28; 0x12; 0xfe;
+      0x20; 0x38; 0xeb; 0x4f; 0x1a; 0xb8; 0x28; 0xe6;
+      0x79; 0x77; 0x23; 0x04; 0xcd; 0xa0; 0xe5; 0x18;
+      0xdd; 0x78; 0xb7; 0x28; 0xd9; 0x05; 0x2b; 0x3e;
+      0x08; 0xcd; 0xa0; 0xe5; 0x18; 0xd0; 0x3e; 0x0d;
+      0xcd; 0xa0; 0xe5; 0x13; 0x78; 0x12; 0x1b; 0xc9;
+      0xe5; 0xc5; 0xd5; 0xcd; 0x40; 0xe5; 0xd1; 0xc1;
+      0xe1; 0xc9 ] ]
+
+(* The bytes of MSXDOS.SYS that identify the standard kernel: the JP 0200h at
+   its start and, at 0238h, LD SP,9000h / LD HL,F1C9h / CALL 4030h. *)
+let dos1_kernel_image t =
+  let at a = mem_read t a in
+  at 0x100 = 0xc3 && at 0x101 = 0x00 && at 0x102 = 0x02
+  && at 0x238 = 0x31 && at 0x239 = 0x00 && at 0x23a = 0x90
+  && at 0x23e = 0xcd && at 0x23f = 0x30 && at 0x240 = 0x40
+
+(* True while page 0 shows the vectors [dos1_start] planted. *)
+let dos1_planted t =
+  t.ppi_a land 3 = 3
+  && mem_read t 0x00 = 0xc3 && mem_read t 0x01 = dos1_warm_boot land 0xff
+  && mem_read t 0x02 = dos1_warm_boot lsr 8
+  && mem_read t 0x05 = 0xc3 && mem_read t 0x06 = dos1_bdos land 0xff
+  && mem_read t 0x07 = dos1_bdos lsr 8
+
+(* Loads COMMAND.COM at 0100h and starts it. False when the disk has none. *)
+let dos1_start t ~cold =
+  match fat12_open t "COMMAND COM" with
+  | None -> false
+  | Some com ->
+    let n = min (Bytes.length com) (dos1_bdos - 0x100) in
+    for i = 0 to n - 1 do
+      mem_write t (0x100 + i) (Char.code (Bytes.get com i))
+    done;
+    let plant a bytes = List.iteri (fun i b -> mem_write t (a + i) b) bytes in
+    plant 0x00 [ 0xc3; dos1_warm_boot land 0xff; dos1_warm_boot lsr 8; 0x00; 0x00;
+                 0xc3; dos1_bdos land 0xff; dos1_bdos lsr 8 ];
+    List.iter (fun (a, dest) -> plant a [ 0xc3; dest land 0xff; dest lsr 8 ]) dos1_vectors;
+    List.iter (fun (a, bytes) -> plant a bytes) dos1_console_stubs;
+    List.iter
+      (fun fcb ->
+        mem_write t fcb 0;
+        for i = 1 to 11 do mem_write t (fcb + i) 0x20 done)
+      [ 0x5c; 0x6c ];
+    (* Power-on RAM is not what the kernel's data area holds; a warm boot
+       keeps what COMMAND.COM left there (AUTOEXEC.BAT runs once). *)
+    if cold then for a = 0xdb00 to 0xe31e do mem_write t a 0 done;
+    (* A DOS program sees RAM in all four pages: slot 3, sub-slot 2. *)
+    t.ppi_a <- 0xff;
+    t.slot3_sel <- 0xaa;
+    Hashtbl.reset t.bdos_files;
+    t.disk_dma <- 0x0080;
+    Z80.set_sp t.cpu 0xe200;
+    Z80.set_af t.cpu 0x0100;
+    Z80.set_bc t.cpu n;
+    Z80.set_de t.cpu 0;
+    Z80.set_hl t.cpu n;
+    Z80.set_pc t.cpu 0x0100;
+    true
+
 let insert_cassette t cas =
   match Cassette.of_cas cas with
   | Error e -> Error e
@@ -1522,6 +1689,23 @@ let page0_byte_untouched t addr =
   let b = mem_read t addr in
   b = 0x00 || b = 0xff
 
+(* An inter-slot callee returns to an address, not to a slot wiring: the code
+   at the caller's return address may share its address with BIOS code that
+   runs under the other wiring (the C-BIOS routine at 0x2511 ran while a DOS
+   program's CALSLT return point 0x2511 was pending, and the early restore
+   put the program's RAM over the BIOS mid-routine). So the callee returns
+   to [slot_return_trap], an address no code runs at, and the trap there
+   restores the wiring and continues at the real return address. *)
+let slot_return_trap = 0xfffe
+
+(* Replaces the return address at SP with [slot_return_trap] and remembers
+   [ret] and the current wiring. *)
+let defer_return t ~ret =
+  let sp = Z80.dump_sp t.cpu in
+  mem_write t sp (slot_return_trap land 0xff);
+  mem_write t ((sp + 1) land 0xffff) (slot_return_trap lsr 8);
+  t.rst30_pending <- (Return_via_trap ret, t.ppi_a) :: t.rst30_pending
+
 (* RST 30h 트램펄린 — 실기의 디스크 ROM 이 0x0030 에 깔아 두던 인터슬롯
    핸들러 대역. RST 30h 가 push 한 반환주소는 서술자(slot 1 + 주소 2)를
    가리킨다: 서술자를 읽고, 그 자리에 서술자 건너뛴 복귀 주소를 심은 뒤
@@ -1543,7 +1727,7 @@ let serve_rst30 t =
   wr16 sp ((desc + 3) land 0xffff);
   let page = addr lsr 14 in
   let shift = page * 2 in
-  t.rst30_pending <- ((desc + 3) land 0xffff, t.ppi_a) :: t.rst30_pending;
+  t.rst30_pending <- (Return_at ((desc + 3) land 0xffff), t.ppi_a) :: t.rst30_pending;
   t.ppi_a <-
     (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
   addr
@@ -1588,7 +1772,7 @@ let serve_calslt t =
   let sp = Z80.dump_sp cpu in
   let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
   Z80.set_sp cpu ((sp + 2) land 0xffff);
-  t.rst30_pending <- (ret, t.ppi_a) :: t.rst30_pending;
+  t.rst30_pending <- (Return_at ret, t.ppi_a) :: t.rst30_pending;
   t.ppi_a <-
     (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
   (* An expanded slot 3 target also selects its sub-slot for the target's
@@ -1602,6 +1786,25 @@ let serve_calslt t =
   end;
   target
 
+
+(* CALSLT as the DOS kernel serves it: the callee's RET comes back through
+   [slot_return_trap], so the caller's return address stays on the stack. *)
+let serve_dos1_calslt t =
+  let cpu = t.cpu in
+  let slot = (Z80.dump_iy cpu lsr 8) land 0xff in
+  let target = Z80.dump_ix cpu in
+  let page = target lsr 14 in
+  let shift = page * 2 in
+  let sp = Z80.dump_sp cpu in
+  let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+  defer_return t ~ret;
+  t.ppi_a <-
+    (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
+  if slot land 0x80 <> 0 && (slot land 3) = 3 && page <> 3 then begin
+    t.slot3_sel <-
+      (t.slot3_sel land lnot (3 lsl shift)) lor (((slot lsr 2) land 3) lsl shift)
+  end;
+  target
 (* ENASLT (BIOS 0x0024) served in OCaml for a caller of the warm-up replay
    that expects the BIOS in page 0 (#147). A = slot id (0x80 | sub << 2 |
    primary), H = an address in the page to switch. The primary slot is
@@ -1625,14 +1828,57 @@ let serve_enaslt t =
 
 (* Serviced in the step loop before the opcode at [pc] runs. Returns true when
    [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
-let disk_trap t pc =
-  (match t.rst30_pending with
-   | (cont, saved) :: rest when pc = cont ->
-     (* 인터슬롯 대상이 복귀했다 — 슬롯 배선을 되돌리고 실행 계속. *)
-     t.rst30_pending <- rest;
-     t.ppi_a <- saved
-   | _ -> ());
+let rec disk_trap t pc =
+  match t.rst30_pending with
+  | (Return_via_trap cont, saved) :: rest when pc = slot_return_trap ->
+    (* A DOS inter-slot callee came back: put the wiring back and go on at the
+       real return address. *)
+    t.rst30_pending <- rest;
+    t.ppi_a <- saved;
+    Z80.set_pc t.cpu cont;
+    true
+  | (Return_at cont, saved) :: rest when pc = cont ->
+    (* 인터슬롯 대상이 복귀했다 — 슬롯 배선을 되돌리고 실행 계속. *)
+    t.rst30_pending <- rest;
+    t.ppi_a <- saved;
+    disk_trap_serve t pc
+  | _ -> disk_trap_serve t pc
+
+and disk_trap_serve t pc =
   if Bytes.length t.disk = 0 || not t.hle_disk then false
+  else if pc < 0x40 && dos1_planted t && List.mem_assoc pc dos1_vectors then false
+  else if pc = dos1_rdslt && dos1_planted t then begin
+    let a = Z80.dump_a t.cpu and hl = Z80.dump_hl t.cpu in
+    let v = with_slot_view t ~slot:a ~addr:hl (fun () -> mem_read t hl) in
+    Z80.set_af t.cpu ((v lsl 8) lor (Z80.dump_f t.cpu land 0xff));
+    return_from_vector t;
+    true
+  end
+  else if pc = dos1_wrslt && dos1_planted t then begin
+    let a = Z80.dump_a t.cpu and hl = Z80.dump_hl t.cpu in
+    let e = Z80.dump_de t.cpu land 0xff in
+    with_slot_view t ~slot:a ~addr:hl (fun () -> mem_write t hl e);
+    return_from_vector t;
+    true
+  end
+  else if pc = dos1_calslt && dos1_planted t then begin
+    Z80.set_pc t.cpu (serve_dos1_calslt t);
+    true
+  end
+  else if pc = dos1_enaslt && dos1_planted t then begin
+    Z80.set_pc t.cpu (serve_enaslt t);
+    true
+  end
+  else if (pc = dos1_chput || pc = dos1_chget) && dos1_planted t then begin
+    (* A call of the console stubs: run CHPUT or CHGET with page 0 on the
+       BIOS; the routine's RET comes back through the trampoline. *)
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+    defer_return t ~ret;
+    t.ppi_a <- t.ppi_a land 0xfc;
+    Z80.set_pc t.cpu (if pc = dos1_chput then 0x00a2 else 0x009f);
+    true
+  end
   else if pc = disk_rst30_entry && t.ppi_a land 3 = 3 then begin
     Z80.set_pc t.cpu (serve_rst30 t);
     true
@@ -1776,7 +2022,7 @@ let disk_trap t pc =
     let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
     if !bios_vector_log then
       bios_vector_calls := (pc, ret, bios_vector_origin t ret) :: !bios_vector_calls;
-    t.rst30_pending <- (ret, t.ppi_a) :: t.rst30_pending;
+    t.rst30_pending <- (Return_at ret, t.ppi_a) :: t.rst30_pending;
     t.ppi_a <- t.ppi_a land 0xfc;
     false
   end
@@ -1837,7 +2083,7 @@ let disk_trap t pc =
     Z80.set_pc t.cpu ret;
     true
   end
-  else if pc = disk_bdos_entry then begin
+  else if pc = disk_bdos_entry || (pc = dos1_bdos && dos1_planted t) then begin
     (* MSX DISK-BASIC system call (C = function). The file-load path the boot
        uses is served against the FAT12 image; per-file state lives in
        [bdos_files] keyed by the FCB address. A=0 success, A=0xFF failure --
@@ -1852,6 +2098,22 @@ let disk_trap t pc =
     if !disk_call_log then
       disk_calls := (pc, c, Z80.dump_bc t.cpu, de, Z80.dump_hl t.cpu, Z80.dump_f t.cpu)
                     :: !disk_calls;
+    let dos1_entry = pc = dos1_bdos in
+    let console_stub =
+      if not dos1_entry then None
+      else if c = 0x02 || (c = 0x06 && de land 0xff <> 0xff) then Some dos1_conout_stub
+      else if c = 0x09 then Some dos1_strout_stub
+      else if c = 0x01 then Some dos1_conin_stub
+      else if c = 0x0a then Some dos1_linein_stub
+      else None
+    in
+    match console_stub with
+    | Some stub ->
+      (* _CONIN, _BUFIN, _CONOUT, _DIRIO output and _STROUT go through the BIOS;
+         the stub returns to the caller itself. *)
+      Z80.set_pc t.cpu stub;
+      true
+    | None ->
     let a =
       match c with
       | 0x06 ->
@@ -2081,7 +2343,19 @@ let disk_trap t pc =
         end;
         0x00
       | 0x27 -> (
-        match Hashtbl.find_opt t.bdos_files de with
+        (* The FCB an open filled in is data the program owns: COMMAND.COM
+           opens the directory entry a search left in its DTA, copies the
+           FCB and reads through the copy. So a block read finds its file by
+           the name inside the FCB when this address was never opened. *)
+        let by_address = Hashtbl.find_opt t.bdos_files de in
+        let opened =
+          match by_address with
+          | Some _ -> by_address
+          | None ->
+            let name = String.init 11 (fun i -> Char.chr (fcb (1 + i))) in
+            Option.map (fun data -> (data, 0)) (fat12_open t name)
+        in
+        match opened with
         | None -> 0xff
         | Some (data, _) ->
           let configured_size = fcb 0x0e lor (fcb 0x0f lsl 8) in
@@ -2105,6 +2379,36 @@ let disk_trap t pc =
             Hashtbl.replace t.bdos_files de (data, start + amount);
             Z80.set_hl t.cpu records;
             if records < count then 0x01 else 0x00)
+      | 0x02 ->
+        (* _CONOUT: no console; the character comes back in A. *)
+        de land 0xff
+      | 0x0e ->
+        (* _SELDSK: the drive count. The image is the only drive. *)
+        0x01
+      | 0x12 when not dos1_entry -> 0xff
+      | 0x11 | 0x12 ->
+        (* _SFIRST / _SNEXT: the next root entry matching the FCB's name
+           ('?' = any byte). The DTA gets the drive number (1 = A:) and the
+           32-byte entry, the shape COMMAND.COM then opens a file from. A
+           DOS 1 search continues after the entries already returned, counted
+           at [dos1_search_count]. *)
+        let pattern = String.init 11 (fun i -> Char.chr (fcb (1 + i))) in
+        let returned =
+          if c = 0x12 then mem_read t dos1_search_count lor (mem_read t (dos1_search_count + 1) lsl 8)
+          else 0
+        in
+        (match List.nth_opt (fat12_search t (fat12_of t) pattern) returned with
+         | None -> 0xff
+         | Some e ->
+           mem_write t t.disk_dma 0x01;
+           for i = 0 to 31 do
+             mem_write t ((t.disk_dma + 1 + i) land 0xffff) (dsk_u8 t (e + i))
+           done;
+           if dos1_entry then begin
+             mem_write t dos1_search_count ((returned + 1) land 0xff);
+             mem_write t (dos1_search_count + 1) (((returned + 1) lsr 8) land 0xff)
+           end;
+           0x00)
       | _ -> 0xff
     in
     if c = 0x16 then Z80.set_hl t.cpu ((Z80.dump_hl t.cpu land 0xff00) lor a);
@@ -2114,6 +2418,20 @@ let disk_trap t pc =
     Z80.set_sp t.cpu ((sp + 2) land 0xffff);
     Z80.set_pc t.cpu ret;
     true
+  end
+  else if pc = 0x0100 && t.ppi_a land 3 = 3 && dos1_kernel_image t && dos1_start t ~cold:true then
+    true
+  else if pc = dos1_warm_boot && dos1_planted t then dos1_start t ~cold:false
+  else if pc = dos1_irq && dos1_planted t then begin
+    (* The interrupt stub of the DOS: run the BIOS interrupt routine with
+       page 0 on the BIOS, and put the slots back where the interrupted code
+       returns -- the way the fixed BIOS vectors are served. *)
+    let sp = Z80.dump_sp t.cpu in
+    let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+    defer_return t ~ret;
+    t.ppi_a <- t.ppi_a land 0xfc;
+    Z80.set_pc t.cpu 0x0038;
+    false
   end
   else if disk_entry_pc pc then begin
     serve_disk_entry t pc;
@@ -2340,6 +2658,10 @@ let mapper_of_code = function
   | 6 -> Ram64
   | _ -> State_codec.fail "invalid cartridge mapper"
 
+(* A saved pending return is one integer: the return PC, plus this bit for
+   [Return_via_trap]. *)
+let pending_via_trap_bit = 0x10000
+
 let serialize t =
   let w = State_codec.writer () in
   (* RAM/media first so restore can create correctly bound CPU callbacks. *)
@@ -2364,7 +2686,12 @@ let serialize t =
   State_codec.put_int w t.psg_latch;
   State_codec.put_int w t.joy1;
   State_codec.put_int w (List.length t.rst30_pending);
-  List.iter (fun (pc, slots) -> State_codec.put_int w pc; State_codec.put_int w slots) t.rst30_pending;
+  List.iter
+    (fun (ret, slots) ->
+      State_codec.put_int w
+        (match ret with Return_at pc -> pc | Return_via_trap pc -> pending_via_trap_bit lor pc);
+      State_codec.put_int w slots)
+    t.rst30_pending;
   let files = Hashtbl.to_seq t.bdos_files |> List.of_seq |> List.sort (fun (a,_) (b,_) -> compare a b) in
   State_codec.put_int w (List.length files);
   List.iter (fun (fcb, (data, pos)) ->
@@ -2458,8 +2785,13 @@ let restore_with_reader reader state =
     t.joy1 <- State_codec.get_int r ~min:0 ~max:255;
     let pending = State_codec.get_int r ~min:0 ~max:(State_codec.remaining r / 16) in
     t.rst30_pending <- List.init pending (fun _ ->
-      let pc = State_codec.get_int r ~min:0 ~max:65535 in
-      let slots = State_codec.get_int r ~min:0 ~max:255 in pc, slots);
+      let saved = State_codec.get_int r ~min:0 ~max:0x1ffff in
+      let slots = State_codec.get_int r ~min:0 ~max:255 in
+      let ret =
+        if saved land pending_via_trap_bit <> 0 then Return_via_trap (saved land 0xffff)
+        else Return_at saved
+      in
+      ret, slots);
     let files = State_codec.get_int r ~min:0 ~max:65536 in
     for _ = 1 to files do
       let fcb = State_codec.get_int r ~min:0 ~max:65535 in
