@@ -150,7 +150,7 @@ let () =
         "  실 디스크 ROM 코드를 cart 에 (DISK_ROM env 로 경로, 기본 --roms 의 cbios_disk.rom)" );
       ( "--cart-mapper",
         Arg.String (fun s -> cart_mapper := s),
-        "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc|koei" );
+        "NAME  mapper override: plain|ascii8|ascii16|konami|konami-scc|koei|neo8|neo16" );
       ( "--rom-db",
         Arg.Set_string rom_db,
         "PATH  openMSX softwaredb.xml — 카트 매퍼를 ROM 의 SHA-1 로 찾는다 (없으면 추정)" );

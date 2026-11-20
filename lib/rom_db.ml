@@ -20,6 +20,8 @@ let mapper_name : Msx.cart_mapper -> string = function
   | Konami -> "konami"
   | Konami_scc -> "konami-scc"
   | Ascii8_sram -> "koei"
+  | Neo8 -> "neo8"
+  | Neo16 -> "neo16"
   (* A RAM cartridge has no ROM image, so the database never names it; this is
      only the label boot.exe prints. *)
   | Ram64 -> "ram64"
@@ -31,6 +33,8 @@ let mapper_of_name = function
   | "konami" -> Some Msx.Konami
   | "konami-scc" -> Some Msx.Konami_scc
   | "koei" -> Some Msx.Ascii8_sram
+  | "neo8" -> Some Msx.Neo8
+  | "neo16" -> Some Msx.Neo16
   | _ -> None
 
 (* openMSX RomInfo.cc names and aliases, lowercased, for the types this
@@ -43,6 +47,8 @@ let kind_of_name name =
   | "konami" | "konami4" | "3" -> Mapper Konami
   | "konamiscc" | "scc" | "konami5" | "2" -> Mapper Konami_scc
   | "koeisram8" | "koeisram32" -> Mapper Ascii8_sram
+  | "neo8" -> Mapper Neo8
+  | "neo16" -> Mapper Neo16
   | "mirrored" | "mirrored0000" | "mirrored4000" | "mirrored8000" | "mirroredc000"
   | "normal" | "normal0000" | "normal4000" | "normal8000" | "normalc000"
   | "page0" | "page1" | "page2" | "page3" | "page01" | "page12" | "page23"
