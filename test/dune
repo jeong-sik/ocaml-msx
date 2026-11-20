@@ -24,6 +24,11 @@
  (libraries vdpcore))
 
 (test
+ (name multicolor_test)
+ (modules multicolor_test)
+ (libraries vdpcore))
+
+(test
  (name keyboard_test)
  (modules keyboard_test)
  (libraries msx))
