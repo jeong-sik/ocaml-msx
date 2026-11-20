@@ -120,13 +120,14 @@ let () =
   let t = Vdp.create () in
   set_reg t 15 2;
   ignore (Vdp.advance t ~cycles:cycles_per_frame);
+  (* R#15 itself, not an S#2 read: S#2's HR and VR bits follow the beam. *)
   check "VBlank without an accepted interrupt keeps the S#2 selection"
-    (Vdp.io_read t ~port:0x99 land 0x7e = 0x7e);
+    ((Vdp.regs t).(15) land 0x0f = 2);
   set_reg t 15 2;
   ignore (Vdp.advance t ~cycles:cycles_per_frame);
   Vdp.interrupt_accepted t;
   check "an accepted VBlank interrupt selects S#0 again"
-    (Vdp.io_read t ~port:0x99 land 0x80 = 0x80)
+    ((Vdp.regs t).(15) land 0x0f = 0 && Vdp.io_read t ~port:0x99 land 0x80 = 0x80)
 
 let () =
   List.iter
