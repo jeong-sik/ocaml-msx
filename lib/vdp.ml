@@ -320,8 +320,8 @@ let line t ~mxd ~arg ~op ~dx ~dy =
 
 (* 블록 명령 실행 — 즉시 완료 (CE 는 관찰되지 않는다). 줄을 마칠 때마다 DY·NY
    (복사 명령은 SY 도)를 레지스터에 되써서, 다음 명령이 그 값에서 시작한다.
-   CPU 동기 전송(LMMC/HMMC)은 R#44 쓰기 구동 transfer_byte 로, LMCM 은 아직
-   없다. *)
+   CPU 동기 전송 LMMC/HMMC 는 R#44 쓰기가 구동하는 transfer_byte 로, LMCM 은
+   S#7 읽기가 구동하는 lmcm_fetch 로 처리한다. *)
 let exec_command t =
   let cmd = t.regs.(46) lsr 4 and op = t.regs.(46) land 15 in
   let arg = t.regs.(45) in
@@ -405,11 +405,52 @@ let transfer_byte t v =
     end
   end
 
+(* LMCM: VRAM 의 점을 CPU 가 S#7 로 읽는다. 시작할 때 첫 점이 R#44(COL)에
+   들어오고, S#7 을 읽을 때마다 다음 점이 들어온다. 마지막 점이 COL 에
+   들어오는 순간 CE 가 내려가고 TR 은 그 점을 읽을 때까지 남는다
+   (openMSX startLmcm·executeLmcm·resetColor). tx_adx = ASX, tx_dx = SX,
+   tx_dy = SY, tx_anx = 이 줄에 남은 점, tx_ny = 남은 줄. SY·NY 는 줄을 마칠
+   때마다 레지스터에 되쓴다. *)
+let lmcm_fetch t =
+  let arg = t.regs.(45) in
+  let mxs = arg land 0x10 <> 0 in
+  t.regs.(44) <- point t mxs t.tx_adx t.tx_dy;
+  t.tx_adx <- t.tx_adx + (if arg land 4 <> 0 then -1 else 1);
+  t.tx_anx <- t.tx_anx - 1;
+  if t.tx_anx = 0 then begin
+    t.tx_dy <- t.tx_dy + (if arg land 8 <> 0 then -1 else 1);
+    set_reg_y t 34 35 t.tx_dy;
+    set_reg_y t 42 43 (reg_y t 42 43 - 1);
+    t.tx_adx <- t.tx_dx;
+    t.tx_anx <- t.tx_nx;
+    t.tx_ny <- t.tx_ny - 1;
+    if t.tx_ny = 0 then begin
+      t.tx_active <- false;
+      t.cmd_ce <- false
+    end
+  end
+
+let lmcm_active t = t.tx_active && t.regs.(46) lsr 4 = 0xa
+
 let start_command t =
   let cmr_v = t.regs.(46) in
   t.cmd_log <- (cmr_v, reg16 t 36 37, reg16 t 38 39, reg16 t 42 43) :: List.filteri (fun i _ -> i < 31) t.cmd_log;
   let cmd = t.regs.(46) lsr 4 in
-  if cmd = 0xB || cmd = 0xF then begin
+  if cmd = 0xA then begin
+    let reverse_x = t.regs.(45) land 4 <> 0 in
+    t.tx_active <- true;
+    t.tx_hm <- false;
+    t.tx_dx <- reg16 t 32 33;
+    t.tx_adx <- t.tx_dx;
+    t.tx_nx <- clip_x t ~byte:false ~reverse:reverse_x ~x:t.tx_dx ~nx:(reg16 t 40 41);
+    t.tx_anx <- t.tx_nx;
+    t.tx_dy <- reg_y t 34 35;
+    t.tx_ny <- clip_y ~reverse:(t.regs.(45) land 8 <> 0) ~y:t.tx_dy ~ny:(reg_y t 42 43);
+    t.cmd_ce <- true;
+    t.cmd_tr <- true;
+    lmcm_fetch t
+  end
+  else if cmd = 0xB || cmd = 0xF then begin
     t.tx_active <- true;
     t.tx_hm <- cmd = 0xF;
     t.tx_dx <- reg16 t 36 37;
@@ -440,7 +481,8 @@ let start_command t =
 let write_reg t r v =
   t.regs.(r) <- v land 0xff;
   if r = 44 then begin
-    if t.tx_active then transfer_byte t v else t.tx_pending <- true
+    if lmcm_active t then ()
+    else if t.tx_active then transfer_byte t v else t.tx_pending <- true
   end
   else if r = 46 then start_command t
   else if r = 16 then begin
@@ -561,7 +603,10 @@ let io_read t ~port =
         in
         if not t.tx_active then t.cmd_tr <- false;
         v
-      | 7 -> t.regs.(44)
+      | 7 ->
+        let v = t.regs.(44) in
+        if lmcm_active t then lmcm_fetch t else t.cmd_tr <- false;
+        v
       | 8 -> t.srch_x land 0xff
       | 9 ->
         t.cmd_bd <- false;
