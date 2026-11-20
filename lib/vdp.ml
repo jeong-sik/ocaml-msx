@@ -557,8 +557,7 @@ let write_log t =
 
 (* 모드 판정 (V9938 모드표: M5=R0bit3, M4=R0bit2, M3=R0bit1,
    M2=R1bit3, M1=R1bit4). G4 비트맵 = MSX2 SCREEN5 (M4+M3),
-   베이스는 R#2 의 A16/A15 (bit6/5) × 32K — 하위 5비트는 11111 고정.
-   멀티컬러(M2) 는 아직 없다. *)
+   베이스는 R#2 의 A16/A15 (bit6/5) × 32K — 하위 5비트는 11111 고정. *)
 let mode_text t = t.regs.(1) land 0x10 <> 0
 (* 타일 렌더러의 G2 계열: SCREEN2(M3) 와 SCREEN4(M4) 는 패턴·컬러 테이블
    배치가 같고(1/3 씩 세 덩어리, 행마다 컬러 한 바이트), 스프라이트만
@@ -710,6 +709,32 @@ let frame_rgb t =
           done
         done
       done
+    end
+    else if mode_now = Multicolor then begin
+      (* SCREEN3: 64×48 블록, 블록 하나는 4×4 픽셀. 이름 하나가 패턴 8바이트를
+         고르고, 블록 줄 (y >> 2) mod 8 번째 바이트의 윗 니블이 왼쪽 블록,
+         아랫 니블이 오른쪽 블록의 색이다 (openMSX
+         CharacterConverter::renderMulti). 패턴 주소는 G1 처럼 R#4 로 만든다. *)
+      let nt = (r.(2) land 0x7f) lsl 10 in
+      let pt_base = ((r.(4) land 0x3f) lsl 11) lor 0x7ff in
+      for row = 0 to 23 do
+        for col = 0 to 31 do
+          let name = vr (nt + (row * 32) + col) in
+          for half = 0 to 1 do
+            let block_row = ((row * 2) + half) land 7 in
+            let bits =
+              vr (pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor block_row)) in
+            for py = 0 to 3 do
+              for px = 0 to 3 do
+                let y = (row * 8) + (half * 4) + py and x = (col * 8) + px in
+                put_px x y ((bits lsr 4) land 0xf);
+                put_px (x + 4) y (bits land 0xf)
+              done
+            done
+          done
+        done
+      done;
+      render_sprites t ~h ~dot:One put
     end
     else begin
       let g2 = mode_g2 t in
