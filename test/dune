@@ -19,6 +19,11 @@
  (libraries vdpcore))
 
 (test
+ (name g5_sprite_test)
+ (modules g5_sprite_test)
+ (libraries vdpcore))
+
+(test
  (name keyboard_test)
  (modules keyboard_test)
  (libraries msx))

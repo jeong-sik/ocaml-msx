@@ -579,8 +579,17 @@ let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
 
 (* 스프라이트 그리기. 모드·줄 선택·패턴 기하는 [Sprites] 가 정한다 — 한 줄에
    모드 1 은 4개, 모드 2 는 8개까지 보이고 번호가 낮은 쪽이 위다. SPD(R#8
-   bit1)가 켜지면 그리지 않는다. [xscale] 은 512폭 모드(SCREEN6/7)에서 2. *)
-let render_sprites t ~h ~xscale put =
+   bit1)가 켜지면 그리지 않는다. [dot] 은 스프라이트 점 하나가 화면 픽셀로
+   바뀌는 방식이다. *)
+type sprite_dot =
+  | One  (* 256폭 모드: 점 하나가 픽셀 하나 *)
+  | Same_pair  (* SCREEN7: 같은 색 픽셀 둘 *)
+  | Split_pair
+      (* SCREEN6: 4색 모드라 색 코드를 둘로 쪼갠다 — 왼쪽 픽셀은 윗 2비트,
+         오른쪽 픽셀은 아랫 2비트가 팔레트 항목이다
+         (openMSX SpriteConverter::drawMode2 GRAPHIC5). *)
+
+let render_sprites t ~h ~dot put =
   match sprite_mode t with
   | Some mode when t.regs.(8) land 0x02 = 0 ->
       let e = sprite_env t mode in
@@ -594,9 +603,14 @@ let render_sprites t ~h ~xscale put =
           for x = 0 to 255 do
             let c = px.(x) in
             if c >= 0 then
-              for k = 0 to xscale - 1 do
-                put ((x * xscale) + k) line c
-              done
+              match dot with
+              | One -> put x line c
+              | Same_pair ->
+                  put (x * 2) line c;
+                  put ((x * 2) + 1) line c
+              | Split_pair ->
+                  put (x * 2) line (c lsr 2);
+                  put ((x * 2) + 1) line (c land 3)
           done
         end
       done
@@ -666,7 +680,13 @@ let frame_rgb t =
           Bytes.set img (i + 2) (Char.chr b))
         else put
       in
-      render_sprites t ~h ~xscale:(w / 256) put_sprite
+      let dot =
+        match display_mode t with
+        | Graphic5 -> Split_pair
+        | Graphic6 -> Same_pair
+        | _ -> One
+      in
+      render_sprites t ~h ~dot put_sprite
     end
     else if mode_text t then begin
       (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
@@ -728,7 +748,7 @@ let frame_rgb t =
           done
         done
       done;
-      render_sprites t ~h ~xscale:1 put
+      render_sprites t ~h ~dot:One put
     end;
     Bytes.to_string img
   end
