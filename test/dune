@@ -29,6 +29,11 @@
  (libraries vdpcore))
 
 (test
+ (name vdp_line_state_test)
+ (modules vdp_line_state_test)
+ (libraries vdpcore))
+
+(test
  (name keyboard_test)
  (modules keyboard_test)
  (libraries msx))
