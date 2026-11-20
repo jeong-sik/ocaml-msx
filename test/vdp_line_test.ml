@@ -49,13 +49,28 @@ let () =
   check "IE1 clear resets latched FH" (read_status t 1 land 1 = 0);
   Msx.step t ~frames:1;
   check "IE1 off after reset: FH not latched" (read_status t 1 land 1 = 0);
-  (* 인터럽트 발생 시 상태 레지스터 선택(R#15)은 0 으로 돌아간다 — V9938
-     계약. 게임이 S#1 선택을 남긴 채 VBlank 가 걸리면 BIOS KEYINT 의
-     `in a,(0x99)` 가 S#1 을 읽고 스캔 없이 종료한다(룬마스터 1 관측). *)
+  (* CPU 가 받지 않은 VBlank(이 머신은 DI 상태)는 상태 레지스터 선택(R#15)을
+     건드리지 않는다. 받은 인터럽트에서 S#0 으로 돌아가는 쪽은
+     sprite_flags_test 가 Vdp.interrupt_accepted 로 확인한다. *)
   set_reg t 15 1;
   Msx.step t ~frames:200;
-  check "interrupt resets S# select to 0"
-    ((Msx.vdp_regs t).(15) land 0x0f = 0);
+  check "a VBlank the CPU does not take leaves the S# select alone"
+    ((Msx.vdp_regs t).(15) land 0x0f = 1);
+  (* CPU 가 받은 VBlank 는 선택을 S#0 으로 되돌린다. 메인 ROM 이
+     DI·IM 1·R#15=1·R#1=0x60(IE0)·EI·HALT 를 하고, 0x38 의 핸들러가 EI·RETI 한다. *)
+  let main = Bytes.make 0x4000 '\000' in
+  List.iteri (fun i b -> Bytes.set main i (Char.chr b))
+    [ 0xf3; 0xed; 0x56;
+      0x3e; 0x01; 0xd3; 0x99; 0x3e; 0x8f; 0xd3; 0x99;
+      0x3e; 0x60; 0xd3; 0x99; 0x3e; 0x81; 0xd3; 0x99;
+      0xfb; 0x76; 0x18; 0xfd ];
+  List.iteri (fun i b -> Bytes.set main (0x38 + i) (Char.chr b)) [ 0xfb; 0xed; 0x4d ];
+  let m =
+    Msx.create ~machine:{ Msx.ram_kb = 64; vram_kb = 128; roms = [ Bytes.to_string main ] }
+  in
+  Msx.step m ~frames:3;
+  check "a VBlank the CPU takes selects S#0 again"
+    ((Msx.vdp_regs m).(15) land 0x0f = 0);
   (* A port access reaches the VDP at its port cycle, not at the start of
      the instruction (issue #76; openMSX CPUCore READ_PORT schedules up to
      getTimeFast(CC_IN_A_N_2), 5+3+1 = 9 cycles in). A program in RAM starts
