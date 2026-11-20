@@ -125,6 +125,10 @@ let () =
   ignore (Vdp.advance t ~cycles:(20*228));
   check "212-line vblank begins at 212" (Vdp.status0 t land 0x80 <> 0);
   let t = fresh 0x06 in reg t 0 0x16; reg t 19 10;
-  ignore (Vdp.advance t ~cycles:(10*228));
+  (* 줄 인터럽트는 R#19 줄의 오른쪽 가장자리(openMSX getRightBorder = 1282 틱
+     = 213.67 사이클)에서 걸린다. *)
+  ignore (Vdp.advance t ~cycles:((10*228) + 213));
+  check "line interrupt waits for the right edge of line R#19" (not (Vdp.int_active t));
+  ignore (Vdp.advance t ~cycles:1);
   check "line interrupt enable is R0 bit4" (Vdp.int_active t);
   print_endline "bitmap: native pixels, VRAM ports, commands and interrupts passed"
