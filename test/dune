@@ -59,6 +59,11 @@
  (libraries vdpcore))
 
 (test
+ (name vdp_command_timing_test)
+ (modules vdp_command_timing_test)
+ (libraries vdpcore))
+
+(test
  (name vdp_lmcm_test)
  (modules vdp_lmcm_test)
  (libraries vdpcore))

@@ -199,7 +199,7 @@ let () =
   Msx.step m ~frames:59;
   check "machine clock after 59 frames" (seconds m = 30);
   let state = Msx.serialize m in
-  check "save state is format 7" (String.sub state 0 11 = "OCAML-MSX\000\007");
+  check "save state is format 8" (String.sub state 0 11 = "OCAML-MSX\000\008");
   Msx.step m ~frames:1;
   check "machine clock after 60 frames" (seconds m = 31);
   match Msx.restore ~state with

@@ -1,7 +1,9 @@
 (** V9938 — TMS9918 호환 표면(텍스트/G1/G2) + 비트맵 렌더(G4~G7), 스프라이트,
     블록 명령(LMMV/HMMV/HMMM/YMMM/LMMM), POINT/SRCH/LINE, CPU 동기 전송
     (LMMC/HMMC/LMCM), 레지스터·VRAM 래치, 팔레트, VBlank·라인 인터럽트.
-    명령은 즉시 끝난다(CE 가 서 있는 시간은 모델하지 않는다). *)
+    블록 명령은 시작할 때 결과를 VRAM 에 쓰고, CE 만 명령 종류와 줄 상태(표시·
+    스프라이트·VBlank)에 따른 시간 동안 세워 둔다. CPU 동기 전송의 TR 은 항상
+    준비 상태다. *)
 
 type t
 

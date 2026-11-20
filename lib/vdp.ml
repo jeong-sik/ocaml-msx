@@ -6,6 +6,18 @@
    팔레트 쓰기: 0x9A 인덱스, 0x9B 두 번 — 첫 (R<<4|B), 둘째 (G<<4).
    VBlank: 라인 192 진입에서 status0 bit7 과 INT. IE = R1 bit5. *)
 
+(* 시간이 걸리는 블록 명령. 단위는 HMMV·HMMM·YMMM 이 VRAM 바이트, LMMV·LMMM 이
+   점, LINE 이 긴 변의 한 걸음이다. POINT·PSET·SRCH 는 폴링 한 번 안에 끝나서
+   여기에 없다. *)
+type timed = Hmmv | Lmmv | Hmmm | Lmmm | Ymmm | Line
+
+let timed_code = function
+  | Hmmv -> 0 | Lmmv -> 1 | Hmmm -> 2 | Lmmm -> 3 | Ymmm -> 4 | Line -> 5
+
+let timed_of_code = function
+  | 0 -> Hmmv | 1 -> Lmmv | 2 -> Hmmm | 3 -> Lmmm | 4 -> Ymmm | 5 -> Line
+  | _ -> State_codec.fail "invalid VDP command kind"
+
 type t = {
   regs : int array;
   vram : Bytes.t;
@@ -23,6 +35,12 @@ type t = {
   mutable cycle_in_line : int;
   mutable int_pending : bool;
   mutable cmd_ce : bool;
+  (* 블록 명령은 시작할 때 결과를 VRAM 에 한꺼번에 쓰고, CE 만 걸리는 시간만큼
+     선 채로 남는다. [cmd_wait] 는 엔진이 일을 시작하기까지 남은 VDP 틱,
+     [cmd_left] 는 남은 단위 수의 [unit_scale] 배. [cmd_left] > 0 이면 CE 가 서 있다. *)
+  mutable cmd_kind : timed;
+  mutable cmd_wait : int;
+  mutable cmd_left : int;
   (* LMMC/HMMC 전송 상태 — CMR 를 쓰면 진입, R#44(CLR) 쓰기마다
      1바이트가 흘러간다 (openMSX setCmdReg case 0x0C). *)
   mutable tx_active : bool;
@@ -86,6 +104,9 @@ let create () =
     cycle_in_line = 0;
     int_pending = false;
     cmd_ce = false;
+    cmd_kind = Hmmv;
+    cmd_wait = 0;
+    cmd_left = 0;
     tx_active = false;
     tx_hm = false;
     tx_dx = 0;
@@ -318,12 +339,14 @@ let line t ~mxd ~arg ~op ~dx ~dy =
   in
   draw ~adx:dx ~dy ~asx:(((nx - 1) land 0xffffffff) lsr 1) ~anx:0
 
-(* 블록 명령 실행 — 즉시 완료 (CE 는 관찰되지 않는다). 줄을 마칠 때마다 DY·NY
+(* 블록 명령 실행 — 결과를 한꺼번에 VRAM 에 쓰고, 걸리는 시간은 반환한 단위
+   수로 [start_command] 가 CE 에 반영한다(POINT·PSET·SRCH 는 0). 줄을 마칠 때마다 DY·NY
    (복사 명령은 SY 도)를 레지스터에 되써서, 다음 명령이 그 값에서 시작한다.
    CPU 동기 전송 LMMC/HMMC 는 R#44 쓰기가 구동하는 transfer_byte 로, LMCM 은
    S#7 읽기가 구동하는 lmcm_fetch 로 처리한다. *)
 let exec_command t =
   let cmd = t.regs.(46) lsr 4 and op = t.regs.(46) land 15 in
+  let line_steps = reg16 t 40 41 in
   let arg = t.regs.(45) in
   let reverse_x = arg land 4 <> 0 and reverse_y = arg land 8 <> 0 in
   let mxs = arg land 0x10 <> 0 and mxd = arg land 0x20 <> 0 in
@@ -344,11 +367,11 @@ let exec_command t =
     if copy then min dest (clip_y ~reverse:reverse_y ~y:sy ~ny) else dest in
   let step_x n = (if reverse_x then -n else n) * (if byte then pixels_per_byte t else 1) in
   let step_y n = if reverse_y then -n else n in
-  if cmd = 4 then t.regs.(44) <- point t mxs sx sy
-  else if cmd = 5 then pset t mxd dx dy op t.regs.(44)
-  else if cmd = 6 then srch t ~mxs ~arg ~sx ~sy
-  else if cmd = 7 then set_reg_y t 38 39 (line t ~mxd ~arg ~op ~dx ~dy)
-  else if cmd = 8 || cmd = 9 || cmd = 0xc || cmd = 0xd || cmd = 0xe then
+  if cmd = 4 then (t.regs.(44) <- point t mxs sx sy; 0)
+  else if cmd = 5 then (pset t mxd dx dy op t.regs.(44); 0)
+  else if cmd = 6 then (srch t ~mxs ~arg ~sx ~sy; 0)
+  else if cmd = 7 then (set_reg_y t 38 39 (line t ~mxd ~arg ~op ~dx ~dy); line_steps)
+  else if cmd = 8 || cmd = 9 || cmd = 0xc || cmd = 0xd || cmd = 0xe then begin
     for row = 0 to ny - 1 do
       for col = 0 to nx - 1 do
         let x = dx + step_x col and y = dy + step_y row in
@@ -368,7 +391,10 @@ let exec_command t =
       set_reg_y t 38 39 (dy + step_y done_rows);
       set_reg_y t 42 43 (ny_start - done_rows);
       if copy then set_reg_y t 34 35 (sy + step_y done_rows)
-    done
+    done;
+    nx * ny
+  end
+  else 0
 
 (* LMMC/HMMC 전송 한 바이트 — 전송 모드에서 R#44(CLR) 쓰기가 곧
    데이터다 (openMSX setCmdReg case 0x0C → executeLmmc/executeHmmc).
@@ -432,10 +458,69 @@ let lmcm_fetch t =
 
 let lmcm_active t = t.tx_active && t.regs.(46) lsr 4 = 0xa
 
+(* 블록 명령이 걸리는 시간.
+
+   명령 엔진은 VRAM 슬롯이 비는 틈에만 접근해서, 같은 명령도 표시가 켜진
+   활성 줄(스프라이트가 켜지면 더 느리게)에서는 표시가 꺼졌거나 VBlank 인
+   줄보다 느리다. 값은 openMSX(my8250cbios, V9938)에서 같은 명령을 NX·NY 를
+   바꿔 가며 돌려 CE 가 서 있던 시간을 잰 기울기다. 단위당 VDP 틱(21.477 MHz)
+   의 10배이고, SCREEN 5·7(G4·G7)에서 잰 값이 1% 안에서 같아 모드별로 가르지
+   않는다. 틱 하나는 Z80 사이클의 1/6 이다. *)
+type engine_state = Blank | Display | Sprites
+
+let unit_cost10 kind state =
+  match kind, state with
+  | Hmmv, Blank -> 499 | Hmmv, Display -> 629 | Hmmv, Sprites -> 651
+  | Lmmv, Blank -> 981 | Lmmv, Display -> 1241 | Lmmv, Sprites -> 1387
+  | Hmmm, Blank -> 920 | Hmmm, Display -> 980 | Hmmm, Sprites -> 1342
+  | Lmmm, Blank -> 1303 | Lmmm, Display -> 1329 | Lmmm, Sprites -> 1529
+  | Ymmm, Blank -> 652 | Ymmm, Display -> 910 | Ymmm, Sprites -> 1220
+  | Line, Blank -> 1304 | Line, Display -> 1400 | Line, Sprites -> 1592
+
+(* 남은 단위 수를 정수로 세는 배율. 명령어 하나(4~23 사이클 = 24~138 틱)가 지나는
+   동안 한 일을 나눗셈으로 내려 버릴 때 잃는 몫이 1 단위의 100만분의 1 안이다. *)
+let unit_scale = 1_000_000
+
+(* 명령을 발행한 뒤 엔진이 첫 단위를 시작하기까지 걸리는 VDP 틱. *)
+let command_start_ticks = 400
+let ticks_per_cycle = 6
+
+let engine_state t ~line =
+  if t.regs.(1) land 0x40 = 0 || line >= visible_lines t then Blank
+  else if t.regs.(8) land 0x02 = 0 then Sprites
+  else Display
+
+(* [cycles] Z80 사이클 동안 명령 엔진을 진행한다. 줄이 바뀔 때마다 그 줄의
+   상태로 비용을 다시 고른다. 호출은 [t.line]·[t.cycle_in_line] 을 옮기기 전이다. *)
+let advance_command t ~cycles =
+  if t.cmd_left > 0 then begin
+    let line = ref t.line and col = ref t.cycle_in_line and todo = ref cycles in
+    while !todo > 0 && t.cmd_left > 0 do
+      let seg = min !todo (cycles_per_line - !col) in
+      let ticks = seg * ticks_per_cycle in
+      let waited = min t.cmd_wait ticks in
+      t.cmd_wait <- t.cmd_wait - waited;
+      let busy = ticks - waited in
+      if busy > 0 then begin
+        let cost = unit_cost10 t.cmd_kind (engine_state t ~line:!line) in
+        t.cmd_left <- max 0 (t.cmd_left - (busy * 10 * unit_scale / cost))
+      end;
+      todo := !todo - seg;
+      col := !col + seg;
+      if !col >= cycles_per_line then begin
+        col := 0;
+        line := if !line + 1 >= lines_per_frame then 0 else !line + 1
+      end
+    done;
+    if t.cmd_left = 0 then t.cmd_ce <- false
+  end
+
 let start_command t =
   let cmr_v = t.regs.(46) in
   t.cmd_log <- (cmr_v, reg16 t 36 37, reg16 t 38 39, reg16 t 42 43) :: List.filteri (fun i _ -> i < 31) t.cmd_log;
   let cmd = t.regs.(46) lsr 4 in
+  t.cmd_wait <- 0;
+  t.cmd_left <- 0;
   if cmd = 0xA then begin
     let reverse_x = t.regs.(45) land 4 <> 0 in
     t.tx_active <- true;
@@ -473,9 +558,20 @@ let start_command t =
   end
   else begin
     t.tx_active <- false;
-    t.cmd_ce <- false;
     t.cmd_tr <- false;
-    exec_command t
+    let units = exec_command t in
+    let kind =
+      match cmd with
+      | 7 -> Some Line | 8 -> Some Lmmv | 9 -> Some Lmmm
+      | 0xc -> Some Hmmv | 0xd -> Some Hmmm | 0xe -> Some Ymmm
+      | _ -> None in
+    match kind with
+    | Some kind when units > 0 ->
+      t.cmd_kind <- kind;
+      t.cmd_wait <- command_start_ticks;
+      t.cmd_left <- units * unit_scale;
+      t.cmd_ce <- true
+    | Some _ | None -> t.cmd_ce <- false
   end
 
 let write_reg t r v =
@@ -589,8 +685,8 @@ let io_read t ~port =
         t.status1 <- 0;
         x
       | 2 ->
-        (* TR: 전송 가능. 즉시 실행이라 전송 중엔 언제나 받을 수
-           있다 — 읽어도 유지. 완료 직후에는 한 번 1을 보여주고
+        (* TR: 전송 가능. CPU 동기 전송은 엔진 속도를 모델하지 않아 전송 중엔
+           언제나 받을 수 있다 — 읽어도 유지. 완료 직후에는 한 번 1을 보여주고
            해제한다 (openMSX commandDone: "TR is reset when S#2 is
            read next") — 완료 감지는 그다음 읽기부터 TR=0 && CE=0. *)
         let v =
@@ -618,6 +714,7 @@ let io_read t ~port =
   | _ -> 0xff
 
 let advance t ~cycles =
+  advance_command t ~cycles;
   let hit = ref false in
   t.cycle_in_line <- t.cycle_in_line + cycles;
   while t.cycle_in_line >= cycles_per_line do
@@ -886,6 +983,9 @@ let write_state w t =
   State_codec.put_bool w t.tx_pending;
   State_codec.put_bool w t.cmd_bd;
   State_codec.put_int w t.srch_x;
+  State_codec.put_int w (timed_code t.cmd_kind);
+  State_codec.put_int w t.cmd_wait;
+  State_codec.put_int w t.cmd_left;
   ()
 
 let read_state r t =
@@ -926,5 +1026,15 @@ let read_state r t =
     t.cmd_bd <- false;
     t.srch_x <- 0
   end;
+  if State_codec.version r >= 8 then begin
+    t.cmd_kind <- timed_of_code (State_codec.get_int r ~min:0 ~max:5);
+    t.cmd_wait <- State_codec.get_int r ~min:0 ~max:command_start_ticks;
+    t.cmd_left <- State_codec.get_int r ~min:0 ~max:(512 * 1024 * unit_scale)
+  end else begin
+    t.cmd_kind <- Hmmv;
+    t.cmd_wait <- 0;
+    t.cmd_left <- 0
+  end;
+  if t.cmd_left > 0 && not t.cmd_ce then State_codec.fail "invalid active VDP command";
   if t.tx_active && (t.tx_nx = 0 || t.tx_anx = 0 || t.tx_anx > t.tx_nx || t.tx_ny = 0) then
     State_codec.fail "invalid active VDP transfer"
