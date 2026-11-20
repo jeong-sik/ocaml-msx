@@ -202,6 +202,14 @@ let pixels_per_byte t = (bitmap_layout t).pixels_per_byte
 let reg16 t lo hi = ((t.regs.(hi) land 1) lsl 8) lor t.regs.(lo)
 let reg_y t lo hi = ((t.regs.(hi) land 3) lsl 8) lor t.regs.(lo)
 
+(* SY·DY·NY 는 10비트다. 명령이 줄을 마칠 때마다 레지스터가 갱신되어, 다음
+   명령이 DY·NY 를 다시 쓰지 않으면 그 값에서 시작한다
+   (openMSX VDPCmdEngine::executeLmmv 등의 `DY += TY; --NY`). SX·DX·NX 는
+   명령이 바꾸지 않는다. *)
+let set_reg_y t lo hi v =
+  t.regs.(lo) <- v land 0xff;
+  t.regs.(hi) <- (t.regs.(hi) land lnot 3) lor ((v lsr 8) land 3)
+
 let physical_addr t a =
   let a = a land 0x1ffff in
   if (bitmap_layout t).planar then ((a land 1) lsl 16) lor (a lsr 1)
@@ -273,7 +281,9 @@ let srch t ~mxs ~arg ~sx ~sy =
 
 (* LINE: NX 는 긴 변, NY 는 짧은 변이고 MAJ(ARG bit0)가 긴 변의 축(0 = X)이다.
    브레젠험 오차 ASX 로 긴 변을 한 칸씩 가며 NX + 1 개를 찍는다
-   (openMSX VDPCmdEngine::executeLine, 실기로 확인한 종료 판정 순서). *)
+   (openMSX VDPCmdEngine::executeLine, 실기로 확인한 종료 판정 순서).
+   끝난 줄의 DY 를 돌려준다 — 짧은 변으로 한 칸 갈 때마다 DY 가 레지스터에서
+   바뀌므로 다음 명령이 그 값에서 시작한다. *)
 let line t ~mxd ~arg ~op ~dx ~dy =
   let cl = t.regs.(44) land pixel_mask t in
   let width = (bitmap_layout t).width in
@@ -287,29 +297,31 @@ let line t ~mxd ~arg ~op ~dx ~dy =
     let finished = anx = nx in
     if not major_y then begin
       let adx = adx + tx in
-      if finished || adx land width <> 0 then ()
+      if finished || adx land width <> 0 then dy
       else begin
         let asx, dy, stop =
           if asx < ny then (asx + nx, dy + ty, ty < 0 && dy + ty < 0)
           else (asx, dy, false) in
-        if not stop then
-          draw ~adx ~dy ~asx:((asx - ny) land 1023) ~anx:(anx + 1)
+        if stop then dy
+        else draw ~adx ~dy ~asx:((asx - ny) land 1023) ~anx:(anx + 1)
       end
     end else begin
       let dy = dy + ty in
-      if ty < 0 && dy < 0 then ()
+      if ty < 0 && dy < 0 then dy
       else begin
         let asx, adx = if asx < ny then (asx + nx, adx + tx) else (asx, adx) in
         let asx = (asx - ny) land 1023 in
-        if finished || adx land width <> 0 then ()
+        if finished || adx land width <> 0 then dy
         else draw ~adx ~dy ~asx ~anx:(anx + 1)
       end
     end
   in
   draw ~adx:dx ~dy ~asx:(((nx - 1) land 0xffffffff) lsr 1) ~anx:0
 
-(* 블록 명령 실행 — 즉시 완료 (CE 는 관찰되지 않는다). CPU 동기 전송
-   (LMMC/HMMC) 은 R#44 쓰기 구동 transfer_byte 로, LMCM 은 아직 없다. *)
+(* 블록 명령 실행 — 즉시 완료 (CE 는 관찰되지 않는다). 줄을 마칠 때마다 DY·NY
+   (복사 명령은 SY 도)를 레지스터에 되써서, 다음 명령이 그 값에서 시작한다.
+   CPU 동기 전송(LMMC/HMMC)은 R#44 쓰기 구동 transfer_byte 로, LMCM 은 아직
+   없다. *)
 let exec_command t =
   let cmd = t.regs.(46) lsr 4 and op = t.regs.(46) land 15 in
   let arg = t.regs.(45) in
@@ -320,6 +332,7 @@ let exec_command t =
   let byte = cmd >= 0xc in
   let nx = if cmd = 0xe then 512 else reg16 t 40 41 in
   let ny = reg_y t 42 43 in
+  let ny_start = ny in
   let src_x = if cmd = 0xe then dx else sx in
   let copy = cmd = 9 || cmd = 0xd || cmd = 0xe in
   let nx =
@@ -334,7 +347,7 @@ let exec_command t =
   if cmd = 4 then t.regs.(44) <- point t mxs sx sy
   else if cmd = 5 then pset t mxd dx dy op t.regs.(44)
   else if cmd = 6 then srch t ~mxs ~arg ~sx ~sy
-  else if cmd = 7 then line t ~mxd ~arg ~op ~dx ~dy
+  else if cmd = 7 then set_reg_y t 38 39 (line t ~mxd ~arg ~op ~dx ~dy)
   else if cmd = 8 || cmd = 9 || cmd = 0xc || cmd = 0xd || cmd = 0xe then
     for row = 0 to ny - 1 do
       for col = 0 to nx - 1 do
@@ -350,7 +363,11 @@ let exec_command t =
             else t.regs.(44) in
           pset t mxd x y op value
         end
-      done
+      done;
+      let done_rows = row + 1 in
+      set_reg_y t 38 39 (dy + step_y done_rows);
+      set_reg_y t 42 43 (ny_start - done_rows);
+      if copy then set_reg_y t 34 35 (sy + step_y done_rows)
     done
 
 (* LMMC/HMMC 전송 한 바이트 — 전송 모드에서 R#44(CLR) 쓰기가 곧
@@ -376,6 +393,8 @@ let transfer_byte t v =
   t.tx_anx <- t.tx_anx - 1;
   if t.tx_anx = 0 then begin
     t.tx_dy <- t.tx_dy + (if diy then 1 else -1);
+    set_reg_y t 38 39 t.tx_dy;
+    set_reg_y t 42 43 (reg_y t 42 43 - 1);
     t.tx_adx <- t.tx_dx;
     t.tx_anx <- t.tx_nx;
     t.tx_ny <- t.tx_ny - 1;
