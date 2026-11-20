@@ -77,7 +77,8 @@ let () =
   beam v ~line:(lines_per_frame - 1) ~cycle:48;
   check "VR drops at cycle 48 of the last line" (not (vr v));
   (* The other bits keep their old values. *)
-  check "bits 4-1 still read 1" (s2 v land 0x1e = 0x1e);
+  check "bits 3-1 still read 1" (s2 v land 0x0e = 0x0e);
+  check "BD reads 0 until a SRCH finds its border" (s2 v land 0x10 = 0);
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1

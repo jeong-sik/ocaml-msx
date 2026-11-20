@@ -1,7 +1,7 @@
-(** V9938 — TMS9918 호환 표면(텍스트/G1/G2) + SCREEN5(G4) 비트맵 렌더,
-    블록 명령(LMMV/HMMV/HMMM/YMMM/LMMM) 과 CPU 동기 전송(LMMC/HMMC),
-    레지스터·VRAM 래치, 팔레트, VBlank·라인 인터럽트.
-    SCREEN6-8·스프라이트·POINT/SRCH/LINE 은 아직 없다. *)
+(** V9938 — TMS9918 호환 표면(텍스트/G1/G2) + 비트맵 렌더(G4~G7), 스프라이트,
+    블록 명령(LMMV/HMMV/HMMM/YMMM/LMMM), POINT/SRCH/LINE, CPU 동기 전송
+    (LMMC/HMMC), 레지스터·VRAM 래치, 팔레트, VBlank·라인 인터럽트.
+    LMCM 은 아직 없다. *)
 
 type t
 
