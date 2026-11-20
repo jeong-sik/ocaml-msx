@@ -347,6 +347,20 @@ let palette_rgb t i =
   if i land 0x10 = 0 then grb_to_rgb t.palette.(i land 15)
   else (0, 0, 0)
 
+(* SCREEN8 스프라이트는 팔레트 레지스터를 쓰지 않고 고정 16색을 쓴다(GRB 각
+   3비트). openMSX Renderer::GRAPHIC7_SPRITE_PALETTE 와 같은 값이다. *)
+let graphic7_sprite_palette =
+  [| 0x000; 0x002; 0x030; 0x032; 0x300; 0x302; 0x330; 0x332;
+     0x472; 0x007; 0x070; 0x077; 0x700; 0x707; 0x770; 0x777 |]
+
+(* SCREEN8 바이트(GGGRRRBB)의 파랑 2비트는 3비트 {b1, b0, b1 AND b0} 로 넓힌다
+   (0, 2, 4, 7). openMSX SDLRasterizer PALETTE256 도 같다. *)
+let graphic7_rgb byte =
+  let g = (byte lsr 5) land 7 and r = (byte lsr 2) land 7 in
+  let b2 = byte land 3 in
+  let b = if b2 = 3 then 7 else b2 * 2 in
+  grb_to_rgb ((g lsl 8) lor (r lsl 4) lor b)
+
 let log_w t port a v =
   (* 전체 주소 = R#14<<14 | 래치 (0x98 데이터 쓰기 기준). *)
   let full =
@@ -635,16 +649,24 @@ let frame_rgb t =
           let color = point t false x vy in
           if display_mode t = Graphic7 then begin
             (* SCREEN8 byte = GGGRRRBB, one byte per native pixel. *)
+            let r, g, b = graphic7_rgb color in
             let i = (y * w + x) * 3 in
-            Bytes.set img i (Char.chr (((color lsr 2) land 7) * 255 / 7));
-            Bytes.set img (i + 1) (Char.chr (((color lsr 5) land 7) * 255 / 7));
-            Bytes.set img (i + 2) (Char.chr ((color land 3) * 255 / 3))
+            Bytes.set img i (Char.chr r);
+            Bytes.set img (i + 1) (Char.chr g);
+            Bytes.set img (i + 2) (Char.chr b)
           end else put_px x y color
         done
       done;
-      (* SCREEN8 의 스프라이트는 고정 팔레트라 아직 없다. *)
-      if display_mode t <> Graphic7 then
-        render_sprites t ~h ~xscale:(w / 256) put
+      let put_sprite =
+        if display_mode t = Graphic7 then (fun x y c ->
+          let r, g, b = grb_to_rgb graphic7_sprite_palette.(c land 15) in
+          let i = (y * w + x) * 3 in
+          Bytes.set img i (Char.chr r);
+          Bytes.set img (i + 1) (Char.chr g);
+          Bytes.set img (i + 2) (Char.chr b))
+        else put
+      in
+      render_sprites t ~h ~xscale:(w / 256) put_sprite
     end
     else if mode_text t then begin
       (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
