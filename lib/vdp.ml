@@ -742,19 +742,21 @@ let render_lines t img ~w ~lo ~hi =
     else if mode_text t then begin
       (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
       let nt = (r.(2) land 0x7f) lsl 10 in
-      let pt = (r.(4) land 0x7) lsl 8 in
+      let pt = (r.(4) land 0x3f) lsl 11 in
       let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
       for y = lo to hi - 1 do
         for x = 0 to 7 do put_px x y bg done;
         for x = w - 8 to w - 1 do put_px x y bg done
       done;
+      (* R#23 은 글자 줄 안에서만 움직인다: 행은 그대로, 행 안의 줄만
+         (줄 + R#23) mod 8 이 된다 (openMSX CharacterConverter::renderText1). *)
       for row = lo / 8 to (hi - 1) / 8 do
         for col = 0 to 39 do
           let ch = vr (nt + row * 40 + col) in
           for py = 0 to 7 do
             let y = row * 8 + py in
             if y >= lo && y < hi then begin
-              let pat = vr (pt + ch * 8 + py) in
+              let pat = vr (pt + ch * 8 + ((py + r.(23)) land 7)) in
               for px = 0 to 5 do
                 let x = 8 + col * 6 + px in
                 if (pat lsr (7 - px)) land 1 = 1 then put_px x y fg else put_px x y bg
@@ -771,22 +773,19 @@ let render_lines t img ~w ~lo ~hi =
          CharacterConverter::renderMulti). 패턴 주소는 G1 처럼 R#4 로 만든다. *)
       let nt = (r.(2) land 0x7f) lsl 10 in
       let pt_base = ((r.(4) land 0x3f) lsl 11) lor 0x7ff in
-      for row = lo / 8 to (hi - 1) / 8 do
+      for y = lo to hi - 1 do
+        (* R#23 은 줄을 256 으로 감아 옮긴다. 이름 행은 줄 / 8, 블록 줄은
+           (줄 / 4) mod 8 이다. *)
+        let dy = (y + r.(23)) land 255 in
+        let row = dy lsr 3 and block_row = (dy lsr 2) land 7 in
         for col = 0 to 31 do
           let name = vr (nt + (row * 32) + col) in
-          for half = 0 to 1 do
-            let block_row = ((row * 2) + half) land 7 in
-            let bits =
-              vr (pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor block_row)) in
-            for py = 0 to 3 do
-              let y = (row * 8) + (half * 4) + py in
-              if y >= lo && y < hi then
-                for px = 0 to 3 do
-                  let x = (col * 8) + px in
-                  put_px x y ((bits lsr 4) land 0xf);
-                  put_px (x + 4) y (bits land 0xf)
-                done
-            done
+          let bits =
+            vr (pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor block_row)) in
+          for px = 0 to 3 do
+            let x = (col * 8) + px in
+            put_px x y ((bits lsr 4) land 0xf);
+            put_px (x + 4) y (bits land 0xf)
           done
         done
       done;
@@ -804,30 +803,29 @@ let render_lines t img ~w ~lo ~hi =
          11비트(name<<3 | 행), 컬러 5비트(name>>3). *)
       let pt_base = ((r.(4) land 0x3f) lsl 11) lor 0x7ff in
       let ct_base = ((r.(10) land 0x07) lsl 14) lor (r.(3) lsl 6) lor 0x3f in
-      for row = lo / 8 to (hi - 1) / 8 do
+      for y = lo to hi - 1 do
+        (* R#23 은 줄을 256 으로 감아 옮긴다. 24 행 밖(24..31)은 이름
+           테이블 뒤쪽 바이트를 그대로 읽는다 (openMSX getNamePtr). *)
+        let dy = (y + r.(23)) land 255 in
+        let row = dy lsr 3 and py = dy land 7 in
         let third = row lsr 3 in
         for col = 0 to 31 do
           let name = vr (nt + (row * 32) + col) in
-          for py = 0 to 7 do
-            let pat_addr, col_addr =
-              if g2 then begin
-                let index = (lnot 0 lsl 13) lor (third lsl 11) lor (name lsl 3) lor py in
-                (pt_base land index, ct_base land index)
-              end
-              else
-                ( pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor py),
-                  ct_base land ((lnot 0 lsl 6) lor (name lsr 3)) )
-            in
-            let y = (row * 8) + py in
-            if y >= lo && y < hi then begin
-              let bits = vr pat_addr in
-              let col_byte = vr col_addr in
-              let fg = (col_byte lsr 4) land 0xf and bg = col_byte land 0xf in
-              for px = 0 to 7 do
-                let x = (col * 8) + px in
-                if (bits lsr (7 - px)) land 1 = 1 then put_px x y fg else put_px x y bg
-              done
+          let pat_addr, col_addr =
+            if g2 then begin
+              let index = (lnot 0 lsl 13) lor (third lsl 11) lor (name lsl 3) lor py in
+              (pt_base land index, ct_base land index)
             end
+            else
+              ( pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor py),
+                ct_base land ((lnot 0 lsl 6) lor (name lsr 3)) )
+          in
+          let bits = vr pat_addr in
+          let col_byte = vr col_addr in
+          let fg = (col_byte lsr 4) land 0xf and bg = col_byte land 0xf in
+          for px = 0 to 7 do
+            let x = (col * 8) + px in
+            if (bits lsr (7 - px)) land 1 = 1 then put_px x y fg else put_px x y bg
           done
         done
       done;
