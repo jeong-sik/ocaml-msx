@@ -231,6 +231,10 @@ let () =
   let byte = Msx.mem_read t in
   check "COMMAND.COM ran in place of the kernel image" (byte result = 0x5a);
   check "COMMAND.COM sits at 0100h" (byte 0x100 = 0xf3);
+  check "both default FCBs are blank: drive 0 and eleven spaces"
+    (List.for_all
+       (fun fcb -> byte fcb = 0 && List.for_all (fun i -> byte (fcb + i) = 0x20) (List.init 11 (fun i -> i + 1)))
+       [ 0x5c; 0x6c ]);
   check "BDOS vector at 0005h leads to DC06h"
     (byte 0x05 = 0xc3 && byte 0x06 = 0x06 && byte 0x07 = 0xdc);
   check "warm boot vector at 0000h leads to E203h"
