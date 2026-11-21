@@ -170,6 +170,11 @@
  (libraries msx))
 
 (test
+ (name pal_frame_test)
+ (modules pal_frame_test)
+ (libraries msx))
+
+(test
  (name vdp_reg_test)
  (modules vdp_reg_test)
  (libraries vdpcore))

@@ -21,6 +21,7 @@ type t = {
   mutable status1 : int;
   mutable line : int;
   mutable cycle_in_line : int;
+  mutable pal : bool;
   (* 표시 줄마다 그 줄의 표시가 시작될 때의 레지스터와 팔레트. 화면은 프레임
      끝의 값이 아니라 줄마다 이 값으로 그린다 (openMSX 는 레지스터 쓰기 시각
      까지의 픽셀을 옛 값으로 그린다). 줄 y 의 값은 line_regs.(y * reg_count ..)
@@ -53,7 +54,9 @@ type t = {
   mutable cmd_log : (int * int * int * int) list;
 }
 
-let lines_per_frame = 262
+let ntsc_lines = 262
+let pal_lines = 313
+let frame_lines t = if t.pal then pal_lines else ntsc_lines
 let cycles_per_line = 228
 let visible_lines t = if t.regs.(9) land 0x80 = 0 then 192 else 212
 
@@ -92,6 +95,7 @@ let create () =
     status1 = 0;
     line = 0;
     cycle_in_line = 0;
+    pal = false;
     line_regs = Array.make (max_snap_lines * reg_count) 0;
     line_pal = Array.make (max_snap_lines * 16) 0;
     line_seen = Array.make max_snap_lines false;
@@ -574,7 +578,10 @@ let advance t ~cycles =
       t.int_pending <- true;
       hit := true
     end;
-    if t.line >= lines_per_frame then t.line <- 0;
+    if t.line >= frame_lines t then begin
+      t.line <- 0;
+      t.pal <- t.regs.(9) land 0x02 <> 0
+    end;
     line_events ~from:0 ~upto:t.cycle_in_line
   done;
   !hit
@@ -598,6 +605,9 @@ let cmd_history t = List.rev t.cmd_log
 let regs t = t.regs
 let status0 t = t.status0
 let line_now t = (t.line, t.cycle_in_line)
+let is_pal t = t.pal
+let cycles_to_frame_end t =
+  ((frame_lines t - t.line) * cycles_per_line) - t.cycle_in_line
 
 let write_log t =
   let n = min t.wlog_i 65536 in
@@ -920,6 +930,7 @@ let read_state r t =
   Bytes.blit vram 0 t.vram 0 (Bytes.length vram);
   State_codec.fill_int_array r ~min:0 ~max:0x777 t.palette;
   fill_all_lines t;
+  t.pal <- t.regs.(9) land 0x02 <> 0;
   t.pal_first <- (if State_codec.get_bool r then Some (State_codec.get_int r ~min:0 ~max:255) else None);
   t.addr <- State_codec.get_int r ~min:(0) ~max:16383;
   t.latch_lo <- State_codec.get_int r ~min:(0) ~max:255;
@@ -927,7 +938,7 @@ let read_state r t =
   t.pal_idx <- State_codec.get_int r ~min:(0) ~max:15;
   t.status0 <- State_codec.get_int r ~min:(0) ~max:255;
   t.status1 <- State_codec.get_int r ~min:(0) ~max:255;
-  t.line <- State_codec.get_int r ~min:(0) ~max:261;
+  t.line <- State_codec.get_int r ~min:(0) ~max:(frame_lines t - 1);
   t.cycle_in_line <- State_codec.get_int r ~min:(0) ~max:227;
   t.tx_dx <- State_codec.get_int r ~min:(0) ~max:511;
   (* ARG and mode can change during a transfer: permit every coordinate
