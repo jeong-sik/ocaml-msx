@@ -59,6 +59,34 @@ let () =
   Vdp.read_state (State_codec.reader (State_codec.finish w)) r;
   check "a restored PAL VDP is PAL" (Vdp.is_pal r);
   check "and keeps its position" (Vdp.line_now r = (50, 0) && Vdp.cycles_to_frame_end r = (263 * line));
+  (* Lines 262..312 exist only in a PAL frame: a save taken there restores. *)
+  let saved_at_line n =
+    let t = Vdp.create () in
+    set_reg t 9 0x02;
+    advance t ntsc;
+    advance t ((n * line) + 7);
+    let w = State_codec.writer () in
+    Vdp.write_state w t;
+    State_codec.finish w
+  in
+  let restore state =
+    let r = Vdp.create () in
+    Vdp.read_state (State_codec.reader state) r;
+    r
+  in
+  let late = restore (saved_at_line 300) in
+  check "a PAL save at line 300 keeps its position" (Vdp.line_now late = (300, 7));
+  let last = restore (saved_at_line 312) in
+  check "a PAL save at line 312 keeps its position" (Vdp.line_now last = (312, 7));
+  (* The same line number is out of range for an NTSC frame. *)
+  let ntsc_state =
+    let t = Vdp.create () in
+    advance t ((261 * line) + 7);
+    let w = State_codec.writer () in
+    Vdp.write_state w t;
+    State_codec.finish w
+  in
+  check "an NTSC save at line 261 restores" (Vdp.line_now (restore ntsc_state) = (261, 7));
   (* A machine: Msx.step ends a frame at the VDP's frame end. *)
   let m = Msx.create ~machine:{ Msx.ram_kb = 64; vram_kb = 128; roms = [ ""; ""; "" ] } in
   Msx.port_out m 0xa8 0xff;

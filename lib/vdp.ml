@@ -938,7 +938,7 @@ let read_state r t =
   t.pal_idx <- State_codec.get_int r ~min:(0) ~max:15;
   t.status0 <- State_codec.get_int r ~min:(0) ~max:255;
   t.status1 <- State_codec.get_int r ~min:(0) ~max:255;
-  t.line <- State_codec.get_int r ~min:(0) ~max:261;
+  t.line <- State_codec.get_int r ~min:(0) ~max:(frame_lines t - 1);
   t.cycle_in_line <- State_codec.get_int r ~min:(0) ~max:227;
   t.tx_dx <- State_codec.get_int r ~min:(0) ~max:511;
   (* ARG and mode can change during a transfer: permit every coordinate
