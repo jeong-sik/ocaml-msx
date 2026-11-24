@@ -537,6 +537,7 @@ let () =
        (List.filter (fun (p, _, _) -> p = 0x99 || p = 0x98 || p = 0x9B)
           (Msx.vdp_write_log t)));
   let oc = open_out_bin (!out_prefix ^ ".ppm") in
-  Printf.fprintf oc "P6\n256 192\n255\n%s" rgb;
+  let frame_w, frame_h = Msx.frame_dims t in
+  Printf.fprintf oc "P6\n%d %d\n255\n%s" frame_w frame_h rgb;
   close_out oc;
   Printf.printf "wrote %s.ppm\n" !out_prefix
