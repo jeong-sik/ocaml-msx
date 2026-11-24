@@ -31,7 +31,7 @@ def ledger(path, edges):
 
 def ram(path):
     state = path.read_bytes()
-    magic = b"OCAML-MSX\0\10"
+    magic = b"OCAML-MSX\0\11"
     assert state.startswith(magic), "saved state header"
     digest_end = len(magic) + 16
     payload = state[digest_end:]

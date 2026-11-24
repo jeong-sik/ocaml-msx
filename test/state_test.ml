@@ -20,7 +20,7 @@ let rejection name expected state =
 (* Recompute the envelope after payload edits: these cases must reach the
    decoder, rather than merely fail the corruption checksum. *)
 let edit_payload state edit =
-  let magic = "OCAML-MSX\000\008" in
+  let magic = "OCAML-MSX\000\009" in
   let offset = String.length magic + 16 in
   let payload = String.sub state offset (String.length state - offset) |> edit in
   magic ^ Digest.string payload ^ payload
@@ -169,7 +169,7 @@ let () =
   let plain = fresh () in
   let current = Msx.serialize plain in
   let head = String.length "OCAML-MSX\000\008" in
-  let payload6 = String.sub current (head + 16) (String.length current - head - 16 - 16 - 1) in
+  let payload6 = String.sub current (head + 16) (String.length current - head - 16 - 16 - 2) in
   let s6 = "OCAML-MSX\000\006" ^ Digest.string payload6 ^ payload6 in
   (match Msx.restore ~state:s6 with
    | Ok m -> check "a format 6 state restores" (Msx.serialize m = current)

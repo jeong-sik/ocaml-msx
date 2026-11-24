@@ -15,6 +15,7 @@ let rtc_time = ref ""
 let disk_real = ref false
 let cart_mapper = ref ""
 let rom_db = ref ""
+let pac_path = ref ""
 let tap_space : int list ref = ref []
 let tap_keys : (int * Msx.key) list ref = ref []
 let tap_key_spec = ref ""
@@ -168,6 +169,9 @@ let () =
       ( "--rom-db",
         Arg.Set_string rom_db,
         "PATH  openMSX softwaredb.xml — 카트 매퍼를 ROM 의 SHA-1 로 찾는다 (없으면 추정)" );
+      ( "--pac",
+        Arg.Set_string pac_path,
+        "PATH  슬롯 1 에 PAC SRAM 카트. openMSX pac.pac 형식, 없으면 빈 SRAM 으로 시작하고 끝날 때 쓴다" );
       ( "--tap-key",
         Arg.String (fun spec -> tap_key_spec := spec),
         "F:KEY[,F:KEY..]  해당 프레임에 키 탭 (space/return/up/.../shift/a)" );
@@ -193,6 +197,21 @@ let () =
     Msx.create ~machine:{ ram_kb = 512; vram_kb = 128; roms }
   in
   if !rtc_time <> "" then Msx.set_rtc_time t (parse_rtc_time !rtc_time);
+  (* The PAC file is read before the run and written after it. A file that
+     is not a PAC file stops the run, so its contents are never replaced. *)
+  let pac =
+    if !pac_path = "" then None
+    else
+      let p =
+        if not (Sys.file_exists !pac_path) then Pac.create ()
+        else
+          match Pac.of_file (read_file !pac_path) with
+          | Ok p -> p
+          | Error e -> Printf.ksprintf failwith "--pac %s: %s" !pac_path e
+      in
+      Msx.insert_pac t p;
+      Some p
+  in
   (* [begin..end] bounds the then-branch: without it the [let mapper = .. in]
      swallows every following statement (run loop, prints), so a no-cart boot
      (BIOS only or disk) ran nothing and exited silently. *)
@@ -540,4 +559,11 @@ let () =
   let frame_w, frame_h = Msx.frame_dims t in
   Printf.fprintf oc "P6\n%d %d\n255\n%s" frame_w frame_h rgb;
   close_out oc;
-  Printf.printf "wrote %s.ppm\n" !out_prefix
+  Printf.printf "wrote %s.ppm\n" !out_prefix;
+  match pac with
+  | None -> ()
+  | Some p ->
+    let oc = open_out_bin !pac_path in
+    output_string oc (Pac.to_file p);
+    close_out oc;
+    Printf.printf "wrote %s\n" !pac_path

@@ -199,3 +199,8 @@
  (name z80_ldai_irq_test)
  (modules z80_ldai_irq_test)
  (libraries z80core))
+
+(test
+ (name pac_test)
+ (modules pac_test)
+ (libraries msx))
