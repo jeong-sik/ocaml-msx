@@ -62,7 +62,7 @@ let port_cycles ~m1_wait code =
    with kind 'R' memory read, 'W' memory write, 'I' port in, 'O' port out.
    The opcode and operand fetches are reads too. BC = 0x0199, DE = 0xd000,
    HL = IX = IY = 0xc000, SP = 0xf000, F = 0 (NZ). *)
-let bus_trace ~m1_wait code =
+let bus_trace ?(observe_write = fun ~at:_ _ _ -> ()) ~m1_wait code =
   Bytes.fill mem 0 0x10000 '\000';
   String.iteri (fun i c -> Bytes.set mem (0x100 + i) c) code;
   let seen = ref [] in
@@ -72,6 +72,7 @@ let bus_trace ~m1_wait code =
       ~read:(fun ~at a -> note 'R' at; Char.code (Bytes.get mem (a land 0xffff)))
       ~write:(fun ~at a v ->
         note 'W' at;
+        observe_write ~at a v;
         Bytes.set mem (a land 0xffff) (Char.chr (v land 0xff)))
       ~port_in:(fun ~at _ -> note 'I' at; 0xff)
       ~port_out:(fun ~at _ _ -> note 'O' at)
@@ -289,6 +290,17 @@ let () =
   check "LD A,(BC): bare Z80" (fst (bus_trace ~m1_wait:0 "\x0a") = [ 'R', 1; 'R', 5 ]);
   check "LD A,(IX+d): bare Z80"
     (fst (bus_trace ~m1_wait:0 "\xdd\x7e\x05") = [ 'R', 1; 'R', 5; 'R', 9; 'R', 17 ]);
+
+  let writes code =
+    let seen = ref [] in
+    let observe_write ~at addr byte = seen := (at, addr, byte) :: !seen in
+    ignore (bus_trace ~observe_write ~m1_wait:1 code);
+    List.rev !seen
+  in
+  check "PUSH BC writes stack high byte first"
+    (writes "\xc5" = [ 7, 0xefff, 0x01; 10, 0xeffe, 0x99 ]);
+  check "EX (SP),HL writes stack high byte first"
+    (writes "\xe3" = [ 13, 0xf001, 0xc0; 16, 0xf000, 0x00 ]);
 
   (* Interrupt acknowledge: the pushes write at 8 and 11 (CC_PUSH_1 +
      EE_IRQ1_1), and IM 2 then reads the vector at 14 and 17 (CC_IRQ2_2). *)

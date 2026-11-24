@@ -169,9 +169,13 @@ let wr16 z addr v =
    order shows when the stack lies on memory-mapped registers: Meikyu no
    Tobira pushes a return address onto its ASCII16 bank register, and the
    bank left selected is the low byte's. *)
+let write_stack_word z v =
+  wr z (m16 (z.sp + 1)) (v lsr 8);
+  wr z z.sp (v land 0xff)
+
 let push z v =
   z.sp <- m16 (z.sp - 2);
-  wr16 z z.sp v
+  write_stack_word z v
 
 let pop z =
   let v = rd16 z z.sp in
@@ -887,7 +891,8 @@ and main_exec z op p =
       (* 19 = 4+3+4+3+5: the second read takes 4 before the writes. *)
       let spv = rd16 z z.sp in
       idle 1;
-      wr16 z z.sp (pget z 2 p);
+      write_stack_word z (pget z 2 p);
+      idle 2;
       pset z 2 spv p;
       add_t 19
     | 0xE9 -> z.pc <- pget z 2 p; add_t 4
