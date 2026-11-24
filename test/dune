@@ -155,6 +155,11 @@
  (libraries vdpcore))
 
 (test
+ (name vdp_s2_retrace_test)
+ (modules vdp_s2_retrace_test)
+ (libraries vdpcore))
+
+(test
  (name vdp_port_latch_test)
  (modules vdp_port_latch_test)
  (libraries msx))
