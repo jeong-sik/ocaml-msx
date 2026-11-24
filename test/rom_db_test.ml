@@ -102,6 +102,7 @@ let () =
       ("KonamiSCC", Msx.Konami_scc); ("SCC", Msx.Konami_scc);
       ("KONAMI5", Msx.Konami_scc); ("2", Msx.Konami_scc);
       ("KoeiSRAM8", Msx.Ascii8_sram); ("KoeiSRAM32", Msx.Ascii8_sram);
+      ("NEO8", Msx.Neo8); ("neo16", Msx.Neo16);
       ("Mirrored", Msx.Flat); ("MirroredC000", Msx.Flat); ("Normal8000", Msx.Flat);
       ("page23", Msx.Flat); ("Page0123", Msx.Flat); ("64kB", Msx.Flat);
       ("Plain", Msx.Flat); ("0xC000", Msx.Flat); ("ROMBAS", Msx.Flat) ];
@@ -114,7 +115,8 @@ let () =
     (fun m ->
       check ("name " ^ Rom_db.mapper_name m)
         (Rom_db.mapper_of_name (Rom_db.mapper_name m) = Some m))
-    [ Msx.Flat; Msx.Ascii8; Msx.Ascii16; Msx.Konami; Msx.Konami_scc; Msx.Ascii8_sram ];
+    [ Msx.Flat; Msx.Ascii8; Msx.Ascii16; Msx.Konami; Msx.Konami_scc; Msx.Ascii8_sram;
+      Msx.Neo8; Msx.Neo16 ];
 
   if !failures > 0 then exit 1;
   print_endline "rom_db_test: all pass"

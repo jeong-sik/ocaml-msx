@@ -138,6 +138,19 @@ let () =
   check "no CC: lower index wins" (is_col t 100 51 1)
 
 let () =
+  let t = Vdp.create () in
+  screen4 t;
+  solid8 t 0;
+  List.iteri
+    (fun i (x, colour) ->
+      sat_w t i 50 x 0;
+      all_rows t i colour)
+    [ (10, 0x44); (50, 1); (50, 0x42); (100, 4); (50, 0x48) ];
+  vram_w t (attr + (5 * 4)) 0xd8;
+  check "CC before the first base sprite is hidden" (is_col t 10 51 0);
+  check "CC composition stops at the next base sprite" (is_col t 50 51 3)
+
+let () =
   (* 6. EC: X 를 32px 왼쪽으로 *)
   let t = Vdp.create () in
   screen4 t;
@@ -318,9 +331,9 @@ let () =
   sat_w t 0 100 50 0;
   all_rows t 0 9;
   let c = is_col_w t 512 in
-  check "SCREEN6: first sprite pixel is 2 wide (100,101)" (c 100 101 9);
-  check "SCREEN6: first sprite pixel is 2 wide (101,101)" (c 101 101 9);
-  check "SCREEN6: last pixel (115,101)" (c 115 101 9);
+  check "SCREEN6: left pixel uses the upper colour bits" (c 100 101 2);
+  check "SCREEN6: right pixel uses the lower colour bits" (c 101 101 1);
+  check "SCREEN6: last pixel uses the lower colour bits" (c 115 101 1);
   check "SCREEN6: left of it (99,101) clear" (c 99 101 0);
   check "SCREEN6: right of it (116,101) clear" (c 116 101 0)
 
