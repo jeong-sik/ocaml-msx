@@ -32,6 +32,7 @@ type t = {
   mutable im : int;
   mutable halted : bool;
   mutable after_ei : bool;
+  mutable after_ld_a_ir : bool;
   mutable t : int;
   (* Wait states added to every M1 (opcode fetch) cycle. 0 is the bare Z80
      the zexall and trace harnesses measure; an MSX inserts 1. *)
@@ -63,6 +64,7 @@ let create ~m1_wait ~read ~write ~port_in ~port_out =
     iff1 = false; iff2 = false; im = 0;
     halted = false;
     after_ei = false;
+    after_ld_a_ir = false;
     t = 0;
     m1_wait;
     rb = read;
@@ -508,6 +510,7 @@ and ed_exec z op =
     let v = if op = 0x57 then z.i else z.r in
     z.f <- (z.f land 0x01) lor sz53 v lor (if z.iff2 then 0x04 else 0);
     z.a <- v;
+    z.after_ld_a_ir <- true;
     add_t 9
   | 0x67 | 0x6F ->
     let addr = hl16 z in
@@ -859,6 +862,7 @@ and main_exec z op p =
     | _ -> add_t 4
 
 let step z =
+  z.after_ld_a_ir <- false;
   dt := 0;
   inc_r z;
   if z.halted then
@@ -887,6 +891,9 @@ let interrupt z =
   if (not z.iff1) || z.after_ei then 0
   else begin
     z.halted <- false;
+    (* NMOS Z80 clears the IFF2 copy in P/V when the IRQ immediately follows LD A,I/R. *)
+    if z.after_ld_a_ir then z.f <- z.f land 0xfb;
+    z.after_ld_a_ir <- false;
     (* The acknowledge cycle is an M1: R counts it. *)
     z.r <- (z.r land 0x80) lor ((z.r + 1) land 0x7f);
     let cycles =
@@ -975,3 +982,6 @@ let read_state r z =
   z.halted <- State_codec.get_bool r;
   z.after_ei <- State_codec.get_bool r;
   ()
+
+let write_irq_window w z = State_codec.put_bool w z.after_ld_a_ir
+let read_irq_window r z = z.after_ld_a_ir <- State_codec.get_bool r

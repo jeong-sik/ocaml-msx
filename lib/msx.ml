@@ -2422,6 +2422,7 @@ let serialize t =
      everything v6 had. *)
   State_codec.put_int w t.cart_banks.(4);
   State_codec.put_int w t.cart_banks.(5);
+  Z80.write_irq_window w t.cpu;
   State_codec.finish w
 
 let restore_with_reader reader state =
@@ -2529,6 +2530,7 @@ let restore_with_reader reader state =
      else Rtc.start_clock t.rtc ~cycle);
     if State_codec.version r >= 7 then
       for i = 4 to 5 do t.cart_banks.(i) <- State_codec.get_int r ~min:0 ~max:neo_bank_max done;
+    if State_codec.version r >= 8 then Z80.read_irq_window r t.cpu;
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message

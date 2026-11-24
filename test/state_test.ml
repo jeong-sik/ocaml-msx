@@ -20,7 +20,7 @@ let rejection name expected state =
 (* Recompute the envelope after payload edits: these cases must reach the
    decoder, rather than merely fail the corruption checksum. *)
 let edit_payload state edit =
-  let magic = "OCAML-MSX\000\007" in
+  let magic = "OCAML-MSX\000\008" in
   let offset = String.length magic + 16 in
   let payload = String.sub state offset (String.length state - offset) |> edit in
   magic ^ Digest.string payload ^ payload
@@ -167,12 +167,12 @@ let () =
   (* A format 6 state ends before the NEO registers: it restores, and the
      machine saves back as the same bytes it had before. *)
   let plain = fresh () in
-  let s7 = Msx.serialize plain in
-  let head = String.length "OCAML-MSX\000\007" in
-  let payload6 = String.sub s7 (head + 16) (String.length s7 - head - 16 - 16) in
+  let current = Msx.serialize plain in
+  let head = String.length "OCAML-MSX\000\008" in
+  let payload6 = String.sub current (head + 16) (String.length current - head - 16 - 16 - 1) in
   let s6 = "OCAML-MSX\000\006" ^ Digest.string payload6 ^ payload6 in
   (match Msx.restore ~state:s6 with
-   | Ok m -> check "a format 6 state restores" (Msx.serialize m = s7)
+   | Ok m -> check "a format 6 state restores" (Msx.serialize m = current)
    | Error e -> failwith ("format 6 state: " ^ e));
   let t = fresh () in
   Msx.load_disk ~interface_rom:false t (String.init 737280 (fun i -> Char.chr (i land 255)));
