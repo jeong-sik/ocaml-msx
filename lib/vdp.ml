@@ -620,13 +620,27 @@ let render_sprites t ~w ~h put =
 (* 스프라이트 모드 2 — SCREEN4~7. 패턴 테이블 = (R#6&0x3F)<<11. 속성
    32엔트리(Y, X, 패턴번호, 예약)는 Y=0xD8 에서 끝난다. 컬러 테이블은
    스프라이트마다 16바이트 — 패턴 행마다 한 바이트: bit0-3 컬러, bit6 CC
-   (번호가 앞선 스프라이트 픽셀과 OR), bit7 EC(X 를 32px 왼쪽으로). 한 줄에는
+   (같은 그룹의 뒤이은 스프라이트와 색 합성), bit7 EC(X 를 32px 왼쪽으로). 한 줄에는
    번호순 처음 8개만 보이고, 겹치면 번호가 낮은 쪽이 위다. 컬러 0 은 R#8
    bit5(TP)=0 이면 투명이고 TP=1 이면 팔레트 0 색으로 칠한다(openMSX
    SpriteConverter, 모드 1 도 같다). 위치·패턴
    주소·16×16 바이트 배치는 모드 1 과 같다. 5번째(9번째) 스프라이트와 충돌
-   플래그(S#0)는 아직 없다. [xscale] 은 512폭 모드(SCREEN6/7)에서 2. *)
-let render_sprites2 t ~h ~xscale put =
+   플래그(S#0)는 아직 없다. *)
+type sprite_row = { x : int; pattern : int; colour : int; cc : bool }
+
+let render_sprites2 t ~h put =
+  let put_dot =
+    match display_mode t with
+    | Graphic5 ->
+      fun x y colour ->
+        put (2 * x) y (colour lsr 2);
+        put (2 * x + 1) y (colour land 3)
+    | Graphic6 ->
+      fun x y colour ->
+        put (2 * x) y colour;
+        put (2 * x + 1) y colour
+    | _ -> put
+  in
   (* SCREEN7 은 CPU 주소가 물리 뱅크에 섞여 있어 테이블 읽기도 같은 사상을 탄다. *)
   let vr a = Char.code (Bytes.get t.vram (physical_addr t a)) in
   let r = t.regs in
@@ -642,7 +656,7 @@ let render_sprites2 t ~h ~xscale put =
   let size16 = r.(1) land 0x02 <> 0 and mag = r.(1) land 0x01 <> 0 in
   let edge = if size16 then 16 else 8 in
   let step = if mag then 2 else 1 in
-  let height = edge * step in
+  let span = edge * step in
   let opaque0 = r.(8) land 0x20 <> 0 in
   let entries =
     let rec collect i acc =
@@ -652,46 +666,46 @@ let render_sprites2 t ~h ~xscale put =
     collect 0 []
   in
   let top i = (vr (attr_addr i 0) + 1) land 0xff in
-  (* X 는 EC 로 -32 까지 내려가고 16×16 MAG 로 +31 까지 나간다. *)
-  let origin = 32 in
-  let px = Array.make (256 + origin + 32) (-1) in
-  for line = 0 to h - 1 do
-    let on_line =
-      List.filter (fun i -> (line - top i) land 0xff < height) entries
+  let sprite_row line i =
+    let row = ((line - top i) land 0xff) / step in
+    let attr = vr (color_addr i row) in
+    let x = vr (attr_addr i 1) - if attr land 0x80 <> 0 then 32 else 0 in
+    let pat = vr (attr_addr i 2) in
+    let pbase = pt + ((if size16 then pat land 0xfc else pat) * 8) in
+    let pattern =
+      if size16 then (vr (pbase + row) lsl 8) lor vr (pbase + 16 + row)
+      else vr (pbase + row)
     in
-    let shown = List.filteri (fun k _ -> k < 8) on_line in
-    if shown <> [] then begin
-      Array.fill px 0 (Array.length px) (-1);
-      List.iter
-        (fun i ->
-          let row = ((line - top i) land 0xff) / step in
-          let cb = vr (color_addr i row) in
-          let c = cb land 0x0f and cc = cb land 0x40 <> 0 in
-          let x0 = vr (attr_addr i 1) - if cb land 0x80 <> 0 then 32 else 0 in
-          let pat = vr (attr_addr i 2) in
-          let pbase = pt + ((if size16 then pat land 0xfc else pat) * 8) in
-          let bits =
-            if size16 then (vr (pbase + row) lsl 8) lor vr (pbase + 16 + row)
-            else vr (pbase + row)
-          in
-          if c <> 0 || opaque0 then
-            for b = 0 to edge - 1 do
-              if (bits lsr (edge - 1 - b)) land 1 = 1 then
-                for mx = 0 to step - 1 do
-                  let k = x0 + (b * step) + mx + origin in
-                  if px.(k) < 0 then px.(k) <- c
-                  else if cc then px.(k) <- px.(k) lor c
-                done
-            done)
-        shown;
-      for x = 0 to 255 do
-        let c = px.(x + origin) in
-        if c >= 0 then
-          for k = 0 to xscale - 1 do
-            put ((x * xscale) + k) line c
-          done
-      done
-    end
+    { x; pattern; colour = attr land 0x0f; cc = attr land 0x40 <> 0 }
+  in
+  let covers row x =
+    let offset = x - row.x in
+    offset >= 0 && offset < span
+    && (row.pattern lsr (edge - 1 - (offset / step))) land 1 <> 0
+  in
+  for line = 0 to h - 1 do
+    let on_line = List.filter (fun i -> (line - top i) land 0xff < span) entries in
+    let rows = List.filteri (fun i _ -> i < 8) on_line |> List.map (sprite_row line) |> Array.of_list in
+    (* Start at the first base sprite. Draw back to front so the lower index
+       wins. The next base sprite ends the CC group (openMSX drawMode2). *)
+    let first = ref 0 in
+    while !first < Array.length rows && rows.(!first).cc do incr first done;
+    for i = Array.length rows - 1 downto !first do
+      let row = rows.(i) in
+      if row.colour <> 0 || opaque0 then
+        for x = max 0 row.x to min 255 (row.x + span - 1) do
+          if covers row x then begin
+            let colour = ref row.colour in
+            let next = ref (i + 1) in
+            while !next < Array.length rows && rows.(!next).cc do
+              let overlay = rows.(!next) in
+              if covers overlay x then colour := !colour lor overlay.colour;
+              incr next
+            done;
+            put_dot x line !colour
+          end
+        done
+    done
   done
 
 let frame_dims t =
@@ -751,7 +765,7 @@ let frame_rgb t =
       done;
       (* SCREEN8 의 스프라이트는 고정 팔레트라 아직 없다. *)
       if display_mode t <> Graphic7 then
-        render_sprites2 t ~h ~xscale:(w / 256) put
+        render_sprites2 t ~h put
     end
     else if display_mode t = Text2 then begin
       (* TEXT2: 80 columns of 6×8 cells in a 512-wide frame, 16px of R#7
@@ -843,7 +857,7 @@ let frame_rgb t =
         done
       done;
       (* TEXT 는 스프라이트가 없다. SCREEN1·2 는 모드 1, SCREEN4 는 모드 2. *)
-      if display_mode t = Graphic3 then render_sprites2 t ~h ~xscale:1 put
+      if display_mode t = Graphic3 then render_sprites2 t ~h put
       else render_sprites t ~w ~h put
     end;
     Bytes.to_string img
