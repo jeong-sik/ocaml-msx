@@ -1,53 +1,176 @@
-(* Save states must round-trip the WD2793-visible drive state (ocaml-msx #46,
-   format v3): [Msx.serialize] used to persist only [disk_dma] and
-   [fdc.disk_changed], so a restored machine redrove cold — motor off, track
-   register 0, and any in-flight READ SECTOR (busy/drq/intr, the sector buffer
-   and its pump position) lost — and two machines differing only in drive
-   state serialized to identical bytes. The checks below pin the fix: drive
-   state survives save -> restore, and an in-flight read keeps its buffer. *)
+(* Save states and the disk controller. Since format v4 a state carries the
+   timed WD2793 (lib/wd2793.ml): its registers, the drive and any command
+   in flight. A v3 state held the instant model's registers instead; it
+   restores with the controller as at power-on. (Resuming a transfer in
+   flight is in fdc_write_test, where Z80 code drives one.) *)
 
 let check name cond = if not cond then failwith name
-let restored t = match Msx.restore ~state:(Msx.serialize t) with
-  | Ok t -> t | Error e -> failwith e
 
+let restored state = match Msx.restore ~state with Ok t -> t | Error e -> failwith e
+
+(* Window registers, read and written at 0x7FF8 + r. *)
+let window = 0x7ff8
+let status = 0 and track = 1 and sector = 2 and side = 4 and drive = 5
+let busy = 0x01
+let drive_bits = 0x83 (* motor and drive select; bit 2 reports a disk change *)
+
+(* The real-ROM wiring: the disk ROM and its window in slot 3-3 page 1. *)
 let machine disk =
   let rom = Bytes.make 32768 '\000' in
-  (* JP (HL) at 0x0000 so a stray boot keeps halting harmlessly. *)
+  (* JR to the next instruction: the CPU runs NOPs and RST 38h harmlessly. *)
   Bytes.set rom 0 (Char.chr 0x18);
   let t = Msx.create ~machine:{ram_kb=512; vram_kb=128; roms=[Bytes.to_string rom; ""; ""]} in
-  if Bytes.length disk > 0 then
-    Msx.load_disk ~interface_rom:false t (Bytes.to_string disk);
+  let disk_rom =
+    match Msx.disk_rom_of_string (String.make 0x4000 '\000') with
+    | Ok r -> r
+    | Error e -> failwith e
+  in
+  Msx.load_disk ~disk_rom t disk;
+  Msx.port_out t 0xA8 0xCC;
+  Msx.mem_write t 0xffff 0x8C;
   t
 
+let rd t r = Msx.mem_read t (window + r)
+let wr t r v = Msx.mem_write t (window + r) v
+
+(* A v3 state written by the instant-FDC core at da14877: a 64KB machine
+   with a 512-byte disk, motor on and track register 5 set through the old
+   port path (0xD4 = 0x08, 0xD1 = 5), no frame run. 2-byte run-length
+   pairs. *)
+let v3_runs = [
+  (0x4f43,1);(0x414d,1);(0x4c2d,1);(0x4d53,1);(0x5800,1);(0x03bb,1);(0x3b2b,1);(0xe318,1);
+  (0xaf83,1);(0x66e8,1);(0x9262,1);(0xcb8b,1);(0xd2a0,1);(0x0b00,1);(0x0000,2);(0x0100,1);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);
+  (0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);
+  (0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);
+  (0x0000,1);(0xff00,127);(0xffff,1);(0x00ff,127);(0x0000,1);(0xff00,127);(0xffff,1);
+  (0x00ff,127);(0x0000,3);(0x0040,1);(0x0000,8195);(0x0040,1);(0x0000,8195);(0x0040,1);
+  (0x0000,8195);(0x0040,1);(0x0041,1);(0x4200,1);(0x41c9,1);(0xc9c9,8189);(0xc900,1);(0x0000,6);
+  (0x0002,1);(0x0000,268);(0x0100,1);(0x0000,3);(0x0200,1);(0x0000,3);(0x0300,1);(0x0000,3);
+  (0x0300,1);(0x0000,3);(0x0300,1);(0x0000,3);(0x0300,1);(0x0000,3);(0x0300,1);(0x0000,119);
+  (0x8000,1);(0x0000,7);(0x0800,1);(0x0000,215);(0x0800,1);(0x0000,15);(0x0100,1);(0x0000,7);
+  (0x3f00,1);(0x0000,15);(0x0500,1);(0x0000,3);(0x0100,1);(0x0000,7);(0x0001,1);(0x0000,5);
+  (0x0200,1);(0x0000,351);(0x00ff,1);(0xff00,1);(0x0000,204);(0x0200,1);(0x0000,65547);
+  (0x0006,1);(0x1100,1);(0x0000,2);(0x0007,1);(0x3300,1);(0x0000,2);(0x0001,1);(0x1700,1);
+  (0x0000,2);(0x0003,1);(0x2700,1);(0x0000,2);(0x0001,1);(0x5100,1);(0x0000,2);(0x0006,1);
+  (0x2700,1);(0x0000,2);(0x0001,1);(0x7100,1);(0x0000,2);(0x0003,1);(0x7300,1);(0x0000,2);
+  (0x0006,1);(0x6100,1);(0x0000,2);(0x0006,1);(0x6400,1);(0x0000,2);(0x0004,1);(0x1100,1);
+  (0x0000,2);(0x0002,1);(0x6500,1);(0x0000,2);(0x0005,1);(0x5500,1);(0x0000,2);(0x0007,1);
+  (0x7700,1);(0x0000,56);(0x0001,1);(0x0000,3) ]
+
+let v3_state =
+  let b = Buffer.create 270000 in
+  List.iter (fun (u, n) ->
+    for _ = 1 to n do
+      Buffer.add_char b (Char.chr (u lsr 8)); Buffer.add_char b (Char.chr (u land 255))
+    done) v3_runs;
+  Buffer.contents b
+
 let () =
-  let disk = Bytes.make (720 * 512) '\000' in
-  Bytes.iteri (fun i _ -> Bytes.set disk i (Char.chr (i land 255))) disk;
+  let disk = String.init (720 * 512) (fun i -> Char.chr (i land 255)) in
 
-  (* 1. Motor + track register survive save -> restore. *)
+  (* 1. The registers and the motor survive save -> restore. *)
   let a = machine disk in
-  Msx.port_out a 0xD4 0x08;             (* system control: motor on, side 0 *)
-  Msx.port_out a 0xD1 5;                (* track register = 5 *)
-  let b = machine disk in               (* motor off, track 0 *)
-  check "motor/track divergence survives serialization"
-    (Msx.serialize a <> Msx.serialize b);
-  let ra = restored a in
-  check "restore keeps the motor bit" (Msx.port_in ra 0xD0 land 0x20 <> 0);
-  check "restore keeps the track register" (Msx.port_in ra 0xD1 = 5);
-  check "pre-restore machine kept the drive state"
-    (Msx.port_in a 0xD0 land 0x20 <> 0 && Msx.port_in a 0xD1 = 5);
-
-  (* 2. An in-flight READ SECTOR keeps its command state (drq, sector
-     buffer, pump position) across save -> restore. *)
-  let a = machine disk in
-  Msx.port_out a 0xD4 0x08;
-  Msx.port_out a 0xD1 3;                (* track 3 *)
-  Msx.port_out a 0xD2 1;                (* sector 1 *)
-  Msx.port_out a 0xD0 0x88;             (* READ SECTOR: immediate-completion pump *)
-  check "sector buffer contents read back" (Msx.port_in a 0xD3 = 3 * 1024 * 2 land 255);
+  wr a status 0xd0;
+  wr a drive 0x80;
+  wr a track 5;
+  wr a sector 7;
+  wr a side 1;
   let b = machine disk in
-  check "pending read state survives serialization"
+  wr b status 0xd0;
+  check "machines differing only in drive state serialize differently"
     (Msx.serialize a <> Msx.serialize b);
-  check "restore keeps DRQ lit" (Msx.port_in a 0xD0 land 0x02 <> 0);
-  let ra = restored a in
-  check "restore keeps DRQ lit" (Msx.port_in ra 0xD0 land 0x02 <> 0);
-  check "restore keeps the buffered byte" (Msx.port_in ra 0xD3 = Msx.port_in a 0xD3)
+  let a' = restored (Msx.serialize a) in
+  (* Compare before reading: a read of register 5 takes the disk-change
+     news and a status read drops INTRQ. *)
+  check "a restored machine serializes to the same bytes" (Msx.serialize a' = Msx.serialize a);
+  check "track register survives" (rd a' track = 5);
+  check "sector register survives" (rd a' sector = 7);
+  check "side register survives" (rd a' side land 1 = 1);
+  check "drive register and motor survive" (rd a' drive land drive_bits = 0x80);
+
+  (* 2. A v3 state restores with the controller as at power-on: the old
+     registers are dropped and the power-on RESTORE runs from time 0,
+     30 ms a step with the motor off, until the track register counts down
+     to 0 at 7.65 s. *)
+  check "fixture is a v3 envelope" (String.sub v3_state 0 11 = "OCAML-MSX\000\003");
+  let t = restored v3_state in
+  (* The interface ROM and its window sit in slot 2 on this path. *)
+  Msx.port_out t 0xA8 0x08;
+  check "v3: the controller starts busy with the power-on RESTORE" (rd t status land busy <> 0);
+  Msx.step t ~frames:480;
+  check "v3: after 8 s the RESTORE is over" (rd t status land busy = 0);
+  check "v3: the old track register 5 is gone" (rd t track = 0);
+  let s = Msx.serialize t in
+  check "v3: re-serialized as v4" (String.sub s 0 11 = "OCAML-MSX\000\004");
+  check "v3: the v4 round trip is stable" (Msx.serialize (restored s) = s);
+  print_endline "state_fdc_test: all passed"

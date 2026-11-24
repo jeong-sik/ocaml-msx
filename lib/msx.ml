@@ -87,35 +87,6 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    the SCC sound chip is not modelled, only its banking. *)
 type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram
 
-(* WD279x 근사 상태. 즉시-완료 모델: 명령을 받으면 상태 읽기 한 번 안에
-   seek/read 준비를 끝낸다 — 실기 타이밍의 근사이고, 로더가 상태 비트를
-   폴링하는 한 관측상 같다. [buf] 는 섹터 한 개: READ SECTOR 는 이미지에서
-   채워 [pos] 로 내보내고, WRITE SECTOR 는 CPU 가 보낸 바이트로 채운 뒤
-   마지막 바이트에서 이미지에 쓴다. *)
-type fdc_state = {
-  mutable cmd : int;         (** 마지막 명령 바이트 — 상태 산출용 *)
-  mutable track : int;       (** 트랙 레지스터 *)
-  mutable sector : int;      (** 섹터 레지스터 *)
-  mutable data : int;        (** 데이터 레지스터 (seek 목적지 포함) *)
-  mutable side : int;        (** 0xD4 bit1 *)
-  mutable motor : bool;      (** 0xD4 bit3 *)
-  mutable step_out : bool;   (** STEP(0x20) 의 직전 방향: IN=false OUT=true *)
-  mutable busy : bool;
-  mutable drq : bool;
-  mutable intr : bool;
-  buf : Bytes.t;             (** 섹터 버퍼, 512 (READ·WRITE SECTOR) *)
-  mutable pos : int;
-  mutable side_reg : int;   (** Philips 0x7FFC: bit0 = side *)
-  mutable drive_reg : int;  (** Philips 0x7FFD: bits0-1 drive, bit7 motor *)
-  mutable disk_changed : bool;
-      (** DSKCHG 래치 — 소비형: 디스크를 넣으면 set, DSKCHG(0x7FFD) 를 읽으면
-          그 한 번만 true 로 나오고 즉시 해제 (openMSX DiskChanger::diskChanged
-          정본: `ret = flag; flag = false;` — 해제 트리거는 step 도 인덱스도
-          아닌 읽기 자체). 전원 인가는 디스크를 새로 넣은 상태라 true 로
-          시작한다. *)
-  mutable intr_fired : bool;  (** 이번 INTRQ 펄스를 이미 CPU 에 전달했나 *)
-}
-
 type t = {
   cpu : Z80.t;
   vdp : Vdp.t;
@@ -176,9 +147,9 @@ type t = {
           떨어져(푸시 → 모터 레지스터, 팝 → DSKCHG) 인터슬롯 프리미티브가 자기
           컨텍스트를 부수고 무한 루프한다(실측: 0x02C0-0x02E3 프리미티브가
           0x7FFD/0x7FFF 를 8만 번 긁음). *)
-  mutable fdc : fdc_state;
-      (** WD279x 컨트롤러 근사: 명령/상태, 트랙·섹터 레지스터, 섹터 버퍼.
-          포트 0xD0-0xD4 로 로더가 직접 말을 건다. *)
+  fdc : Wd2793.t;
+      (** The disk interface behind the 0x7FF8-0x7FFF window: WD2793, drive A
+          holding [disk] and an empty drive B. *)
   ram : Bytes.t;
   mutable mapper : int array;
   mutable ppi_a : int;
@@ -265,12 +236,13 @@ let guess_mapper rom =
     else Konami
   end
 
-(* ---------- FDC (WD279x 근사) — 포트 0xD0-0xD4 ----------
+(* ---------- FDC access log ----------
 
-   정본은 openMSX src/fdc/WD2793.cc. 즉시-완료 모델: RESTORE/SEEK 은 상태
-   읽기 한 번 안에 끝나고, READ SECTOR 는 명령 받는 순간 버퍼를 채워
-   DRQ 를 올린다 — 로더가 상태 비트를 폴링하는 한 실기와 관측이 같다.
-   논리 섹터 = (track*2 + side)*9 + (sector-1). *)
+   The controller itself is [Wd2793]. Here: the last 256 window accesses
+   (kind 0 read / 1 write, address 0x7FF8-0x7FFF, value, PC) for boot
+   diagnosis. *)
+
+let fdc_window = 0x7ff8
 
 let fdc_log : (int * int * int * int) array = Array.make 256 (0, 0, 0, 0)
 let fdc_log_i = ref 0
@@ -278,289 +250,18 @@ let fdc_log_i = ref 0
    선언을 앞에 둔다. *)
 let ring = Array.make 64 0
 let ri = ref 0
-(* 직전 0x7FFF 폴 값 — 계측이 값 변화 시점만 찍게. *)
-let last_poll = ref 0xff
-let fdc_note m kind port v =
-  fdc_log.(!fdc_log_i land 255) <- (kind, port, v, Z80.dump_pc m.cpu);
+let fdc_note m kind reg v =
+  fdc_log.(!fdc_log_i land 255) <- (kind, fdc_window + reg, v, Z80.dump_pc m.cpu);
   incr fdc_log_i
 
-let fdc_create () =
-  {
-    cmd = 0;
-    track = 0;
-    sector = 1;
-    data = 0;
-    side = 0;
-    motor = false;
-    step_out = false;
-    busy = false;
-    drq = false;
-    intr = false;
-    buf = Bytes.make 512 '\000';
-    pos = 0;
-    side_reg = 0;
-    drive_reg = 0;
-    disk_changed = true;
-    intr_fired = false;
-  }
+(* The controller's clock: master ticks, 960 per Z80 cycle. An access
+   inside an instruction counts from the instruction's start. *)
+let fdc_time m = Z80.t_states m.cpu * Wd2793.ticks_per_cycle
 
-let fdc_status m =
-  let f = m.fdc in
-  (* WD2793 상태 비트는 명령 타입을 따라 다르다 (openMSX WD2793::getStatus
-     의 type1 분기 정본). Type I(RESTORE/SEEK/STEP, cmd<0x80): bit5=헤드
-     적재, bit2=TRK00, bit1=인덱스. Type II+(READ/WRITE SECTOR): bit5=레코드
-     타입(0=정상), bit2=LOST DATA, bit1=DRQ. 한 비트로 두 의미를 실는 칩의
-     설계라, 펌프 완료 검사(실ROM 0x76C5: 상태 AND 0x9C / RET Z)는 Type II
-     상태의 bit2 를 lost data 로 읽는다 — TRK00 을 Type II 에도 얹으면
-     모든 READ SECTOR 가 "lost data 에러"로 판정돼 10회 재시도 뒤 드라이브를
-     포기한다(실측 09-12: readsec logical 0 을 10번 반복 후 BASIC 폴백). *)
-  let base = if Bytes.length m.disk = 0 then 0x80 else 0x00 in
-  let type1 = f.cmd < 0x80 in
-  (* TRK00: 헤드가 0번 트랙에 있을 때 1 (Type I 상태에서만). 실 디스크 ROM
-     의 초기화는 STEP OUT 연쇄로 이 비트가 켜질 때까지 헤드를 되돌린다. *)
-  let trk0 = if type1 && f.track = 0 then 0x04 else 0x00 in
-  (* Type I 상태의 bit5 = 헤드 적재. 모터가 돌면 헤드가 디스크에 닿는다
-     (즉시-완료 근사) — 이 비트가 없으면 실 디스크 ROM 의 드라이브 검색이
-     헤드 적재를 폴링하다 영원히 못 넘어간다. Type II 의 bit5(레코드 타입)
-     는 0 = 정상 데이터. *)
-  let head =
-    if type1 && f.motor && Bytes.length m.disk > 0 then 0x20 else 0x00
-  in
-  let drq = if f.drq then 0x02 else 0x00 in
-  let busy = if f.busy then 0x01 else 0x00 in
-  base lor trk0 lor head lor drq lor busy
-
-(* Debug traces to stderr, off by default. The caller switches them on; the
-   core never reads its environment. *)
 let fdc_trace = ref false
 let set_fdc_trace on = fdc_trace := on
 let ppi_trace = ref false
 let set_ppi_trace on = ppi_trace := on
-
-(* How the image's sectors lie on the disk. The image is plain sector data
-   in logical order; the drive sees tracks, sides and sector numbers. *)
-type disk_geometry = { sides : int; sectors_per_track : int }
-
-let dd_sectors_per_track = 9
-let ds_dd_sectors = 1440 (* 720KB *)
-let ss_dd_sectors = 720 (* 360KB *)
-let media_8_sectors = 0x02 (* media byte bit 1: 8 sectors per track *)
-let media_lowest = 0xf8 (* media bytes run 0xF8-0xFF *)
-let bpb_sectors_per_track = 0x18
-let bpb_sides = 0x1a
-let jmp_near = 0xe9
-let jmp_short = 0xeb
-let media_two_sides = 0x01 (* media byte bit 0: two sides *)
-
-(* The geometry openMSX gives a .dsk image (SectorBasedDisk::detectGeometry
-   and Disk::detectGeometry):
-   - a 720KB image is two sides of 9 sectors, whatever its boot sector says;
-   - else a boot sector starting with a JMP (0xE9/0xEB) gives sectors per
-     track at 0x18 and sides at 0x1A (16-bit little endian), unless one of
-     them is 0 or above 255;
-   - else a FAT media byte (sector 1, byte 0) of 0xF8-0xFF gives 8 or 9
-     sectors (bit 1) and one or two sides (bit 0);
-   - else 9 sectors, and one side for a 360KB image, two for any other.
-   It is read from the current bytes on every access, so a restored machine
-   sees the geometry the saved one saw. openMSX reads it once per inserted
-   disk: the two differ only when software rewrites the boot sector or FAT
-   of an image that is not 720KB. *)
-let disk_geometry disk ~sector_size =
-  let sectors = Bytes.length disk / sector_size in
-  let byte i = Char.code (Bytes.get disk i) in
-  let word i = byte i lor (byte (i + 1) lsl 8) in
-  let fallback =
-    { sectors_per_track = dd_sectors_per_track;
-      sides = (if sectors = ss_dd_sectors then 1 else 2) }
-  in
-  let valid n = n >= 1 && n <= 255 in
-  if sectors = ds_dd_sectors then { sides = 2; sectors_per_track = dd_sectors_per_track }
-  else if sectors < 1 then fallback
-  else if byte 0 = jmp_near || byte 0 = jmp_short then begin
-    let sectors_per_track = word bpb_sectors_per_track and sides = word bpb_sides in
-    if valid sectors_per_track && valid sides then { sides; sectors_per_track }
-    else fallback
-  end
-  else if sectors < 2 then fallback
-  else begin
-    let media = byte sector_size in
-    if media >= media_lowest then
-      { sectors_per_track =
-          (if media land media_8_sectors <> 0 then 8 else dd_sectors_per_track);
-        sides = (if media land media_two_sides <> 0 then 2 else 1) }
-    else fallback
-  end
-
-(* The logical sector the track, side and sector registers name (openMSX
-   Disk::physToLog). Side 1 of a one-sided image counts on into the next
-   track, as openMSX does; software that reads such a disk by its media
-   byte never selects side 1. *)
-let fdc_logical_sector m =
-  let f = m.fdc in
-  let g = disk_geometry m.disk ~sector_size:(Bytes.length f.buf) in
-  (g.sectors_per_track * (f.side + (g.sides * f.track))) + (f.sector - 1)
-
-(* Image offset of that sector, or None when the disk has no such sector.
-   A track holds sectors 1 to sectors-per-track: sector 0 would give offset
-   -512, which Bytes.blit rejects with an exception, and the sector after
-   the last would land on the next side, letting a multi-sector write run
-   on across the whole image. openMSX builds a whole track from the image
-   and leaves it empty when any of its sectors is missing, so a track cut
-   short by the end of the image has no sectors at all. *)
-let fdc_sector_offset m =
-  let f = m.fdc in
-  let size = Bytes.length f.buf in
-  if Bytes.length m.disk < size then None
-  else begin
-    let g = disk_geometry m.disk ~sector_size:size in
-    let logical = fdc_logical_sector m in
-    let last_on_track = logical + (g.sectors_per_track - f.sector) in
-    if f.sector >= 1 && f.sector <= g.sectors_per_track
-       && (last_on_track + 1) * size <= Bytes.length m.disk
-    then Some (logical * size)
-    else None
-  end
-
-let fdc_load_sector m =
-  let f = m.fdc in
-  if Bytes.length m.disk = 0 then f.drq <- false
-  else begin
-    let logical = fdc_logical_sector m in
-    match fdc_sector_offset m with
-    | None ->
-      if !fdc_trace then
-        Printf.eprintf "FDC readsec MISS t=%d side=%d sec=%d -> logical %d (len %d)\n%!"
-          f.track f.side f.sector logical (Bytes.length m.disk);
-      f.drq <- false
-    | Some off ->
-      Bytes.blit m.disk off f.buf 0 (Bytes.length f.buf);
-      if !fdc_trace then
-        Printf.eprintf "FDC readsec t=%d side=%d sec=%d -> logical %d (off %d) buf0=%02x drive=%d motor=%b\n%!"
-          f.track f.side f.sector logical off (Char.code (Bytes.get f.buf 0))
-          (f.drive_reg land 3) f.motor;
-      f.pos <- 0;
-      f.drq <- true;
-      f.busy <- true
-  end
-
-(* WRITE SECTOR is 0xA0, or 0xB0 with the multi-sector flag; READ SECTOR is
-   0x80/0x90. Bit 5 tells them apart (openMSX WD2793 tests cmd & 0xE0). *)
-let fdc_writing f = f.cmd land 0xe0 = 0xa0
-let fdc_multi_sector = 0x10
-
-(* End of a Type II command: BUSY and DRQ drop, INTRQ rises (openMSX
-   WD2793::endCmd). *)
-let fdc_end_command f =
-  f.busy <- false;
-  f.drq <- false;
-  f.intr <- true
-
-(* WRITE SECTOR takes the sector through the data register, one byte per
-   DRQ, and stores it in the image after the last byte. The chip asks for
-   the first byte once the sector header passes under the head; this model
-   has no rotation, so DRQ is up as soon as the command is taken. A sector
-   the image does not have ends the command without writing. The chip would
-   also report RECORD NOT FOUND (status bit 4); that bit is not modelled. *)
-let fdc_start_write m =
-  let f = m.fdc in
-  match fdc_sector_offset m with
-  | None -> fdc_end_command f
-  | Some _ ->
-    f.pos <- 0;
-    f.drq <- true;
-    f.busy <- true
-
-(* One byte written to the data register while WRITE SECTOR holds DRQ. The
-   offset is looked up again at the last byte: the registers name the
-   sector, and only a full sector reaches the image. With the multi-sector
-   flag the chip moves to the next sector number and keeps going until the
-   track has no such sector (openMSX WD2793::postWriteSector). *)
-let fdc_take_byte m v =
-  let f = m.fdc in
-  let size = Bytes.length f.buf in
-  Bytes.set f.buf f.pos (Char.chr v);
-  if f.pos < size - 1 then f.pos <- f.pos + 1
-  else
-    match fdc_sector_offset m with
-    | None -> fdc_end_command f
-    | Some off ->
-      Bytes.blit f.buf 0 m.disk off size;
-      if f.cmd land fdc_multi_sector = 0 then fdc_end_command f
-      else begin
-        f.sector <- (f.sector + 1) land 0xff;
-        fdc_start_write m
-      end
-
-let fdc_write m port v =
-  let f = m.fdc in
-  match port land 0xff with
-  | 0xD0 ->
-      fdc_note m 1 0xD0 v;
-      f.cmd <- v land 0xf0;
-      (match v land 0xf0 with
-       | 0x00 -> f.track <- 0; f.intr <- true (* RESTORE *)
-       | 0x10 -> f.track <- f.data; f.intr <- true (* SEEK *)
-       | 0x20 | 0x30 ->
-         f.track <- max 0 (f.track + if f.step_out then -1 else 1);
-         f.intr <- true (* STEP: 직전 방향. 0x30 변형은 트랙 레지스터 갱신 —
-                           상위니블 디코딩으로 같은 스텝 (WD2793 정본 T_FLAG). *)
-       | 0x40 | 0x50 ->
-         f.track <- f.track + 1; f.step_out <- false;
-         f.intr <- true (* STEP IN — 트랙 증가, TRK00 해제. 0x50(트랙 갱신
-                           변형)은 실 디스크 ROM 0x783F 의 되돌리기 스텝이 쓴다. *)
-       | 0x60 | 0x70 -> f.track <- max 0 (f.track - 1); f.step_out <- true;
-         f.intr <- true (* STEP OUT — 0 에서 멈춘다 *)
-       | 0x80 | 0x90 -> fdc_load_sector m (* READ SECTOR *)
-       | 0xA0 | 0xB0 -> fdc_start_write m (* WRITE SECTOR *)
-       | 0xC0 -> f.intr <- true (* READ ADDRESS — 최소 *)
-       | 0xD0 -> f.busy <- false; f.intr <- true (* FORCE INTERRUPT *)
-       | _ -> f.intr <- true)
-  | 0xD1 -> f.track <- v land 0xff
-  | 0xD2 -> f.sector <- v land 0xff
-  | 0xD3 ->
-      f.data <- v land 0xff;
-      if fdc_writing f && f.drq then fdc_take_byte m f.data
-  | 0xD4 ->
-      (* 시스템 컨트롤: bit1 side, bit3 motor (배선은 로더 로그로 맞춘다). *)
-      fdc_note m 1 0xD4 v;
-      f.side <- (v lsr 1) land 1;
-      f.motor <- v land 0x08 <> 0
-  | _ -> ()
-
-let fdc_read m port =
-  let f = m.fdc in
-  match port land 0xff with
-  | 0xD0 ->
-      let st = fdc_status m in
-      fdc_note m 0 0xD0 st;
-      (* 상태 읽기가 seek 완료를 소비한다 — 즉시-완료 모델의 표현. 실칩과
-         같이 상태 읽기가 INTRQ 도 내린다: 실 디스크 ROM 은 EX (SP),HL 쌍
-         사이에 park 한 복귀 주소를 INTRQ 인터럽트 핸들러가 소비한다. *)
-      f.busy <- false;
-      f.intr <- false;
-      f.intr_fired <- false;
-      st
-  | 0xD1 -> f.track
-  | 0xD2 -> f.sector
-  | 0xD3 when fdc_writing f ->
-      (* During a write the data register holds the last byte the CPU
-         sent; reading it moves nothing (openMSX WD2793::getDataReg pumps
-         only for read commands). *)
-      f.data
-  | 0xD3 ->
-      let b = Char.code (Bytes.get f.buf f.pos) in
-      if f.pos < 2 && !fdc_trace then
-        Printf.eprintf "FDC pump pos=%d buf0=%02x b=%02x cmd=%02x drq=%b hl=%04x ppi=%02x sl3=%02x\n%!"
-          f.pos (Char.code (Bytes.get f.buf 0)) b f.cmd f.drq
-          (Z80.dump_hl m.cpu) m.ppi_a m.slot3_sel;
-      if f.pos < 511 then f.pos <- f.pos + 1
-      else begin
-        f.drq <- false;
-        f.intr <- true
-      end;
-      fdc_note m 0 0xD3 b;
-      b
-  | _ -> 0xff
 
 let fdc_recent_calls () =
   Array.init (min !fdc_log_i 256) (fun k -> fdc_log.((!fdc_log_i - min !fdc_log_i 256 + k) land 255))
@@ -594,48 +295,13 @@ let mem_read m addr =
        페이지마다 0x3FF8-0x3FFF 창(=0x7FF8-0x7FFF 미러)에 상태/트랙/섹터/데이터
        레지스터가 보인다(openMSX 설정 문서: "FDC registers are visible in all
        4 pages"). 실 디스크 ROM(0x782B 폴링 루프)은 이 창으로만 칩을 다룬다.
-       +0..3 = WD279x 포트 0xD0..0xD3, 0x7FFC = 사이드/모터 시스템 레지스터.
-       인터페이스 슬롯은 서브2(레거시 rm2 배선)와 서브3(정본 NMS8250 배치,
+       +0..3 = 상태·명령/트랙/섹터/데이터, +4 = 사이드, +5 = 드라이브·모터,
+       +7 = DRQ·INTRQ (레지스터 배치는 Wd2793.read). 인터페이스 슬롯은 서브2(레거시 rm2 배선)와 서브3(정본 NMS8250 배치,
        hardwareconfig rom_visibility 참조) 양쪽에서 보인다. *)
-    (match a land 7 with
-     | 0 | 1 | 2 | 3 -> fdc_read m ((a land 7) + 0xd0)
-     | 4 ->
-       fdc_note m 0 0xd4 m.fdc.side_reg;
-       m.fdc.side_reg
-     | 5 ->
-       (* DSKCHG: bit2 는 active-low — 디스크가 교체되었으면 0, 아니면 1
-          (openMSX PhilipsFDC 정본: `driveReg & ~4 | (diskChanged ? 0 : 4)`).
-          [disk_changed] 는 소비형 래치: 읽는 이 한 번이 true 로 나오고 즉시
-          해제된다. 전원 인가 시 디스크가 로드되어 있으면 첫 읽기는 0 —
-          "새 디스크" 를 알려 ROM 이 FAT/부트섹터를 다시 읽게 한다. 항상 1
-          (안 바뀜)만 돌려주면 실 ROM 의 드라이브 탐지가 끝까지 "변화 없음"
-          만 보고 부트섹터 읽기를 발행하지 않은 채 조용히 멈춘다(실측 09-11:
-          RESTORE → TRK00 폴 → R d5=04 → R d0=04 후 정지, READ SECTOR
-          미발행). *)
-       let v =
-         (m.fdc.drive_reg land 0xfb)
-         lor (if m.fdc.disk_changed then 0 else 4)
-       in
-       m.fdc.disk_changed <- false;
-       fdc_note m 0 0xd5 v;
-       v
-     | 6 -> 0xff
-     | _ ->
-       (* DRQ/INTRQ 상태: 풀업 0xFF 기반 active-low — DRQ active 면 bit7
-          클리어, INTRQ active 면 bit6 클리어 (openMSX 정본). 실ROM 의
-          바이트 펌프(0x760C)가 이 비트들을 기다린다. *)
-       let v =
-         0xff
-         land (if m.fdc.drq then lnot 0x80 else 0xff)
-         land (if m.fdc.intr then lnot 0x40 else 0xff)
-       in
-       if !fdc_trace && v <> !last_poll then begin
-         Printf.eprintf "FDC poll %02x -> %02x @%04x pos=%d cmd=%02x\n%!"
-           !last_poll v (Z80.dump_pc m.cpu) m.fdc.pos m.fdc.cmd;
-         last_poll := v
-       end;
-       fdc_note m 0 0xd7 v;
-       v)
+    let r = a land 7 in
+    let v = Wd2793.read m.fdc ~disk:m.disk ~time:(fdc_time m) r in
+    fdc_note m 0 r v;
+    v
   else if
     a >= 0x4000 && a < 0xc000 && slot = 2 && m.cart_mapper <> Flat
     && Bytes.length m.cart > 0
@@ -759,10 +425,9 @@ let mem_write m addr v =
         || (slot = 3 && slot3_sub m page = 3 && Bytes.length m.cart >= 0x4000))
     && Bytes.length m.disk > 0
   then
-    (* 메모리 매핑 FDC 창의 쓰기 면(읽기 면의 주석 참조): +0..3 = WD279x
-       포트 0xD0-0xD3(명령/트랙/섹터/데이터), +4 = 사이드(bit0), +5 =
-       드라이브(bits0-1)·모터(bit7) — 0xD4 포트 계열과는 비트 배치가 다르다
-       (openMSX PhilipsFDC 정본). *)
+    (* 메모리 매핑 FDC 창의 쓰기 면(읽기 면의 주석 참조): +0..3 = 명령/
+       트랙/섹터/데이터, +4 = 사이드(bit0), +5 = 드라이브(bits0-1)·모터(bit7)
+       (openMSX PhilipsFDC, 배치는 Wd2793.write). *)
     begin
       (if !fdc_trace then begin
          Printf.eprintf "fdcwin W %04x=%02x @%04x sp=%04x ppi=%02x sl3=%02x\n  ring:"
@@ -774,17 +439,8 @@ let mem_write m addr v =
          done;
          Printf.eprintf "\n%!"
        end);
-      match a land 7 with
-      | 0 | 1 | 2 | 3 -> fdc_write m ((a land 7) + 0xd0) v
-      | 4 ->
-        fdc_note m 1 0xd4 v;
-        m.fdc.side_reg <- v land 0xff;
-        m.fdc.side <- v land 1
-      | 5 ->
-        fdc_note m 1 0xd5 v;
-        m.fdc.drive_reg <- v land 0xff;
-        m.fdc.motor <- v land 0x80 <> 0
-      | _ -> ()
+      fdc_note m 1 (a land 7) (v land 0xff);
+      Wd2793.write m.fdc ~disk:m.disk ~time:(fdc_time m) (a land 7) v
     end
   else if
     slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
@@ -853,7 +509,6 @@ let port_read m port =
   match port land 0xff with
   | 0xB4 -> m.rtc_reg land 0x0f
   | 0xB5 -> rtc_read_reg m
-  | 0xD0 | 0xD1 | 0xD2 | 0xD3 -> fdc_read m port
   | 0x98 -> Vdp.io_read m.vdp ~port:0x98
   | 0x99 -> Vdp.io_read m.vdp ~port:0x99
   | 0xA8 -> m.ppi_a
@@ -889,7 +544,6 @@ let port_write m port v =
        0x2F 로 글자를 뱉는다) — 관측용으로 흘린다. *)
     Printf.eprintf "%c" (Char.chr (v land 0xff));
     if v = 0x0d then Printf.eprintf "\n%!"
-  | 0xD0 | 0xD1 | 0xD2 | 0xD3 | 0xD4 -> fdc_write m port v
   | 0x98 | 0x99 | 0x9A | 0x9B -> Vdp.io_write m.vdp ~port:(port land 0xff) v
   | 0xA8 -> m.ppi_a <- v land 0xff
   | 0xAA -> m.ppi_c <- v land 0xff
@@ -950,7 +604,7 @@ let create ~machine =
       rst30_pending = [];
       hle_disk = true;
       cart_is_disk_rom = false;
-      fdc = fdc_create ();
+      fdc = Wd2793.create ();
       (* 전원 인가 시 RAM 의 실측 패턴(openMSX Philips_NMS_8250 initialContent):
          (00 FF)*128 (FF 00)*128 의 512 바이트 블록이 전체를 덮는다. 룬마스터
          1 의 커널 슬롯 프로브는 이 패턴의 보수쌍(byte2 = ~byte1)을 "이 슬롯에
@@ -1113,6 +767,12 @@ let disk_rom_bytes () =
   Bytes.set rom 3 (Char.chr ((disk_init_entry lsr 8) land 0xff));
   Bytes.to_string rom
 
+(* The disk HLE (the DSKIO and BDOS traps) writes the image behind the
+   controller's back, so the controller drops the track it holds. *)
+let hle_wrote_disk t disk =
+  t.disk <- disk;
+  Wd2793.image_written t.fdc
+
 (* Move [count] 512-byte sectors between the disk image and RAM. [write] false
    reads disk -> RAM. Sectors past the image read as zero and drop on write, the
    way a real controller reports a seek error; the caller sets the flags. *)
@@ -1131,7 +791,8 @@ let disk_transfer t ~write ~sector ~count ~addr =
         mem_write t mem v
       end
     done
-  done
+  done;
+  if write then hle_wrote_disk t t.disk
 
 (* --- FAT12 read-only file system on the .dsk image -----------------------
    Enough of FAT12 to find a file in the root directory and read its bytes, so
@@ -1227,6 +888,7 @@ let fat12_open t name11 =
 
 let load_disk ?(interface_rom = true) ?disk_rom t dsk =
   t.disk <- Bytes.of_string dsk;
+  Wd2793.disk_changed t.fdc;
   Hashtbl.reset t.bdos_files;
   t.disk_dma <- 0x0080;
   (* The interface ROM occupies the cartridge slot; loading it the cart way puts
@@ -1278,9 +940,9 @@ let change_disk t image =
   else begin
     let disk = Bytes.of_string image in
     t.disk <- disk;
-    (* 교체는 DSKCHG 래치를 다시 어설트 — DiskChanger::changeDisk 정본. 다음
-       DSKCHG 읽기는 0 (changed) 로 나와 ROM 이 FAT 을 다시 읽는다. *)
-    t.fdc.disk_changed <- true;
+    (* openMSX DiskChanger::changeDisk: the next read of 0x7FFD reports
+       the change, so the disk ROM reads the FAT again. *)
+    Wd2793.disk_changed t.fdc;
     Hashtbl.reset t.bdos_files;
     Ok ()
   end
@@ -1779,7 +1441,7 @@ let disk_trap t pc =
           match result with
           | Error _ -> 0xff
           | Ok (disk, data) ->
-            t.disk <- disk;
+            hle_wrote_disk t disk;
             Hashtbl.replace t.bdos_files de (data, 0);
             let extent = fcb 0x0c in
             for i = 0x0c to 0x24 do mem_write t ((de + i) land 0xffff) 0 done;
@@ -1814,7 +1476,7 @@ let disk_trap t pc =
             match Disk_fat12.put_file ~image:t.disk ~name ~data:updated with
             | Error _ -> 0x01
             | Ok disk ->
-              t.disk <- disk;
+              hle_wrote_disk t disk;
               Hashtbl.replace t.bdos_files de (updated, start + amount);
               for i = 0 to (if size < 64 then 3 else 2) do
                 mem_write t ((de + 0x21 + i) land 0xffff) (((record + count) lsr (8 * i)) land 255)
@@ -2232,7 +1894,6 @@ let serialize t =
   State_codec.put_int w t.ppi_c;
   State_codec.put_int w t.slot3_sel;
   State_codec.put_int w (if t.cart_is_disk_rom then 1 else 0);
-  State_codec.put_int w (if t.fdc.disk_changed then 1 else 0);
   State_codec.put_int w t.psg_latch;
   State_codec.put_int w t.joy1;
   State_codec.put_int w (List.length t.rst30_pending);
@@ -2241,30 +1902,30 @@ let serialize t =
   State_codec.put_int w (List.length files);
   List.iter (fun (fcb, (data, pos)) ->
     State_codec.put_int w fcb; State_codec.put_bytes w data; State_codec.put_int w pos) files;
-  (* v3: the WD2793-visible drive state (ocaml-msx #46). Without it a restored
-     machine redrives cold — motor off, track register 0, and any in-flight
-     READ SECTOR (busy/drq/intr, the sector buffer and its pump position)
-     lost — so two machines differing only in drive state serialize to
-     identical bytes. *)
-  let f = t.fdc in
-  State_codec.put_int w f.cmd;
-  State_codec.put_int w f.track;
-  State_codec.put_int w f.sector;
-  State_codec.put_int w f.data;
-  State_codec.put_int w f.side;
-  State_codec.put_bool w f.motor;
-  State_codec.put_bool w f.step_out;
-  State_codec.put_bool w f.busy;
-  State_codec.put_bool w f.drq;
-  State_codec.put_bool w f.intr;
-  State_codec.put_bytes w f.buf;
-  State_codec.put_int w f.pos;
-  State_codec.put_int w f.side_reg;
-  State_codec.put_int w f.drive_reg;
-  State_codec.put_bool w f.intr_fired;
+  (* v4: the timed WD2793 and drive A. *)
+  Wd2793.write_state w t.fdc;
   Z80.write_state w t.cpu;
   Vdp.write_state w t.vdp;
   State_codec.finish w
+
+(* The v3 FDC block held the instant model's registers, flags and sector
+   buffer. A v3 state restores with an idle controller: the power-on
+   RESTORE is long over, a sector read in flight is lost and the disk ROM
+   retries it. *)
+let skip_v3_fdc r =
+  let byte () = ignore (State_codec.get_int r ~min:0 ~max:255) in
+  let flag () = ignore (State_codec.get_bool r) in
+  (* command, track, sector, data *)
+  byte (); byte (); byte (); byte ();
+  (* side *)
+  ignore (State_codec.get_int r ~min:0 ~max:1);
+  (* motor, step direction, busy, DRQ, INTRQ *)
+  flag (); flag (); flag (); flag (); flag ();
+  (* sector buffer and its position *)
+  let buf = State_codec.get_bytes r in
+  ignore (State_codec.get_int r ~min:0 ~max:(Bytes.length buf));
+  (* side and drive registers, INTRQ delivered *)
+  byte (); byte (); flag ()
 
 let restore_with_reader reader state =
   try
@@ -2305,7 +1966,9 @@ let restore_with_reader reader state =
     t.slot3_sel <- State_codec.get_int r ~min:0 ~max:255;
     if State_codec.version r >= 2 then begin
       t.cart_is_disk_rom <- State_codec.get_int r ~min:0 ~max:1 <> 0;
-      t.fdc.disk_changed <- State_codec.get_int r ~min:0 ~max:1 <> 0
+      (* Before v4: the disk-change latch. The restored controller reports a
+         change once, so the disk ROM reads the FAT again. *)
+      if State_codec.version r < 4 then ignore (State_codec.get_int r ~min:0 ~max:1)
     end;
     t.psg_latch <- State_codec.get_int r ~min:0 ~max:255;
     t.joy1 <- State_codec.get_int r ~min:0 ~max:255;
@@ -2321,27 +1984,8 @@ let restore_with_reader reader state =
       let pos = State_codec.get_int r ~min:0 ~max:max_int in
       Hashtbl.add t.bdos_files fcb (data, pos)
     done;
-    if State_codec.version r >= 3 then begin
-      let f = t.fdc in
-      f.cmd <- State_codec.get_int r ~min:0 ~max:255;
-      f.track <- State_codec.get_int r ~min:0 ~max:255;
-      f.sector <- State_codec.get_int r ~min:0 ~max:255;
-      f.data <- State_codec.get_int r ~min:0 ~max:255;
-      f.side <- State_codec.get_int r ~min:0 ~max:1;
-      f.motor <- State_codec.get_bool r;
-      f.step_out <- State_codec.get_bool r;
-      f.busy <- State_codec.get_bool r;
-      f.drq <- State_codec.get_bool r;
-      f.intr <- State_codec.get_bool r;
-      let buf = State_codec.get_bytes r in
-      if Bytes.length buf <> Bytes.length f.buf then
-        State_codec.fail "invalid FDC sector buffer size";
-      Bytes.blit buf 0 f.buf 0 (Bytes.length f.buf);
-      f.pos <- State_codec.get_int r ~min:0 ~max:(Bytes.length f.buf);
-      f.side_reg <- State_codec.get_int r ~min:0 ~max:255;
-      f.drive_reg <- State_codec.get_int r ~min:0 ~max:255;
-      f.intr_fired <- State_codec.get_bool r
-    end;
+    if State_codec.version r = 3 then skip_v3_fdc r;
+    if State_codec.version r >= 4 then Wd2793.read_state r t.fdc;
     Z80.read_state r t.cpu;
     Vdp.read_state r t.vdp;
     State_codec.end_of_input r;
