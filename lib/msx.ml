@@ -2182,7 +2182,10 @@ let step t ~frames =
       let irq_used = if Vdp.int_active t.vdp then Z80.interrupt t.cpu else 0 in
       (* The acknowledge comes before the instruction: port cycles count
          from the instruction start. *)
-      if irq_used > 0 then ignore (Vdp.advance t.vdp ~cycles:irq_used);
+      if irq_used > 0 then begin
+        Vdp.interrupt_accepted t.vdp;
+        ignore (Vdp.advance t.vdp ~cycles:irq_used)
+      end;
       let pc0 = Z80.dump_pc t.cpu in
       (match !trace_from with
        | Some (target, n) when pc0 = target && !trace_remaining = 0 ->
