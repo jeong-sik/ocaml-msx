@@ -145,6 +145,19 @@ let () =
   check "VR=0: G1 name table at 0x8000 reads cell 0"
     (let r, g, b = white in r > 200 && g > 200 && b > 200);
 
+  (* The sprite pattern table at 0x8000 reads its alias at 0x0000. *)
+  let t = Vdp.create () in
+  reg t 1 0x40;
+  reg t 5 0x20;
+  reg t 6 0x10;
+  reg t 16 15;
+  Vdp.io_write t ~port:0x9a 0x77;
+  Vdp.io_write t ~port:0x9a 0x07;
+  List.iteri (fun i v -> poke t (0x1000 + i) v) [0xff; 16; 1; 15; 0xd0];
+  poke t 8 0x80;
+  check "VR=0: sprite patterns read the low alias"
+    (pixel t 16 0 = Vdp.palette_rgb t 15 && pixel t 17 0 <> Vdp.palette_rgb t 15);
+
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1

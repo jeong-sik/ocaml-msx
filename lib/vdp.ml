@@ -593,7 +593,7 @@ let vram_read t addr = Char.code (Bytes.get t.vram (addr land vram_space))
    그린다. 라인당 표시 제한(4/8)과 5th-sprite·충돌 플래그(S#0 bit6/5)
    는 아직 없다. *)
 let render_sprites t ~w ~h put =
-  let vr a = Char.code (Bytes.get t.vram a) in
+  let vr a = Char.code (Bytes.get t.vram (a land address_mask t)) in
   let sat = (t.regs.(5) land 0x7f) lsl 7 in
   let pt = (t.regs.(6) land 0x07) lsl 11 in
   let size16 = t.regs.(1) land 0x02 <> 0 in
