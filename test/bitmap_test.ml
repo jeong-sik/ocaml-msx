@@ -13,7 +13,12 @@ let xy t r x = reg t r (x land 255); reg t (r + 1) (x lsr 8)
 let command t ~cmd ~dx ~dy ~nx ~ny ~arg ~color =
   xy t 36 dx; xy t 38 dy; xy t 40 nx; xy t 42 ny;
   reg t 45 arg; reg t 44 color; reg t 46 cmd
+(* Two frames: the second VBlank publishes lines all scanned after the
+   first, so every line reflects the state written before. *)
+let show t = ignore (Vdp.advance t ~cycles:(2 * 262 * 228))
+let dims t = show t; Vdp.frame_dims t
 let pixel t x y =
+  show t;
   let width, _ = Vdp.frame_dims t in
   let rgb = Vdp.frame_rgb t in let i = (y * width + x) * 3 in
   (Char.code rgb.[i], Char.code rgb.[i + 1], Char.code rgb.[i + 2])
@@ -22,9 +27,9 @@ let white t = reg t 16 1; Vdp.io_write t ~port:0x9a 0x77; Vdp.io_write t ~port:0
 let () =
   List.iter (fun (mode, width) ->
     let t = fresh mode in
-    check "native width and default height" (Vdp.frame_dims t = (width, 192));
+    check "native width and default height" (dims t = (width, 192));
     reg t 9 0x80;
-    check "212 lines selected" (Vdp.frame_dims t = (width, 212));
+    check "212 lines selected" (dims t = (width, 212));
     check "RGB length agrees with dimensions" (String.length (Vdp.frame_rgb t) = width * 212 * 3)
   ) [0x06,256; 0x08,512; 0x0a,512; 0x0e,256];
   let t = fresh 0x0a in
@@ -126,5 +131,7 @@ let () =
   check "212-line vblank begins at 212" (Vdp.status0 t land 0x80 <> 0);
   let t = fresh 0x06 in reg t 0 0x16; reg t 19 10;
   ignore (Vdp.advance t ~cycles:(10*228));
+  check "line interrupt waits for line 10 to finish" (not (Vdp.int_active t));
+  ignore (Vdp.advance t ~cycles:228);
   check "line interrupt enable is R0 bit4" (Vdp.int_active t);
   print_endline "bitmap: native pixels, VRAM ports, commands and interrupts passed"

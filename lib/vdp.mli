@@ -18,20 +18,26 @@ val io_read : t -> port:int -> int
     인터럽트 요청이 지워진다. *)
 
 val advance : t -> cycles:int -> bool
-(** 경과 T-state 만큼 스캔라인을 진행한다. VBlank 시작(라인 192)에서
-    반환값이 [true] 가 되고 인터럽트 요청이 걸린다 — 호출자는 Z80 에
-    INT 를 걸고, 스크린 표시 기간 동안엔 이 신호가 유지된다. *)
+(** 경과 T-state 만큼 스캔라인을 진행한다. 표시 라인을 벗어날 때마다 그
+    순간의 레지스터·팔레트·VRAM 으로 그 라인을 그린다. 라인
+    (R#19 - R#23) mod 256 을 벗어날 때 IE1 이면 라인 인터럽트, VBlank
+    시작(라인 192/212)에서 프레임을 확정하고 수직 인터럽트를 건다. 둘 중
+    하나가 걸리면 [true]. *)
 
 val int_active : t -> bool
 (** 인터럽트 라인 상태 — IE 가 켜져 있고 status0 비트7 이 서 있는 동안. *)
 
 val frame_dims : t -> int * int
-(** Bitmap modes retain native width (SCREEN6/7: 512, SCREEN5/8: 256)
-    and R#9 LN selects 192 or 212 visible lines. *)
+(** Size of the frame the last VBlank published. Bitmap modes keep native
+    width (SCREEN6/7: 512, SCREEN5/8: 256) and R#9 LN height (192/212);
+    character modes are 256×192. A fresh VDP shows a black 256×192 frame. *)
 
 val frame_rgb : t -> string
-(** 현재 VRAM 을 {!frame_dims} RGB (row-major, 채널 R,G,B) 로 렌더.
-    BLANK(R1 bit6) 꺼짐이면 검은 화면. *)
+(** The frame the last VBlank published, {!frame_dims} RGB (row-major,
+    R,G,B). Each line holds what was scanned out for it, so changes made
+    mid-frame (scroll, palette, mode) show from the line they reached.
+    A line drawn at the other width is doubled or halved to the frame's.
+    BLANK(R1 bit6) 이 꺼진 라인은 검다. *)
 
 val vram : t -> Bytes.t
 (** VRAM 원본 — 하네스 검사용. *)

@@ -59,7 +59,12 @@ let colour_rows t l i rows = List.iteri (fun row c -> vram_w t (l.ct + i * 16 + 
 let colour_all t l i c = colour_rows t l i (List.init 16 (fun _ -> c))
 let solid t l p = for row = 0 to 7 do vram_w t (l.pt + p * 8 + row) 0xff done
 
+(* Two frames: the second VBlank publishes lines all scanned after the
+   first, so every line reflects the state written before. *)
+let show t = ignore (Vdp.advance t ~cycles:(2 * 262 * 228))
+
 let px t x y =
+  show t;
   let w, _ = Vdp.frame_dims t in
   let rgb = Vdp.frame_rgb t in
   let i = (y * w + x) * 3 in
