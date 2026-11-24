@@ -150,7 +150,8 @@ let () =
   colour_all t l 1 10;
   run_to_line t 262;
   check "IC clear: collision" (Vdp.status0 t land 0x20 <> 0);
-  check "IC clear: S#3 = 52 + 12" (status t 3 = 64)
+  check "IC clear: S#3 = 52 + 12" (status t 3 = 64);
+  check "IC clear: S#5 = 100 + 8" (status t 5 = 108)
 
 let () =
   (* 7. EC 는 줄마다: 컬러 바이트 bit7 이 그 줄만 32 도트 민다 *)
@@ -208,6 +209,16 @@ let () =
   Vdp.io_write t ~port:0x9a 0x77;
   Vdp.io_write t ~port:0x9a 0x07;
   check "SCREEN8: fixed sprite colour 8 = GRB 4,7,2" (px t 50 101 = (255, 145, 72))
+
+let () =
+  let l = screen5 in
+  let t = setup ~r1:0x62 l in
+  sat_w t l 0 100 50 5;
+  colour_all t l 0 9;
+  vram_w t (l.sat + 4) 216;
+  vram_w t (l.pt + 4 * 8) 0x80;
+  check "16x16: pattern 5 aligns to pattern 4" (is_col t 50 101 9);
+  check "16x16: clear adjacent pixels stay transparent" (is_col t 51 101 0)
 
 let () =
   if !failures > 0 then begin
