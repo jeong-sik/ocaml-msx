@@ -7,8 +7,8 @@
     Sound output remains unimplemented. Versioned save states include CPU,
     VDP, memory, mounted media, the WD2793 drive state (format v3,
     ocaml-msx #46), the VDP sprite collision coordinates (format v4), the
-    VDP raster and published frame (format v5) and device state; file IO
-    belongs to callers. *)
+    VDP raster and published frame (format v5), the VDP LMCM transfer, BD
+    and ASX (format v6) and device state; file IO belongs to callers. *)
 
 type key =
   | Up
