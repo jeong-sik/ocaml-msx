@@ -49,6 +49,11 @@
  (libraries msx))
 
 (test
+ (name disk_drvtbl_test)
+ (modules disk_drvtbl_test)
+ (libraries msx))
+
+(test
  (name bitmap_test)
  (modules bitmap_test)
  (libraries vdpcore))
