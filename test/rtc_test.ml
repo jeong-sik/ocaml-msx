@@ -196,19 +196,26 @@ let () =
     ones + (10 * (Msx.port_in m 0xb5 land 0x0f))
   in
   let m = machine () in
-  Msx.step m ~frames:59;
-  check "machine clock after 59 frames" (seconds m = 30);
+  Msx.step m ~frames:58;
+  check "machine clock after 58 frames" (seconds m = 30);
+  Msx.step m ~frames:1;
   let state = Msx.serialize m in
   check "save state is format 7" (String.sub state 0 11 = "OCAML-MSX\000\007");
   Msx.step m ~frames:1;
   check "machine clock after 60 frames" (seconds m = 31);
-  match Msx.restore ~state with
-  | Error e -> failwith ("restore: " ^ e)
-  | Ok restored ->
-    Msx.step restored ~frames:1;
-    check "restored machine clock after 60 frames" (seconds restored = 31);
-    check "restored machine serializes like the original"
-      (Msx.serialize restored = Msx.serialize m)
+  let header_size = String.length "OCAML-MSX\000\007" + 16 in
+  let payload = String.sub state header_size (String.length state - header_size - 16) in
+  let v6 = "OCAML-MSX\000\006" ^ Digest.string payload ^ payload in
+  List.iter
+    (fun (version, state) ->
+      match Msx.restore ~state with
+      | Error e -> failwith (version ^ " restore: " ^ e)
+      | Ok restored ->
+        Msx.step restored ~frames:1;
+        check (version ^ " clock after 60 frames") (seconds restored = 31);
+        check (version ^ " serializes like the original")
+          (Msx.serialize restored = Msx.serialize m))
+    [ ("v6", v6); ("v7", state) ]
 
 let () =
   if !failures > 0 then begin

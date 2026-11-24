@@ -2508,10 +2508,10 @@ let restore_with_reader reader state =
       t.cassette <- Some (Cassette.resume tape ~position ~cycle:(Z80.t_states t.cpu))
     end;
     let cycle = Z80.t_states t.cpu in
-    if State_codec.version r >= 6 then Rtc.read_clock r t.rtc ~cycle;
+    (if State_codec.version r >= 6 then Rtc.read_clock r t.rtc ~cycle
+     else Rtc.start_clock t.rtc ~cycle);
     if State_codec.version r >= 7 then
-      for i = 4 to 5 do t.cart_banks.(i) <- State_codec.get_int r ~min:0 ~max:neo_bank_max done
-    else Rtc.start_clock t.rtc ~cycle;
+      for i = 4 to 5 do t.cart_banks.(i) <- State_codec.get_int r ~min:0 ~max:neo_bank_max done;
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message
