@@ -494,7 +494,7 @@ let out_of_range () =
 
 (* Koei SRAM: openMSX RomAscii8_8 KOEI (sramPages 0x34) stores through
    windows 0, 2 and 3; a store into window 1 (0x6000-0x7FFF) is a bank
-   select. The SRAM bit is the ROM's block count: 24 segments -> 0x18,
+   select and reads through ROM. The SRAM bit is the ROM's block count: 24 segments -> 0x18,
    so bank 8 selects SRAM. *)
 let koei_windows () =
   let t = machine () in
@@ -504,9 +504,9 @@ let koei_windows () =
   Msx.mem_write t 0x4000 0xcd;
   check "koei window 0 stores into sram" (win t 0x4000 = 0xcd);
   Msx.mem_write t 0x6800 0x21;
-  check "koei window 1 reads sram page 1" (win t 0x6000 = 0);
+  check "koei window 1 reads rom bank 1" (win t 0x6000 = 1);
   Msx.mem_write t 0x6800 0x20;
-  check "koei window 1 reads sram page 0" (win t 0x6000 = 0xcd);
+  check "koei window 1 reads rom bank 0" (win t 0x6000 = 0);
   let t = machine () in
   Msx.load_cartridge ~mapper:Msx.Ascii8_sram t (synth 24);
   show_cart t;

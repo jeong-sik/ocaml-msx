@@ -277,7 +277,7 @@ let cart_rom_read m w off =
     else 0xff
 
 (* Koei maps SRAM in windows 0, 2 and 3 (openMSX sramPages = 0x34). *)
-let koei_sram_writable w = w <> 1
+let koei_sram_window w = w <> 1
 
 (* A write into the cart window selects a bank. Each mapper decodes the target
    address differently; a write that hits no register is ignored (ROM is not
@@ -657,7 +657,7 @@ let mem_read m addr =
        slot 2 (see load_cartridge). *)
     let bank = m.cart_banks.(w) in
     if
-      m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
+      koei_sram_window w && m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
       && bank land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
     then begin
       (* A Koei cart maps its battery RAM into a window whose bank has the SRAM
@@ -789,7 +789,7 @@ let mem_write m addr v =
   then begin
     let w = (a lsr 13) - 2 in
     if
-      koei_sram_writable w && m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
+      koei_sram_window w && m.cart_mapper = Ascii8_sram && m.cart_sram_bit <> 0
       && m.cart_banks.(w) land m.cart_sram_bit <> 0 && Bytes.length m.cart_sram > 0
     then begin
       (* A store into a window mapped to battery RAM lands in the SRAM. *)
