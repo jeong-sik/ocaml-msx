@@ -4,6 +4,11 @@
  (libraries vdpcore))
 
 (test
+ (name screen4_test)
+ (modules screen4_test)
+ (libraries vdpcore))
+
+(test
  (name keyboard_test)
  (modules keyboard_test)
  (libraries msx))
