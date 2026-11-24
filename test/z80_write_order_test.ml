@@ -29,7 +29,7 @@ let write a v =
 let writes ?(pc = 0x0100) ?(steps = 1) ?(setup = fun _ -> ()) code =
   Bytes.fill ram 0 0x10000 '\000';
   String.iteri (fun i c -> Bytes.set ram (pc + i) c) code;
-  let z = Z80.create ~m1_wait:0 ~read ~write ~port_in:(fun ~at:_ _ -> 0xff) ~port_out:(fun ~at:_ _ _ -> ()) in
+  let z = Z80.create ~m1_wait:0 ~read:(fun ~at:_ -> read) ~write:(fun ~at:_ -> write) ~port_in:(fun ~at:_ _ -> 0xff) ~port_out:(fun ~at:_ _ _ -> ()) in
   Z80.set_pc z pc;
   Z80.set_sp z 0x8000;
   setup z;
