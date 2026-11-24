@@ -158,6 +158,20 @@ let () =
   check "blank split: line 100 black" (px t 0 100 = (0, 0, 0))
 
 let () =
+  let t = screen5 ~split:100 () in
+  finish t;
+  let expected = Vdp.frame_rgb t in
+  check "published frame has two visible colours" (px t 0 0 = white && px t 0 100 = red);
+  let writer = State_codec.writer () in
+  Vdp.write_state writer t;
+  let reader = State_codec.reader (State_codec.finish writer) in
+  let restored = Vdp.create () in
+  Vdp.read_state reader restored;
+  State_codec.end_of_input reader;
+  check "restore displays the published frame before another cycle"
+    (Vdp.frame_rgb restored = expected)
+
+let () =
   if !failures > 0 then begin
     Printf.eprintf "raster_test: %d failure(s)\n%!" !failures;
     exit 1
