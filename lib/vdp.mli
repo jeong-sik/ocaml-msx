@@ -29,7 +29,8 @@ val int_active : t -> bool
 
 val frame_dims : t -> int * int
 (** Bitmap modes retain native width (SCREEN6/7: 512, SCREEN5/8: 256)
-    and R#9 LN selects 192 or 212 visible lines. *)
+    and R#9 LN selects 192 or 212 visible lines. TEXT2 is 512 wide with the
+    same LN rule; the other modes are 256x192. *)
 
 val frame_rgb : t -> string
 (** 현재 VRAM 을 {!frame_dims} RGB (row-major, 채널 R,G,B) 로 렌더.

@@ -20,7 +20,7 @@ let rejection name expected state =
 (* Recompute the envelope after payload edits: these cases must reach the
    decoder, rather than merely fail the corruption checksum. *)
 let edit_payload state edit =
-  let magic = "OCAML-MSX\000\006" in
+  let magic = "OCAML-MSX\000\007" in
   let offset = String.length magic + 16 in
   let payload = String.sub state offset (String.length state - offset) |> edit in
   magic ^ Digest.string payload ^ payload
@@ -138,6 +138,42 @@ let () =
   check "Koei SRAM content and selected bank restored" (Msx.mem_read copy 0x8000 = 0x5a);
   Msx.mem_write copy 0x8000 0x33;
   check "SRAM does not alias original" (Msx.mem_read t 0x8000 = 0x5a);
+  let t = fresh () in
+  (* every even byte of an 8KB segment is its number's low byte, every odd one
+     its high byte, so a 14-bit bank register shows in two reads *)
+  Msx.load_cartridge ~mapper:Msx.Neo8 t
+    (String.init (0x120 * 0x2000) (fun i ->
+         let s = i lsr 13 in
+         Char.chr (if i land 1 = 0 then s land 0xff else s lsr 8)));
+  Msx.port_out t 0xa8 0xaa;
+  Msx.mem_write t 0x6000 5;
+  Msx.mem_write t 0x6001 1;
+  Msx.mem_write t 0x5000 9;
+  Msx.mem_write t 0x5800 0x0a;
+  Msx.mem_write t 0x7000 3;
+  Msx.mem_write t 0x7800 4;
+  Msx.mem_write t 0x7801 1;
+  let seg m a = Msx.mem_read m a lor (Msx.mem_read m (a + 1) lsl 8) in
+  check "NEO8 14-bit bank before the snapshot"
+    (seg t 0x4000 = 0x105 && seg t 0x0000 = 9 && seg t 0x2000 = 10 && seg t 0x8000 = 3
+     && seg t 0xa000 = 0x104);
+  let copy = restored t in
+  check "NEO8 mapper and its 14-bit bank registers restored"
+    (Msx.cart_mapper copy = Msx.Neo8 && seg copy 0x4000 = 0x105 && seg copy 0x0000 = 9
+     && seg copy 0x2000 = 10 && seg copy 0x8000 = 3 && seg copy 0xa000 = 0x104);
+  Msx.mem_write copy 0x6000 6;
+  Msx.mem_write copy 0x5000 7;
+  check "NEO8 bank registers do not alias the original" (seg t 0x4000 = 0x105 && seg t 0x0000 = 9);
+  (* A format 6 state ends before the NEO registers: it restores, and the
+     machine saves back as the same bytes it had before. *)
+  let plain = fresh () in
+  let s7 = Msx.serialize plain in
+  let head = String.length "OCAML-MSX\000\007" in
+  let payload6 = String.sub s7 (head + 16) (String.length s7 - head - 16 - 16) in
+  let s6 = "OCAML-MSX\000\006" ^ Digest.string payload6 ^ payload6 in
+  (match Msx.restore ~state:s6 with
+   | Ok m -> check "a format 6 state restores" (Msx.serialize m = s7)
+   | Error e -> failwith ("format 6 state: " ^ e));
   let t = fresh () in
   Msx.load_disk ~interface_rom:false t (String.init 737280 (fun i -> Char.chr (i land 255)));
   same "mounted disk bytes restored" t (restored t);
