@@ -350,7 +350,12 @@ let outer_pages () =
   shows "konami scc after 0x5000=4 0x9000=6" Msx.Konami_scc [ (0x5000, 4); (0x9000, 6) ]
     [ 6; 3; 4; 1 ];
   shows "ascii8" Msx.Ascii8 [] [ 0xff; 0xff; 0xff; 0xff ];
-  shows "ascii16" Msx.Ascii16 [] [ 0xff; 0xff; 0xff; 0xff ]
+  shows "ascii16" Msx.Ascii16 [] [ 0xff; 0xff; 0xff; 0xff ];
+  (* NEO carts cover 0x0000-0xBFFF: page 0 shows the cart, 0xC000 up stays empty *)
+  shows "neo8 at reset" Msx.Neo8 [] [ 0; 0; 0xff; 0xff ];
+  shows "neo8 after 0x5000=3 0x5800=5" Msx.Neo8 [ (0x5000, 3); (0x5800, 5) ] [ 3; 5; 0xff; 0xff ];
+  shows "neo16 at reset" Msx.Neo16 [] [ 0; 1; 0xff; 0xff ];
+  shows "neo16 after 0x5000=2" Msx.Neo16 [ (0x5000, 2) ] [ 4; 5; 0xff; 0xff ]
 
 (* Plugging a cart does not touch slot selection: PPI port A stays at its
    power-on 0x00 (every page on slot 0), as on the real machine and in
@@ -362,6 +367,90 @@ let ppi_untouched () =
   Msx.load_cartridge t (synth 2);
   check "cart leaves PPI A at 0x00" (Msx.port_in t 0xA8 = 0x00)
 
+(* The NEO flash carts (openMSX RomNeo8 / RomNeo16): 14-bit bank registers
+   written as low byte (even address) then high six bits (odd address), decoded
+   from A11-A13 only, every region at block 0 after reset, regions over
+   0x0000-0xBFFF (the whole of slot 2, page 3 empty). Segment s of this ROM
+   holds s land 0xff at byte 0 and s lsr 8 at byte 1, so a 14-bit bank shows. *)
+let synth_wide nseg =
+  let b = Bytes.make (nseg * 0x2000) '\000' in
+  for s = 0 to nseg - 1 do
+    Bytes.set b (s * 0x2000) (Char.chr (s land 0xff));
+    Bytes.set b ((s * 0x2000) + 1) (Char.chr (s lsr 8))
+  done;
+  Bytes.to_string b
+
+let seg_at t addr = Msx.mem_read t addr lor (Msx.mem_read t (addr + 1) lsl 8)
+
+let neo8 () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Neo8 t (synth_wide 0x120);
+  Msx.port_out t 0xA8 0xAA;
+  check "neo8 resets every region to block 0"
+    (List.for_all (fun a -> seg_at t a = 0) [ 0x0000; 0x2000; 0x4000; 0x6000; 0x8000; 0xA000 ]);
+  check "neo8 leaves 0xC000-0xFFFF empty" (win t 0xC000 = 0xff && win t 0xE000 = 0xff);
+  Msx.mem_write t 0x5000 4;
+  Msx.mem_write t 0x5800 5;
+  check "neo8 0x5000/0x5800 select the regions at 0x0000/0x2000"
+    (seg_at t 0x0000 = 4 && seg_at t 0x2000 = 5 && seg_at t 0x4000 = 0);
+  Msx.mem_write t 0x9000 6;
+  check "neo8 0x9000 mirrors the 0x5000 register" (seg_at t 0x0000 = 6);
+  Msx.mem_write t 0x1000 7;
+  check "neo8 a write at 0x1000 decodes as the 0x5000 register" (seg_at t 0x0000 = 7);
+  Msx.mem_write t 0x6000 5;
+  check "neo8 0x6000 low byte selects window0 seg5" (seg_at t 0x4000 = 5);
+  check "neo8 0x6000 leaves window1 alone" (seg_at t 0x6000 = 0);
+  Msx.mem_write t 0x6001 1;
+  check "neo8 odd address sets the high bits (seg 0x105)" (seg_at t 0x4000 = 0x105);
+  Msx.mem_write t 0x6000 6;
+  check "neo8 a low byte write keeps the high bits (seg 0x106)" (seg_at t 0x4000 = 0x106);
+  Msx.mem_write t 0x6800 3;
+  Msx.mem_write t 0x7000 4;
+  Msx.mem_write t 0x7800 6;
+  check "neo8 0x6800/0x7000/0x7800 select windows 1..3"
+    (seg_at t 0x6000 = 3 && seg_at t 0x8000 = 4 && seg_at t 0xA000 = 6);
+  (* 0x41: only the low six bits reach the register, so the bank is 0x100|2. *)
+  Msx.mem_write t 0x7000 2;
+  Msx.mem_write t 0x7001 0x41;
+  check "neo8 high byte keeps six bits" (seg_at t 0x8000 = 0x102);
+  (* the registers repeat 0x4000 higher *)
+  Msx.mem_write t 0xA000 7;
+  Msx.mem_write t 0xA001 0;
+  check "neo8 0xA000 mirrors the 0x6000 register" (seg_at t 0x4000 = 7);
+  (* A11-A13 = 0 and 1 (0x4000, 0x4800) hit no register *)
+  List.iter (fun a -> Msx.mem_write t a 9) [ 0x4000; 0x4800; 0x0000; 0x0800 ];
+  check "neo8 writes at A11-A13 = 0,1 are inert"
+    (seg_at t 0x0000 = 7 && seg_at t 0x2000 = 5 && seg_at t 0x4000 = 7 && seg_at t 0x6000 = 3
+     && seg_at t 0x8000 = 0x102 && seg_at t 0xA000 = 6)
+
+let neo16 () =
+  let t = machine () in
+  Msx.load_cartridge ~mapper:Msx.Neo16 t (synth_wide 0x208);
+  Msx.port_out t 0xA8 0xAA;
+  check "neo16 resets every region to block 0"
+    (seg_at t 0x0000 = 0 && seg_at t 0x2000 = 1 && seg_at t 0x4000 = 0 && seg_at t 0x6000 = 1
+     && seg_at t 0x8000 = 0 && seg_at t 0xA000 = 1);
+  check "neo16 leaves 0xC000-0xFFFF empty" (win t 0xC000 = 0xff);
+  Msx.mem_write t 0x5000 3;
+  check "neo16 0x5000 selects the 16KB bank at 0x0000 (segs 6,7)"
+    (seg_at t 0x0000 = 6 && seg_at t 0x2000 = 7 && seg_at t 0x4000 = 0);
+  Msx.mem_write t 0x6000 2;
+  check "neo16 0x6000 selects the 16KB bank at 0x4000 (segs 4,5)"
+    (seg_at t 0x4000 = 4 && seg_at t 0x6000 = 5);
+  Msx.mem_write t 0x7000 3;
+  check "neo16 0x7000 selects the 16KB bank at 0x8000 (segs 6,7)"
+    (seg_at t 0x8000 = 6 && seg_at t 0xA000 = 7);
+  Msx.mem_write t 0x7001 1;
+  check "neo16 odd address sets the high bits (bank 0x103, segs 0x206,0x207)"
+    (seg_at t 0x8000 = 0x206 && seg_at t 0xA000 = 0x207);
+  (* odd A11-A13 (0x5800, 0x6800, 0x7800) and 0, 1 (0x4000, 0x4800) are not registers. *)
+  List.iter (fun a -> Msx.mem_write t a 9) [ 0x5800; 0x6800; 0x7800; 0x4000; 0x4800 ];
+  check "neo16 writes at odd A11-A13 are inert"
+    (seg_at t 0x0000 = 6 && seg_at t 0x4000 = 4 && seg_at t 0x8000 = 0x206);
+  Msx.mem_write t 0xA000 4;
+  check "neo16 0xA000 mirrors the 0x6000 register (segs 8,9)"
+    (seg_at t 0x4000 = 8 && seg_at t 0x6000 = 9)
+
 let () =
   ram_cart ();
   ppi_untouched ();
@@ -369,6 +458,8 @@ let () =
   konami_scc ();
   ascii8 ();
   ascii16 ();
+  neo8 ();
+  neo16 ();
   koei_sram ();
   detection ();
   plain ();
