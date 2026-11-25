@@ -85,6 +85,16 @@ let () =
   check "row 26 starts at line 208" (is_col t 16 208 15);
   check "the frame ends at line 211, the cut of the 27th row"
     (is_col t 16 211 4 && String.length (Vdp.frame_rgb t) = 512 * 212 * 3);
+  let t = text2 () in
+  vram_w t 0 0x41;
+  ignore (Vdp.advance t ~cycles:49);
+  set_reg t 7 0x25;
+  let cycles_per_line = 228 in
+  ignore (Vdp.advance t ~cycles:cycles_per_line);
+  check "TEXT2 line 0 keeps its foreground and border"
+    (is_col t 16 0 15 && is_col t 0 0 4);
+  check "TEXT2 line 1 uses the new foreground and border"
+    (is_col t 16 1 2 && is_col t 511 1 5);
   if !failures > 0 then begin
     Printf.eprintf "%d failure(s)\n%!" !failures;
     exit 1

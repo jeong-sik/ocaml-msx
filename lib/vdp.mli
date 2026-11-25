@@ -20,9 +20,12 @@ val interrupt_accepted : t -> unit
     되돌린다. 받지 못한 VBlank(DI 구간)는 선택을 건드리지 않는다. *)
 
 val advance : t -> cycles:int -> bool
-(** 경과 T-state 만큼 스캔라인을 진행한다. VBlank 시작(라인 192)에서
-    반환값이 [true] 가 되고 인터럽트 요청이 걸린다 — 호출자는 Z80 에
-    INT 를 걸고, 스크린 표시 기간 동안엔 이 신호가 유지된다. *)
+(** 경과 T-state 만큼 스캔라인을 진행한다. VBlank 시작(라인 192)과 줄
+    인터럽트(IE1 이 켜졌을 때 R#19 - R#23 줄의 214 사이클, 글자 모드는 203)
+    에서 반환값이 [true] 가 되고 인터럽트 요청이 걸린다 — 호출자는 Z80 에
+    INT 를 걸고, 스크린 표시 기간 동안엔 이 신호가 유지된다. 표시 줄마다 그
+    줄의 표시가 시작되는 사이클(43, 글자 모드 49)에 레지스터와 팔레트를 잡아
+    둔다 — {!frame_rgb} 가 줄마다 그 값으로 그린다. *)
 
 val int_active : t -> bool
 (** 인터럽트 라인 상태 — IE 가 켜져 있고 status0 비트7 이 서 있는 동안. *)
@@ -34,7 +37,9 @@ val frame_dims : t -> int * int
 
 val frame_rgb : t -> string
 (** 현재 VRAM 을 {!frame_dims} RGB (row-major, 채널 R,G,B) 로 렌더.
-    BLANK(R1 bit6) 꺼짐이면 검은 화면. *)
+    레지스터와 팔레트는 줄마다 {!advance} 가 잡아 둔 값이다(한 번도 잡히지
+    않았으면 지금 값). 모드와 크기는 첫 줄의 값을 따른다. 상태를 복원하면
+    모든 줄이 지금 값이다. BLANK(R1 bit6) 꺼짐이면 검은 화면. *)
 
 val vram : t -> Bytes.t
 (** VRAM 원본 — 하네스 검사용. *)
