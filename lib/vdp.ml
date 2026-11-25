@@ -137,6 +137,37 @@ let display_mode t =
   | 0x09 -> Text2
   | code -> Undefined code
 
+(* S#2 HR (bit 5) and VR (bit 6), after openMSX VDP.cc peekStatusReg case 2.
+   A line runs from one right border to the next in this model, so HR is the
+   first stretch of every line: openMSX getHR is 1 for HBLANK_LEN_GFX = 312
+   ticks after the right border, HBLANK_LEN_TXT = 404 in the text modes
+   (DisplayMode::isTextMode: TEXT1, TEXT2 and TEXT1Q, code 0x05, which
+   [display_mode] leaves Undefined). One Z80 cycle is 6 VDP ticks, so that is
+   52 and 67.3 cycles.
+
+   VR is 1 from the display end to one line before the next display start:
+   openMSX [ticksThisFrame < displayStart - TICKS_PER_LINE || ticksThisFrame
+   >= displayEnd]. Here it rises with S#0 F at the end of the last display
+   line and drops 48 cycles into the last line of the frame (1368 - 1282 +
+   202 = 288 ticks). openMSX raises it 48 cycles later than this model's F
+   (issue #63). *)
+let hr_cycles_graphic = 52
+let hr_cycles_text = 68
+let vr_fall_cycle = 48
+
+let text_timing t =
+  match display_mode t with
+  | Text1 | Text2 | Undefined 0x05 -> true
+  | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4 | Graphic5
+  | Graphic6 | Graphic7 | Undefined _ -> false
+
+let horizontal_retrace t =
+  t.cycle_in_line < (if text_timing t then hr_cycles_text else hr_cycles_graphic)
+
+let vertical_retrace t =
+  t.line >= visible_lines t
+  && not (t.line = lines_per_frame - 1 && t.cycle_in_line >= vr_fall_cycle)
+
 let display_mode_to_string = function
   | Text1 -> "TEXT1"
   | Text2 -> "TEXT2"
@@ -453,8 +484,10 @@ let io_read t ~port =
            read next") — 완료 감지는 그다음 읽기부터 TR=0 && CE=0. *)
         let v =
           ((if t.cmd_ce then 1 else 0)
-           lor (if t.cmd_tr || t.tx_active then 0x80 else 0))
-          lor 0x7e
+           lor (if t.cmd_tr || t.tx_active then 0x80 else 0)
+           lor (if vertical_retrace t then 0x40 else 0)
+           lor (if horizontal_retrace t then 0x20 else 0))
+          lor 0x1e
         in
         if not t.tx_active then t.cmd_tr <- false;
         v
@@ -619,6 +652,7 @@ let frame_dims t =
   match display_mode t with
   | Graphic4 | Graphic5 | Graphic6 | Graphic7 ->
       ((bitmap_layout t).width, if t.regs.(9) land 0x80 = 0 then 192 else 212)
+  | Text2 -> (512, if t.regs.(9) land 0x80 = 0 then 192 else 212)
   | _ -> (256, 192)
 
 let frame_rgb t =
@@ -687,10 +721,39 @@ let frame_rgb t =
       in
       render_sprites t ~h ~dot put_sprite
     end
+    else if display_mode t = Text2 then begin
+      (* TEXT2: 80 columns of 6×8 cells in a 512-wide frame, 16px of R#7
+         background on each side. The name table is 80 bytes a row at
+         (R#2 bits 6-2) × 0x400; with LN (R#9 bit 7) the 212 lines show 26.5
+         rows, the last one cut. The blink colour table (R#3, R#10, R#12,
+         R#13) is not drawn. *)
+      let nt = (r.(2) land 0x7c) lsl 10 in
+      let pt = (r.(4) land 0x3f) lsl 11 in
+      let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
+      for y = 0 to h - 1 do
+        for x = 0 to 15 do put x y bg done;
+        for x = w - 16 to w - 1 do put x y bg done
+      done;
+      for row = 0 to ((h + 7) / 8) - 1 do
+        for col = 0 to 79 do
+          let ch = vr (nt + row * 80 + col) in
+          for py = 0 to 7 do
+            let y = row * 8 + py in
+            if y < h then begin
+              let pat = vr (pt + ch * 8 + py) in
+              for px = 0 to 5 do
+                let x = 16 + col * 6 + px in
+                if (pat lsr (7 - px)) land 1 = 1 then put x y fg else put x y bg
+              done
+            end
+          done
+        done
+      done
+    end
     else if mode_text t then begin
       (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
       let nt = (r.(2) land 0x7f) lsl 10 in
-      let pt = (r.(4) land 0x7) lsl 8 in
+      let pt = (r.(4) land 0x3f) lsl 11 in
       let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
       for y = 0 to h - 1 do
         for x = 0 to 7 do put_px x y bg done;

@@ -110,18 +110,35 @@ let iter_dots e r f =
 (* 컬러 0 은 TP(R#8 bit5)=0 이면 투명이고 1 이면 팔레트 0 으로 그려진다. *)
 let drawn ~opaque0 r = r.colour <> 0 || opaque0
 
-(* 한 줄의 스프라이트 픽셀. [px] 는 길이 256, 투명은 -1. 번호가 낮은 쪽이
-   위고, CC 스프라이트는 번호가 앞선 스프라이트 픽셀과 컬러를 OR 한다. *)
+(* 스프라이트 [r] 의 점이 x 에 있는가 (MAG 로 늘어난 점 포함). *)
+let covers e r x =
+  let edge = edge e and step = step e in
+  let d = x - r.x0 in
+  d >= 0 && d < edge * step && (r.bits lsr (edge - 1 - (d / step))) land 1 = 1
+
+(* 한 줄의 스프라이트 픽셀. [px] 는 길이 256, 투명은 -1. [rows] 는 번호 순이고
+   번호가 낮은 쪽이 위다. 모드 2 의 CC 규칙(openMSX SpriteConverter::drawMode2):
+   앞쪽에 CC=0 스프라이트가 없는 CC=1 스프라이트는 보이지 않고, 그 밖의
+   스프라이트의 점은 바로 뒤에 이어지는 CC=1 스프라이트들 가운데 같은 점을 켠
+   것의 컬러와 OR 된다. CC=0 스프라이트가 사이에 끼면 OR 는 거기서 끊긴다. *)
 let paint e ~opaque0 rows px =
   Array.fill px 0 (Array.length px) (-1);
-  List.iter
-    (fun r ->
-      if drawn ~opaque0 r then
-        iter_dots e r (fun x ->
-            if x >= 0 && x < 256 then
-              if px.(x) < 0 then px.(x) <- r.colour
-              else if r.cc then px.(x) <- px.(x) lor r.colour))
-    rows
+  let rec skip_leading_cc = function r :: rest when r.cc -> skip_leading_cc rest | l -> l in
+  let rows = Array.of_list (skip_leading_cc rows) in
+  for i = Array.length rows - 1 downto 0 do
+    let r = rows.(i) in
+    if drawn ~opaque0 r then
+      iter_dots e r (fun x ->
+          if x >= 0 && x < 256 then begin
+            let colour = ref r.colour in
+            let j = ref (i + 1) in
+            while !j < Array.length rows && rows.(!j).cc do
+              if covers e rows.(!j) x then colour := !colour lor rows.(!j).colour;
+              incr j
+            done;
+            px.(x) <- !colour
+          end)
+  done
 
 type scan = {
   collided : bool;  (* S#0 bit5 *)
