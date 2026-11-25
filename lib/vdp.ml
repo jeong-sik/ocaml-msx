@@ -378,6 +378,20 @@ let palette_rgb t i =
   if i land 0x10 = 0 then grb_to_rgb t.palette.(i land 15)
   else (0, 0, 0)
 
+(* SCREEN8 스프라이트는 팔레트 레지스터를 쓰지 않고 고정 16색을 쓴다(GRB 각
+   3비트). openMSX Renderer::GRAPHIC7_SPRITE_PALETTE 와 같은 값이다. *)
+let graphic7_sprite_palette =
+  [| 0x000; 0x002; 0x030; 0x032; 0x300; 0x302; 0x330; 0x332;
+     0x472; 0x007; 0x070; 0x077; 0x700; 0x707; 0x770; 0x777 |]
+
+(* SCREEN8 바이트(GGGRRRBB)의 파랑 2비트는 3비트 {b1, b0, b1 AND b0} 로 넓힌다
+   (0, 2, 4, 7). openMSX SDLRasterizer PALETTE256 도 같다. *)
+let graphic7_rgb byte =
+  let g = (byte lsr 5) land 7 and r = (byte lsr 2) land 7 in
+  let b2 = byte land 3 in
+  let b = if b2 = 3 then 7 else b2 * 2 in
+  grb_to_rgb ((g lsl 8) lor (r lsl 4) lor b)
+
 let log_w t port a v =
   (* 전체 주소 = R#14<<14 | 래치 (0x98 데이터 쓰기 기준). *)
   let full =
@@ -598,8 +612,17 @@ let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
 
 (* 스프라이트 그리기. 모드·줄 선택·패턴 기하는 [Sprites] 가 정한다 — 한 줄에
    모드 1 은 4개, 모드 2 는 8개까지 보이고 번호가 낮은 쪽이 위다. SPD(R#8
-   bit1)가 켜지면 그리지 않는다. [xscale] 은 512폭 모드(SCREEN6/7)에서 2. *)
-let render_sprites t ~h ~xscale put =
+   bit1)가 켜지면 그리지 않는다. [dot] 은 스프라이트 점 하나가 화면 픽셀로
+   바뀌는 방식이다. *)
+type sprite_dot =
+  | One  (* 256폭 모드: 점 하나가 픽셀 하나 *)
+  | Same_pair  (* SCREEN7: 같은 색 픽셀 둘 *)
+  | Split_pair
+      (* SCREEN6: 4색 모드라 색 코드를 둘로 쪼갠다 — 왼쪽 픽셀은 윗 2비트,
+         오른쪽 픽셀은 아랫 2비트가 팔레트 항목이다
+         (openMSX SpriteConverter::drawMode2 GRAPHIC5). *)
+
+let render_sprites t ~h ~dot put =
   match sprite_mode t with
   | Some mode when t.regs.(8) land 0x02 = 0 ->
       let e = sprite_env t mode in
@@ -613,9 +636,14 @@ let render_sprites t ~h ~xscale put =
           for x = 0 to 255 do
             let c = px.(x) in
             if c >= 0 then
-              for k = 0 to xscale - 1 do
-                put ((x * xscale) + k) line c
-              done
+              match dot with
+              | One -> put x line c
+              | Same_pair ->
+                  put (x * 2) line c;
+                  put ((x * 2) + 1) line c
+              | Split_pair ->
+                  put (x * 2) line (c lsr 2);
+                  put ((x * 2) + 1) line (c land 3)
           done
         end
       done
@@ -669,21 +697,30 @@ let frame_rgb t =
           let color = point t false x vy in
           if display_mode t = Graphic7 then begin
             (* SCREEN8 byte = GGGRRRBB, one byte per native pixel. *)
+            let r, g, b = graphic7_rgb color in
             let i = (y * w + x) * 3 in
-            Bytes.set img i (Char.chr (((color lsr 2) land 7) * 255 / 7));
-            Bytes.set img (i + 1) (Char.chr (((color lsr 5) land 7) * 255 / 7));
-            Bytes.set img (i + 2) (Char.chr ((color land 3) * 255 / 3))
+            Bytes.set img i (Char.chr r);
+            Bytes.set img (i + 1) (Char.chr g);
+            Bytes.set img (i + 2) (Char.chr b)
           end else put_px x y color
         done
       done;
-      (* SCREEN8 의 스프라이트는 고정 팔레트라 아직 없다. *)
-      if display_mode t <> Graphic7 then
-        let put_sprite =
-          if mode_now = Graphic5 then
-            fun x y colour -> put x y (if x land 1 = 0 then colour lsr 2 else colour land 3)
-          else put
-        in
-        render_sprites t ~h ~xscale:(w / 256) put_sprite
+      let put_sprite =
+        if display_mode t = Graphic7 then (fun x y c ->
+          let r, g, b = grb_to_rgb graphic7_sprite_palette.(c land 15) in
+          let i = (y * w + x) * 3 in
+          Bytes.set img i (Char.chr r);
+          Bytes.set img (i + 1) (Char.chr g);
+          Bytes.set img (i + 2) (Char.chr b))
+        else put
+      in
+      let dot =
+        match display_mode t with
+        | Graphic5 -> Split_pair
+        | Graphic6 -> Same_pair
+        | _ -> One
+      in
+      render_sprites t ~h ~dot put_sprite
     end
     else if display_mode t = Text2 then begin
       (* TEXT2: 80 columns of 6×8 cells in a 512-wide frame, 16px of R#7
@@ -774,7 +811,7 @@ let frame_rgb t =
           done
         done
       done;
-      render_sprites t ~h ~xscale:1 put
+      render_sprites t ~h ~dot:One put
     end;
     Bytes.to_string img
   end
