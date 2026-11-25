@@ -4,8 +4,6 @@
    PPI A(0xA8) 가 페이지→슬롯을, 0xFFFF 가 슬롯3 의 2차를 고른다.
    포트: VDP 0x98-0x9B, PPI 0xA8-0xAB, PSG 0xA0-0xA2, 매퍼 0xFC-0xFF. *)
 
-let cycles_per_frame = 262 * 228
-
 (* RAM 매퍼 포트(0xFC-0xFF) 쓰기 — 세그먼트 스왑 관찰용. 페이지별 쓰기 수. *)
 let mapper_writes : int array = Array.make 4 0
 
@@ -2164,11 +2162,12 @@ let trap_cycles = 18
 
 let step t ~frames =
   for _ = 1 to frames do
-    (* Frame N ends at CPU T-state N * cycles_per_frame: the cycles the last
+    (* A frame ends where the VDP's frame does: the cycles the last
        instruction ran past the boundary come off the next frame, so N
-       frames are N * 59736 cycles and not N * (59736 + overshoot). Both
-       counts are in the save state. *)
-    let frame_end = (t.frames + 1) * cycles_per_frame in
+       frames are N * 59736 cycles (71364 each while R#9 bit 1 is set, PAL)
+       and not N * (59736 + overshoot). The CPU T-state count and the VDP
+       position are both in the save state. *)
+    let frame_end = Z80.t_states t.cpu + Vdp.cycles_to_frame_end t.vdp in
     while Z80.t_states t.cpu < frame_end do
       (* 인터럽트 선은 VDP 만: NMS8250(PhilipsFDC) 의 WD2793 INTRQ/DRQ 는
          Z80 인터럽트 선에 연결되지 않는다(openMSX PhilipsFDC 정본 주석:
