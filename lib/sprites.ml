@@ -88,6 +88,10 @@ let row_of e i line =
 (* [line] 에 걸리는 스프라이트 중 표시되는 앞쪽 몇 개의 행 정보(번호 순)와,
    제한을 넘은 첫 번째 스프라이트(5번째 스프라이트 플래그의 번호). *)
 let displayed e indices line =
+  (* R#23 은 스프라이트도 배경과 같이 옮긴다: 화면 줄 [line] 에는 줄
+     (line + R#23) mod 256 에 걸린 스프라이트가 보인다 (openMSX
+     SpriteChecker 의 displayDelta). *)
+  let line = (line + e.regs.(23)) land 0xff in
   let h = height e in
   let on = List.filter (fun i -> (line - top e i) land 0xff < h) indices in
   let limit = max_per_line e.mode in

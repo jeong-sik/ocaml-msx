@@ -29,6 +29,11 @@
  (libraries vdpcore))
 
 (test
+ (name vdp_vertical_scroll_test)
+ (modules vdp_vertical_scroll_test)
+ (libraries vdpcore))
+
+(test
  (name vdp_line_state_test)
  (modules vdp_line_state_test)
  (libraries vdpcore))
