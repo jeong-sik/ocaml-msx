@@ -85,6 +85,13 @@ let () =
   check "row 26 starts at line 208" (is_col t 16 208 15);
   check "the frame ends at line 211, the cut of the 27th row"
     (is_col t 16 211 4 && String.length (Vdp.frame_rgb t) = 512 * 212 * 3);
+  let scrolled = text2 () in
+  vram_w scrolled 0 0x41;
+  set_reg scrolled 23 1;
+  check "R#23 starts TEXT2 at the second glyph scanline"
+    (is_col scrolled 16 0 15 && is_col scrolled 17 0 4);
+  check "R#23 wraps within the same character row"
+    (is_col scrolled 17 7 15 && is_col scrolled 16 8 4);
   let t = text2 () in
   vram_w t 0 0x41;
   ignore (Vdp.advance t ~cycles:49);
