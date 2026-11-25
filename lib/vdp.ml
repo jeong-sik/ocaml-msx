@@ -782,16 +782,16 @@ let render_lines t img ~w ~lo ~hi =
       let nt = (r.(2) land 0x7c) lsl 10 in
       let pt = (r.(4) land 0x3f) lsl 11 in
       let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
-      for y = 0 to h - 1 do
+      for y = lo to hi - 1 do
         for x = 0 to 15 do put x y bg done;
         for x = w - 16 to w - 1 do put x y bg done
       done;
-      for row = 0 to ((h + 7) / 8) - 1 do
+      for row = lo / 8 to (hi - 1) / 8 do
         for col = 0 to 79 do
           let ch = vr (nt + row * 80 + col) in
           for py = 0 to 7 do
             let y = row * 8 + py in
-            if y < h then begin
+            if y >= lo && y < hi then begin
               let pat = vr (pt + ch * 8 + py) in
               for px = 0 to 5 do
                 let x = 16 + col * 6 + px in
