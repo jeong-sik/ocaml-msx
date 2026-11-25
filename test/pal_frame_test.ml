@@ -48,7 +48,7 @@ let () =
   advance t ((100 * line) + 5);
   check "cycles to the end of an NTSC frame from line 100 cycle 5"
     (Vdp.cycles_to_frame_end t = ((262 - 100) * line) - 5);
-  (* A restored VDP takes the frame length from R#9. *)
+  (* Restore the current frame length and scanline. *)
   let t = Vdp.create () in
   set_reg t 9 0x02;
   advance t ntsc;
@@ -78,15 +78,25 @@ let () =
   check "a PAL save at line 300 keeps its position" (Vdp.line_now late = (300, 7));
   let last = restore (saved_at_line 312) in
   check "a PAL save at line 312 keeps its position" (Vdp.line_now last = (312, 7));
-  (* The same line number is out of range for an NTSC frame. *)
-  let ntsc_state =
-    let t = Vdp.create () in
-    advance t ((261 * line) + 7);
+  let round_trip t =
     let w = State_codec.writer () in
     Vdp.write_state w t;
-    State_codec.finish w
+    restore (State_codec.finish w)
   in
-  check "an NTSC save at line 261 restores" (Vdp.line_now (restore ntsc_state) = (261, 7));
+  let t = Vdp.create () in
+  advance t ((261 * line) + 7);
+  set_reg t 9 0x02;
+  let r = round_trip t in
+  check "pending PAL change keeps the restored current frame NTSC"
+    (not (Vdp.is_pal r) && Vdp.line_now r = (261, 7));
+  advance r (line - 7);
+  check "the pending PAL setting applies at the next boundary" (Vdp.is_pal r);
+  set_reg last 9 0;
+  let r = round_trip last in
+  check "pending NTSC change restores the late PAL scanline"
+    (Vdp.is_pal r && Vdp.line_now r = (312, 7));
+  advance r (line - 7);
+  check "the pending NTSC setting applies at the next boundary" (not (Vdp.is_pal r));
   (* A machine: Msx.step ends a frame at the VDP's frame end. *)
   let m = Msx.create ~machine:{ Msx.ram_kb = 64; vram_kb = 128; roms = [ ""; ""; "" ] } in
   Msx.port_out m 0xa8 0xff;

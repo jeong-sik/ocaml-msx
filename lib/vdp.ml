@@ -185,7 +185,7 @@ let horizontal_retrace t =
 
 let vertical_retrace t =
   t.line >= visible_lines t
-  && not (t.line = lines_per_frame - 1 && t.cycle_in_line >= vr_fall_cycle)
+  && not (t.line = frame_lines t - 1 && t.cycle_in_line >= vr_fall_cycle)
 
 let display_mode_to_string = function
   | Text1 -> "TEXT1"
@@ -968,7 +968,9 @@ let write_state w t =
   State_codec.put_int w t.pal_idx;
   State_codec.put_int w t.status0;
   State_codec.put_int w t.status1;
-  State_codec.put_int w t.line;
+  (* Legacy states encode an NTSC line directly. The PAL range stores the
+     current frame latch independently of the next frame's R#9 setting. *)
+  State_codec.put_int w (if t.pal then ntsc_lines + t.line else t.line);
   State_codec.put_int w t.cycle_in_line;
   State_codec.put_int w t.tx_dx;
   State_codec.put_int w t.tx_adx;
@@ -993,7 +995,6 @@ let read_state r t =
   Bytes.blit vram 0 t.vram 0 (Bytes.length vram);
   State_codec.fill_int_array r ~min:0 ~max:0x777 t.palette;
   fill_all_lines t;
-  t.pal <- t.regs.(9) land 0x02 <> 0;
   t.pal_first <- (if State_codec.get_bool r then Some (State_codec.get_int r ~min:0 ~max:255) else None);
   t.addr <- State_codec.get_int r ~min:(0) ~max:16383;
   t.latch_lo <- State_codec.get_int r ~min:(0) ~max:255;
@@ -1001,7 +1002,9 @@ let read_state r t =
   t.pal_idx <- State_codec.get_int r ~min:(0) ~max:15;
   t.status0 <- State_codec.get_int r ~min:(0) ~max:255;
   t.status1 <- State_codec.get_int r ~min:(0) ~max:255;
-  t.line <- State_codec.get_int r ~min:(0) ~max:(frame_lines t - 1);
+  let saved_line = State_codec.get_int r ~min:0 ~max:(ntsc_lines + pal_lines - 1) in
+  t.pal <- saved_line >= ntsc_lines;
+  t.line <- if t.pal then saved_line - ntsc_lines else saved_line;
   t.cycle_in_line <- State_codec.get_int r ~min:(0) ~max:227;
   t.tx_dx <- State_codec.get_int r ~min:(0) ~max:511;
   (* ARG and mode can change during a transfer: permit every coordinate
