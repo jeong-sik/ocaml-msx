@@ -57,9 +57,9 @@ val fdc_recent_calls : unit -> (int * int * int * int) array
 
 val load_cartridge : ?mapper:cart_mapper -> t -> string -> unit
 (** Plug in a cartridge. Without [mapper] the type is guessed from the ROM
-    ({!guess_mapper}); pass it to override a wrong guess. The bank registers
-    reset linear so the ROM boots from segment 0.
-    @raise Invalid_argument for [~mapper:Ram64]: that cart has no ROM. *)
+    ({!guess_mapper}); pass it to override a wrong guess. ASCII and NEO
+    banks reset to block 0. Konami and Konami SCC reset to blocks 0-3.
+    @raise Invalid_argument for [~mapper:Ram64]: use {!insert_ram_cartridge}. *)
 
 val insert_ram_cartridge : t -> unit
 (** Plug a 64KB RAM cartridge into slot 2, as openMSX's [-extb ram64k] does:
