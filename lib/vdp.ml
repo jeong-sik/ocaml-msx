@@ -21,6 +21,16 @@ type t = {
   mutable status1 : int;
   mutable line : int;
   mutable cycle_in_line : int;
+  mutable pal : bool;
+  (* 표시 줄마다 그 줄의 표시가 시작될 때의 레지스터와 팔레트. 화면은 프레임
+     끝의 값이 아니라 줄마다 이 값으로 그린다 (openMSX 는 레지스터 쓰기 시각
+     까지의 픽셀을 옛 값으로 그린다). 줄 y 의 값은 line_regs.(y * reg_count ..)
+     와 line_pal.(y * 16 ..) 에 있고, 한 번도 잡히지 않은 줄은 line_seen.(y) =
+     false 라 지금 값을 쓴다. 저장 상태에 넣지 않는다: 복원하면 지금 값으로
+     채운다. *)
+  line_regs : int array;
+  line_pal : int array;
+  line_seen : bool array;
   mutable int_pending : bool;
   mutable cmd_ce : bool;
   (* LMMC/HMMC 전송 상태 — CMR 를 쓰면 진입, R#44(CLR) 쓰기마다
@@ -48,7 +58,9 @@ type t = {
   mutable cmd_log : (int * int * int * int) list;
 }
 
-let lines_per_frame = 262
+let ntsc_lines = 262
+let pal_lines = 313
+let frame_lines t = if t.pal then pal_lines else ntsc_lines
 let cycles_per_line = 228
 let visible_lines t = if t.regs.(9) land 0x80 = 0 then 192 else 212
 
@@ -65,6 +77,9 @@ let grb_to_rgb v =
    VDP::changeRegister drops a write to R#47-R#63, which the indirect port
    0x9B can name through R#17. *)
 let reg_count = 47
+
+(* 줄 스냅샷을 두는 표시 줄 수 (R#9 LN 의 212 줄까지 담는다). *)
+let max_snap_lines = 256
 
 let create () =
   let pal = Array.make 16 0 in
@@ -84,6 +99,10 @@ let create () =
     status1 = 0;
     line = 0;
     cycle_in_line = 0;
+    pal = false;
+    line_regs = Array.make (max_snap_lines * reg_count) 0;
+    line_pal = Array.make (max_snap_lines * 16) 0;
+    line_seen = Array.make max_snap_lines false;
     int_pending = false;
     cmd_ce = false;
     tx_active = false;
@@ -172,7 +191,7 @@ let horizontal_retrace t =
 
 let vertical_retrace t =
   t.line >= visible_lines t
-  && not (t.line = lines_per_frame - 1 && t.cycle_in_line >= vr_fall_cycle)
+  && not (t.line = frame_lines t - 1 && t.cycle_in_line >= vr_fall_cycle)
 
 let display_mode_to_string = function
   | Text1 -> "TEXT1"
@@ -442,6 +461,20 @@ let palette_rgb t i =
   if i land 0x10 = 0 then grb_to_rgb t.palette.(i land 15)
   else (0, 0, 0)
 
+(* SCREEN8 스프라이트는 팔레트 레지스터를 쓰지 않고 고정 16색을 쓴다(GRB 각
+   3비트). openMSX Renderer::GRAPHIC7_SPRITE_PALETTE 와 같은 값이다. *)
+let graphic7_sprite_palette =
+  [| 0x000; 0x002; 0x030; 0x032; 0x300; 0x302; 0x330; 0x332;
+     0x472; 0x007; 0x070; 0x077; 0x700; 0x707; 0x770; 0x777 |]
+
+(* SCREEN8 바이트(GGGRRRBB)의 파랑 2비트는 3비트 {b1, b0, b1 AND b0} 로 넓힌다
+   (0, 2, 4, 7). openMSX SDLRasterizer PALETTE256 도 같다. *)
+let graphic7_rgb byte =
+  let g = (byte lsr 5) land 7 and r = (byte lsr 2) land 7 in
+  let b2 = byte land 3 in
+  let b = if b2 = 3 then 7 else b2 * 2 in
+  grb_to_rgb ((g lsl 8) lor (r lsl 4) lor b)
+
 let log_w t port a v =
   (* 전체 주소 = R#14<<14 | 래치 (0x98 데이터 쓰기 기준). *)
   let full =
@@ -553,39 +586,116 @@ let io_read t ~port =
     s
   | _ -> 0xff
 
+(* 스프라이트 모드: SCREEN1~3 은 모드 1, SCREEN4~7 은 모드 2, 텍스트는 없다. *)
+let sprite_mode t =
+  match display_mode t with
+  | Graphic1 | Graphic2 | Multicolor -> Some Sprites.Mode1
+  | Graphic3 | Graphic4 | Graphic5 | Graphic6 | Graphic7 -> Some Sprites.Mode2
+  | Text1 | Text2 | Undefined _ -> None
+
+let sprite_env t mode =
+  { Sprites.regs = t.regs;
+    vr = (fun a -> Char.code (Bytes.get t.vram (physical_addr t a)));
+    mode }
+
+(* 프레임 끝에서 S#0 의 스프라이트 비트를 갱신한다. 충돌(bit5)은 읽기 전까지
+   쌓이고, 5번째 스프라이트(bit6 + 하위 5비트 번호)는 읽기 전까지 처음 값이
+   남는다. 5번째가 없으면 하위 5비트는 목록을 끝낸 번호(종결자가 없으면
+   31)다. 스프라이트를 처리하지 않는 상태(SPD, 표시 끔, 텍스트)는 31.
+   플래그는 프레임이 끝날 때의 VRAM 으로 한 번에 계산한다 — 화면 중간에
+   속성 테이블을 바꾸는 게임은 그 줄의 충돌을 놓친다. *)
+let sprite_status t s0 =
+  let with_low n = (s0 land lnot 0x1f) lor n in
+  let frozen = s0 land 0x40 <> 0 in
+  match sprite_mode t with
+  | Some mode when t.regs.(8) land 0x02 = 0 && t.regs.(1) land 0x40 <> 0 ->
+      let scan =
+        Sprites.scan (sprite_env t mode)
+          ~opaque0:(t.regs.(8) land 0x20 <> 0)
+          ~lines:(visible_lines t)
+      in
+      let s0 = if scan.collided then s0 lor 0x20 else s0 in
+      if frozen then s0
+      else (
+        match scan.fifth with
+        | Some i -> (s0 land lnot 0x1f) lor 0x40 lor i
+        | None -> (s0 land lnot 0x1f) lor min 31 scan.stop)
+  | _ -> if frozen then s0 else with_low 0x1f
+
+(* 줄 안의 위치 (Z80 사이클 = openMSX 21MHz 틱 / 6, 가로 보정 기본값 7).
+   표시가 시작되는 왼쪽 가장자리는 VDP::getLeftSprites = 100+102+56 틱(글자
+   모드는 +9*4), 오른쪽 가장자리는 거기서 1024 틱(글자 모드 960) 뒤다. 줄 인터
+   럽트(S#1 FH)는 오른쪽 가장자리에서 걸린다 (VDP::scheduleHScan 의
+   horizontalScanOffset 에 getRightBorder 가 들어 있다). *)
+let is_text_timing t =
+  match display_mode t with Text1 | Text2 -> true | _ -> false
+
+let left_edge_cycle t = if is_text_timing t then 49 else 43
+let right_edge_cycle t = if is_text_timing t then 203 else 214
+
+let capture_line t =
+  if t.line < max_snap_lines then begin
+    Array.blit t.regs 0 t.line_regs (t.line * reg_count) reg_count;
+    Array.blit t.palette 0 t.line_pal (t.line * 16) 16;
+    t.line_seen.(t.line) <- true
+  end
+
+(* 모든 표시 줄을 지금 값으로 채운다 — 상태 복원 직후. *)
+let fill_all_lines t =
+  for y = 0 to max_snap_lines - 1 do
+    Array.blit t.regs 0 t.line_regs (y * reg_count) reg_count;
+    Array.blit t.palette 0 t.line_pal (y * 16) 16;
+    t.line_seen.(y) <- true
+  done
+
 let advance t ~cycles =
   let hit = ref false in
-  t.cycle_in_line <- t.cycle_in_line + cycles;
-  while t.cycle_in_line >= cycles_per_line do
-    t.cycle_in_line <- t.cycle_in_line - cycles_per_line;
-    t.line <- t.line + 1;
-    if t.line = visible_lines t then begin
-      t.status0 <- t.status0 lor 0x80;
-      t.int_pending <- true;
-      hit := true;
-      (* 인터럽트 발생 시 상태 레지스터 선택(R#15)을 0 으로 되돌린다 —
-         V9938 계약. BIOS KEYINT 는 `in a,(0x99)` 후 `jp p,int_end` 로
-         VBlank 플래그(S#0 bit7)를 검사하는데, 게임이 S#1 선택(R#15=1)을
-         남긴 채 인터럽트가 걸리면 이 리셋이 없는 한 KEYINT 는 S#1 을
-         읽고 스캔 없이 종료한다 — 키가 영원히 KEYBUF 에 들어가지 않는다
-         (룬마스터 1 의 CONIN 이 비는 경로). *)
-      t.regs.(15) <- 0
-    end;
-    (* 라인 인터럽트: 표시 라인이 R#19 와 같아질 때 S#1 bit0. FH 플래그는
-       IE1(R#0 bit4) 이 켜져 있을 때만 래치된다 — V9938 정본(openMSX
-       execHScan: "if (controlRegs[0] & 0x10)"). IE1 없이도 세우면 IE1=0 으로
-       라인 인터럽트를 쓰지 않는 게임이 매 프레임 S#1 읽기에서 1 을 본다. *)
+  (* 줄 하나 안에서 from..upto 사이클을 지나는 동안 일어나는 일: 표시 시작
+     가장자리를 지나면 그 줄의 레지스터를 잡고, 오른쪽 가장자리를 지날 때 줄
+     인터럽트 줄이면 S#1 bit0 을 세운다. FH 플래그는 IE1(R#0 bit4) 이 켜져
+     있을 때만 래치된다 — V9938 정본(openMSX execHScan: "if (controlRegs[0] &
+     0x10)"). IE1 없이도 세우면 IE1=0 으로 라인 인터럽트를 쓰지 않는 게임이
+     매 프레임 S#1 읽기에서 1 을 본다. 비교 줄은 R#19 - R#23 (openMSX
+     scheduleHScan: 표시 줄 카운터가 R#19 - R#23 과 같을 때). *)
+  let line_events ~from ~upto =
+    if from < left_edge_cycle t && upto >= left_edge_cycle t then capture_line t;
     if
-      t.regs.(0) land 0x10 <> 0
-      && t.line < visible_lines t && t.line = t.regs.(19)
+      from < right_edge_cycle t && upto >= right_edge_cycle t
+      && t.regs.(0) land 0x10 <> 0
+      && t.line < visible_lines t
+      && t.line = (t.regs.(19) - t.regs.(23)) land 0xff
     then begin
       t.status1 <- t.status1 lor 1;
       t.int_pending <- true;
       hit := true
+    end
+  in
+  let from = t.cycle_in_line in
+  t.cycle_in_line <- from + cycles;
+  line_events ~from ~upto:t.cycle_in_line;
+  while t.cycle_in_line >= cycles_per_line do
+    t.cycle_in_line <- t.cycle_in_line - cycles_per_line;
+    t.line <- t.line + 1;
+    if t.line = visible_lines t then begin
+      t.status0 <- sprite_status t t.status0 lor 0x80;
+      t.int_pending <- true;
+      hit := true
     end;
-    if t.line >= lines_per_frame then t.line <- 0
+    if t.line >= frame_lines t then begin
+      t.line <- 0;
+      t.pal <- t.regs.(9) land 0x02 <> 0
+    end;
+    line_events ~from:0 ~upto:t.cycle_in_line
   done;
   !hit
+
+(* CPU 가 VBlank 인터럽트를 받으면 상태 레지스터 선택(R#15)을 0 으로 되돌린다.
+   BIOS KEYINT 는 `in a,(0x99)` 후 `jp p,int_end` 로 VBlank 플래그(S#0 bit7)를
+   검사하는데, 게임이 S#1 선택(R#15=1)을 남긴 채 인터럽트가 걸리면 KEYINT 는
+   S#1 을 읽고 스캔 없이 종료한다 — 키가 영원히 KEYBUF 에 들어가지 않는다(룬
+   마스터 1 의 CONIN 이 비는 경로). 받는 시점에 되돌리므로 DI 구간에서 S#2 를
+   고른 채 VBlank 가 지나가도 선택은 그대로다(MSXgl 의 CE 대기 루프). *)
+let interrupt_accepted t = if t.status0 land 0x80 <> 0 then t.regs.(15) <- 0
 
 let int_active t =
   let ie0 = t.regs.(1) land 0x20 <> 0 and ie1 = t.regs.(0) land 0x10 <> 0 in
@@ -598,6 +708,9 @@ let cmd_history t = List.rev t.cmd_log
 let regs t = t.regs
 let status0 t = t.status0
 let line_now t = (t.line, t.cycle_in_line)
+let is_pal t = t.pal
+let cycles_to_frame_end t =
+  ((frame_lines t - t.line) * cycles_per_line) - t.cycle_in_line
 
 let write_log t =
   let n = min t.wlog_i 65536 in
@@ -609,12 +722,14 @@ let write_log t =
 
 (* 모드 판정 (V9938 모드표: M5=R0bit3, M4=R0bit2, M3=R0bit1,
    M2=R1bit3, M1=R1bit4). G4 비트맵 = MSX2 SCREEN5 (M4+M3),
-   베이스는 R#2 의 A16/A15 (bit6/5) × 32K — 하위 5비트는 11111 고정.
-   멀티컬러(M2) 는 아직 없다. *)
+   베이스는 R#2 의 A16/A15 (bit6/5) × 32K — 하위 5비트는 11111 고정. *)
 let mode_text t = t.regs.(1) land 0x10 <> 0
+(* 타일 렌더러의 G2 계열: SCREEN2(M3) 와 SCREEN4(M4) 는 패턴·컬러 테이블
+   배치가 같고(1/3 씩 세 덩어리, 행마다 컬러 한 바이트), 스프라이트만
+   모드 1 대 모드 2 로 갈린다. *)
 let mode_g2 t =
-  not (mode_text t) && t.regs.(0) land 0x02 <> 0
-  && t.regs.(0) land 0x04 = 0
+  let m = t.regs.(0) land 0x0e in
+  not (mode_text t) && (m = 0x02 || m = 0x04)
 (* G4(SCREEN5) 는 M5 가 꺼져 있다 — 0x06 마스크만으론 SCREEN8(M5+M4+M3,
    R0=0x0E) 도 걸려버린다. *)
 let mode_s5 t =
@@ -626,76 +741,55 @@ let mode_bitmap_hi t = not (mode_text t) && t.regs.(0) land 0x08 <> 0
 
 let vram_read t addr = Char.code (Bytes.get t.vram (addr land 0x1ffff))
 
-(* 스프라이트 모드 1 — SCREEN1-3. SAT = R#5<<7 (32엔트리 × 4바이트:
-   Y, X, 패턴번호, 컬러), PT = R#6<<11. R#1 bit0 = MAG(2배), bit1 =
-   SIZE(16×16). Y 값은 실제보다 1 크고, 0xD0 인 엔트리부터 뒤는 없으며
-   0xFF 는 그 엔트리만 화면 밖이다. 컬러 0 은 투명, 컬러 bit7(EC) 은
-   X 를 16px 왼쪽으로 민다. 우선순위는 번호가 낮은 쪽이 위 — 큰 번호부터
-   그린다. 라인당 표시 제한(4/8)과 5th-sprite·충돌 플래그(S#0 bit6/5)
-   는 아직 없다. *)
-let render_sprites t ~w ~h put =
-  let vr a = Char.code (Bytes.get t.vram a) in
-  let sat = (t.regs.(5) land 0x7f) lsl 7 in
-  let pt = (t.regs.(6) land 0x07) lsl 11 in
-  let size16 = t.regs.(1) land 0x02 <> 0 in
-  let mag = t.regs.(1) land 0x01 <> 0 in
-  let pat_len = if size16 then 32 else 8 in
-  let edge = if size16 then 16 else 8 in
-  let step = if mag then 2 else 1 in
-  let sput x y c =
-    if x >= 0 && x < w && y >= 0 && y < h then put x y c
-  in
-  (* 표시할 엔트리를 번호순으로 모은 뒤 역순으로 그린다 — 0xD0 는
-     목록 수집 자체를 끝낸다. *)
-  let active = ref [] in
-  (try
-     for i = 0 to 31 do
-       let e = sat + i * 4 in
-       match vr e with
-       | 0xd0 -> raise Exit
-       | 0xff -> () (* 이 엔트리만 화면 밖 *)
-       | _ -> active := i :: !active
-     done
-   with Exit -> ());
-  List.iter
-    (fun i ->
-      let e = sat + i * 4 in
-      let y0 = ((vr e - 1) land 0xff) and x_raw = vr (e + 1) in
-      let pat = vr (e + 2) and col = vr (e + 3) in
-      let c = col land 0x0f in
-      let x0 = if col land 0x80 <> 0 then x_raw - 16 else x_raw in
-      if c <> 0 then
-        let pbase =
-          pt + (if size16 then (pat land 0xfc) * pat_len else pat * pat_len)
-        in
-        for row = 0 to edge - 1 do
-          (* 16×16 은 한 줄이 2바이트: 상위 바이트가 왼쪽 8px. *)
-          let bits =
-            if size16 then
-              (vr (pbase + row * 2) lsl 8) lor vr (pbase + row * 2 + 1)
-            else vr (pbase + row)
-          in
-          let top = if size16 then 15 else 7 in
-          for b = 0 to edge - 1 do
-            if (bits lsr (top - b)) land 1 = 1 then
-              for my = 0 to step - 1 do
-                for mx = 0 to step - 1 do
-                  sput (x0 + b * step + mx) (y0 + row * step + my) c
-                done
-              done
-          done
-        done)
-    !active
+(* 스프라이트 그리기. 모드·줄 선택·패턴 기하는 [Sprites] 가 정한다 — 한 줄에
+   모드 1 은 4개, 모드 2 는 8개까지 보이고 번호가 낮은 쪽이 위다. SPD(R#8
+   bit1)가 켜지면 그리지 않는다. [dot] 은 스프라이트 점 하나가 화면 픽셀로
+   바뀌는 방식이다. *)
+type sprite_dot =
+  | One  (* 256폭 모드: 점 하나가 픽셀 하나 *)
+  | Same_pair  (* SCREEN7: 같은 색 픽셀 둘 *)
+  | Split_pair
+      (* SCREEN6: 4색 모드라 색 코드를 둘로 쪼갠다 — 왼쪽 픽셀은 윗 2비트,
+         오른쪽 픽셀은 아랫 2비트가 팔레트 항목이다
+         (openMSX SpriteConverter::drawMode2 GRAPHIC5). *)
 
-let frame_dims t =
+let render_sprites t ~lo ~hi ~dot put =
+  match sprite_mode t with
+  | Some mode when t.regs.(8) land 0x02 = 0 ->
+      let e = sprite_env t mode in
+      let opaque0 = t.regs.(8) land 0x20 <> 0 in
+      let indices, _ = Sprites.entries e in
+      let px = Array.make 256 (-1) in
+      for line = lo to hi - 1 do
+        let rows, _ = Sprites.displayed e indices line in
+        if rows <> [] then begin
+          Sprites.paint e ~opaque0 rows px;
+          for x = 0 to 255 do
+            let c = px.(x) in
+            if c >= 0 then
+              match dot with
+              | One -> put x line c
+              | Same_pair ->
+                  put (x * 2) line c;
+                  put ((x * 2) + 1) line c
+              | Split_pair ->
+                  put (x * 2) line (c lsr 2);
+                  put ((x * 2) + 1) line (c land 3)
+          done
+        end
+      done
+  | _ -> ()
+
+let dims_of t =
   match display_mode t with
   | Graphic4 | Graphic5 | Graphic6 | Graphic7 ->
       ((bitmap_layout t).width, if t.regs.(9) land 0x80 = 0 then 192 else 212)
+  | Text2 -> (512, if t.regs.(9) land 0x80 = 0 then 192 else 212)
   | _ -> (256, 192)
 
-let frame_rgb t =
-  let w, h = frame_dims t in
-  let img = Bytes.make (w * h * 3) '\000' in
+(* 줄 [lo, hi) 를 t 의 레지스터·팔레트로 img 에 그린다. 모드·해상도는 호출자가
+   정한 w, h 와 같아야 한다. *)
+let render_lines t img ~w ~lo ~hi =
   let put x y c =
     let (r, g, b) = palette_rgb t c in
     let i = (y * w + x) * 3 in
@@ -703,7 +797,24 @@ let frame_rgb t =
     Bytes.set img (i + 1) (Char.chr g);
     Bytes.set img (i + 2) (Char.chr b)
   in
-  if blanked t then Bytes.to_string img
+  (* 타일·비트맵·텍스트 픽셀의 컬러 0 은 R#8 bit5(TP)=0 이면 R#7 하위 4비트가
+     가리키는 백드롭 색이다. 텍스트는 TP 와 무관하게 늘 백드롭이다(SCREEN8 은
+     TP 를 쓰지 않아 이 함수를 거치지 않는다). SCREEN6(2비트 픽셀)은 R#7 을 두 팔레트 번호로 나눠
+     짝수·홀수 픽셀에 하나씩 쓴다(openMSX SDLRasterizer::precalcColorIndex0). *)
+  let backdrop = t.regs.(7) land 0x0f in
+  let mode_now = display_mode t in
+  let tp_clear = mode_text t || t.regs.(8) land 0x20 = 0 in
+  let put_px x y c =
+    let c =
+      if c <> 0 || not tp_clear then c
+      else
+        match mode_now with
+        | Graphic5 -> if x land 1 = 0 then backdrop lsr 2 else backdrop land 3
+        | _ -> backdrop
+    in
+    put x y c
+  in
+  if blanked t then ()
   else begin
     let vr addr = Char.code (Bytes.get t.vram (addr land 0x1ffff)) in
     let r = t.regs in
@@ -711,42 +822,117 @@ let frame_rgb t =
       let layout = bitmap_layout t in
       let page = if layout.planar then ((r.(2) lsr 6) land 1) * 256
         else ((r.(2) lsr 5) land 3) * 256 in
-      for y = 0 to h - 1 do
+      for y = lo to hi - 1 do
         let vy = page + ((y + r.(23)) land 255) in
         for x = 0 to w - 1 do
           let color = point t false x vy in
           if display_mode t = Graphic7 then begin
             (* SCREEN8 byte = GGGRRRBB, one byte per native pixel. *)
+            let r, g, b = graphic7_rgb color in
             let i = (y * w + x) * 3 in
-            Bytes.set img i (Char.chr (((color lsr 2) land 7) * 255 / 7));
-            Bytes.set img (i + 1) (Char.chr (((color lsr 5) land 7) * 255 / 7));
-            Bytes.set img (i + 2) (Char.chr ((color land 3) * 255 / 3))
-          end else put x y color
+            Bytes.set img i (Char.chr r);
+            Bytes.set img (i + 1) (Char.chr g);
+            Bytes.set img (i + 2) (Char.chr b)
+          end else put_px x y color
+        done
+      done;
+      let put_sprite =
+        if display_mode t = Graphic7 then (fun x y c ->
+          let r, g, b = grb_to_rgb graphic7_sprite_palette.(c land 15) in
+          let i = (y * w + x) * 3 in
+          Bytes.set img i (Char.chr r);
+          Bytes.set img (i + 1) (Char.chr g);
+          Bytes.set img (i + 2) (Char.chr b))
+        else put
+      in
+      let dot =
+        match display_mode t with
+        | Graphic5 -> Split_pair
+        | Graphic6 -> Same_pair
+        | _ -> One
+      in
+      render_sprites t ~lo ~hi ~dot put_sprite
+    end
+    else if display_mode t = Text2 then begin
+      (* TEXT2: 80 columns of 6×8 cells in a 512-wide frame, 16px of R#7
+         background on each side. The name table is 80 bytes a row at
+         (R#2 bits 6-2) × 0x400; with LN (R#9 bit 7) the 212 lines show 26.5
+         rows, the last one cut. The blink colour table (R#3, R#10, R#12,
+         R#13) is not drawn. *)
+      let nt = (r.(2) land 0x7c) lsl 10 in
+      let pt = (r.(4) land 0x3f) lsl 11 in
+      let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
+      for y = lo to hi - 1 do
+        for x = 0 to 15 do put x y bg done;
+        for x = w - 16 to w - 1 do put x y bg done
+      done;
+      for row = lo / 8 to (hi - 1) / 8 do
+        for col = 0 to 79 do
+          let ch = vr (nt + row * 80 + col) in
+          for py = 0 to 7 do
+            let y = row * 8 + py in
+            if y >= lo && y < hi then begin
+              let pat = vr (pt + ch * 8 + ((py + r.(23)) land 7)) in
+              for px = 0 to 5 do
+                let x = 16 + col * 6 + px in
+                if (pat lsr (7 - px)) land 1 = 1 then put x y fg else put x y bg
+              done
+            end
+          done
         done
       done
     end
     else if mode_text t then begin
       (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
       let nt = (r.(2) land 0x7f) lsl 10 in
-      let pt = (r.(4) land 0x7) lsl 8 in
+      let pt = (r.(4) land 0x3f) lsl 11 in
       let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
-      for y = 0 to h - 1 do
-        for x = 0 to 7 do put x y bg done;
-        for x = w - 8 to w - 1 do put x y bg done
+      for y = lo to hi - 1 do
+        for x = 0 to 7 do put_px x y bg done;
+        for x = w - 8 to w - 1 do put_px x y bg done
       done;
-      for row = 0 to 23 do
+      (* R#23 은 글자 줄 안에서만 움직인다: 행은 그대로, 행 안의 줄만
+         (줄 + R#23) mod 8 이 된다 (openMSX CharacterConverter::renderText1). *)
+      for row = lo / 8 to (hi - 1) / 8 do
         for col = 0 to 39 do
           let ch = vr (nt + row * 40 + col) in
           for py = 0 to 7 do
-            let pat = vr (pt + ch * 8 + py) in
-            for px = 0 to 5 do
-              let x = 8 + col * 6 + px in
-              let y = row * 8 + py in
-              if (pat lsr (7 - px)) land 1 = 1 then put x y fg else put x y bg
-            done
+            let y = row * 8 + py in
+            if y >= lo && y < hi then begin
+              let pat = vr (pt + ch * 8 + ((py + r.(23)) land 7)) in
+              for px = 0 to 5 do
+                let x = 8 + col * 6 + px in
+                if (pat lsr (7 - px)) land 1 = 1 then put_px x y fg else put_px x y bg
+              done
+            end
           done
         done
       done
+    end
+    else if mode_now = Multicolor then begin
+      (* SCREEN3: 64×48 블록, 블록 하나는 4×4 픽셀. 이름 하나가 패턴 8바이트를
+         고르고, 블록 줄 (y >> 2) mod 8 번째 바이트의 윗 니블이 왼쪽 블록,
+         아랫 니블이 오른쪽 블록의 색이다 (openMSX
+         CharacterConverter::renderMulti). 패턴 주소는 G1 처럼 R#4 로 만든다. *)
+      let nt = (r.(2) land 0x7f) lsl 10 in
+      let pt_base = ((r.(4) land 0x3f) lsl 11) lor 0x7ff in
+      for y = lo to hi - 1 do
+        (* R#23 은 줄을 256 으로 감아 옮긴다. 이름 행은 줄 / 8, 블록 줄은
+           (줄 / 4) mod 8 이다. *)
+        let dy = (y + r.(23)) land 255 in
+        let row = dy lsr 3 and block_row = (dy lsr 2) land 7 in
+        for col = 0 to 31 do
+          let name = vr (nt + (row * 32) + col) in
+          let bits =
+            vr (pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor block_row)) in
+          for px = 0 to 3 do
+            let x = (col * 8) + px in
+            put_px x y ((bits lsr 4) land 0xf);
+            put_px (x + 4) y (bits land 0xf)
+          done
+        done
+      done;
+      render_sprites t ~lo ~hi ~dot:One put
     end
     else begin
       let g2 = mode_g2 t in
@@ -760,37 +946,83 @@ let frame_rgb t =
          11비트(name<<3 | 행), 컬러 5비트(name>>3). *)
       let pt_base = ((r.(4) land 0x3f) lsl 11) lor 0x7ff in
       let ct_base = ((r.(10) land 0x07) lsl 14) lor (r.(3) lsl 6) lor 0x3f in
-      for row = 0 to 23 do
+      for y = lo to hi - 1 do
+        (* R#23 은 줄을 256 으로 감아 옮긴다. 24 행 밖(24..31)은 이름
+           테이블 뒤쪽 바이트를 그대로 읽는다 (openMSX getNamePtr). *)
+        let dy = (y + r.(23)) land 255 in
+        let row = dy lsr 3 and py = dy land 7 in
         let third = row lsr 3 in
         for col = 0 to 31 do
           let name = vr (nt + (row * 32) + col) in
-          for py = 0 to 7 do
-            let pat_addr, col_addr =
-              if g2 then begin
-                let index = (lnot 0 lsl 13) lor (third lsl 11) lor (name lsl 3) lor py in
-                (pt_base land index, ct_base land index)
-              end
-              else
-                ( pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor py),
-                  ct_base land ((lnot 0 lsl 6) lor (name lsr 3)) )
-            in
-            let bits = vr pat_addr in
-            let col_byte = vr col_addr in
-            let fg = (col_byte lsr 4) land 0xf and bg = col_byte land 0xf in
-            for px = 0 to 7 do
-              let x = (col * 8) + px in
-              let y = (row * 8) + py in
-              if (bits lsr (7 - px)) land 1 = 1 then put x y fg else put x y bg
-            done
+          let pat_addr, col_addr =
+            if g2 then begin
+              let index = (lnot 0 lsl 13) lor (third lsl 11) lor (name lsl 3) lor py in
+              (pt_base land index, ct_base land index)
+            end
+            else
+              ( pt_base land ((lnot 0 lsl 11) lor (name lsl 3) lor py),
+                ct_base land ((lnot 0 lsl 6) lor (name lsr 3)) )
+          in
+          let bits = vr pat_addr in
+          let col_byte = vr col_addr in
+          let fg = (col_byte lsr 4) land 0xf and bg = col_byte land 0xf in
+          for px = 0 to 7 do
+            let x = (col * 8) + px in
+            if (bits lsr (7 - px)) land 1 = 1 then put_px x y fg else put_px x y bg
           done
         done
       done;
-      (* SCREEN1-3 에서만 모드 1 스프라이트를 올린다 (TEXT 는 스프라이트가
-         없고 SCREEN5+ 는 모드 2 가 따로 있다). *)
-      render_sprites t ~w ~h put
-    end;
-    Bytes.to_string img
+      render_sprites t ~lo ~hi ~dot:One put
+    end
   end
+
+(* 줄 y 의 레지스터·팔레트를 가진 VDP 사본. 한 번도 잡히지 않은 줄은 지금 값이다.
+   VRAM 은 공유한다 (읽기만 한다). *)
+let line_view t y =
+  if y < max_snap_lines && t.line_seen.(y) then
+    { t with
+      regs = Array.sub t.line_regs (y * reg_count) reg_count;
+      palette = Array.sub t.line_pal (y * 16) 16 }
+  else { t with regs = Array.copy t.regs; palette = Array.copy t.palette }
+
+let same_line_state t a b =
+  let seen y = y < max_snap_lines && t.line_seen.(y) in
+  if not (seen a && seen b) then not (seen a || seen b)
+  else begin
+    let eq = ref true in
+    for i = 0 to reg_count - 1 do
+      if t.line_regs.((a * reg_count) + i) <> t.line_regs.((b * reg_count) + i) then eq := false
+    done;
+    for i = 0 to 15 do
+      if t.line_pal.((a * 16) + i) <> t.line_pal.((b * 16) + i) then eq := false
+    done;
+    !eq
+  end
+
+(* 해상도와 모드는 프레임 첫 줄의 값을 따른다. 프레임 중간에 모드를 바꾸는
+   화면 분할은 그리지 않는다. *)
+let frame_dims t = dims_of (line_view t 0)
+
+let frame_rgb t =
+  let first = line_view t 0 in
+  let w, h = dims_of first in
+  let img = Bytes.make (w * h * 3) '\000' in
+  let mode_bits = [ (0, 0x0e); (1, 0x18); (9, 0x80) ] in
+  let rec groups lo =
+    if lo < h then begin
+      let hi = ref (lo + 1) in
+      while !hi < h && same_line_state t lo !hi do incr hi done;
+      let v = line_view t lo in
+      List.iter
+        (fun (r, mask) ->
+          v.regs.(r) <- (first.regs.(r) land mask) lor (v.regs.(r) land lnot mask))
+        mode_bits;
+      render_lines v img ~w ~lo ~hi:!hi;
+      groups !hi
+    end
+  in
+  groups 0;
+  Bytes.to_string img
 
 let write_state w t =
   State_codec.put_int_array w t.regs;
@@ -804,7 +1036,9 @@ let write_state w t =
   State_codec.put_int w t.pal_idx;
   State_codec.put_int w t.status0;
   State_codec.put_int w t.status1;
-  State_codec.put_int w t.line;
+  (* Legacy states encode an NTSC line directly. The PAL range stores the
+     current frame latch independently of the next frame's R#9 setting. *)
+  State_codec.put_int w (if t.pal then ntsc_lines + t.line else t.line);
   State_codec.put_int w t.cycle_in_line;
   State_codec.put_int w t.tx_dx;
   State_codec.put_int w t.tx_adx;
@@ -819,10 +1053,11 @@ let write_state w t =
   State_codec.put_bool w t.tx_active;
   State_codec.put_bool w t.tx_hm;
   State_codec.put_bool w t.cmd_tr;
-  State_codec.put_bool w t.tx_pending;
+  State_codec.put_bool w t.tx_pending
+
+let write_search_state w t =
   State_codec.put_bool w t.cmd_bd;
-  State_codec.put_int w t.srch_x;
-  ()
+  State_codec.put_int w t.srch_x
 
 let read_state r t =
   State_codec.fill_int_array r ~min:0 ~max:255 t.regs;
@@ -830,6 +1065,7 @@ let read_state r t =
   if Bytes.length vram <> Bytes.length t.vram then State_codec.fail "invalid VRAM size";
   Bytes.blit vram 0 t.vram 0 (Bytes.length vram);
   State_codec.fill_int_array r ~min:0 ~max:0x777 t.palette;
+  fill_all_lines t;
   t.pal_first <- (if State_codec.get_bool r then Some (State_codec.get_int r ~min:0 ~max:255) else None);
   t.addr <- State_codec.get_int r ~min:(0) ~max:16383;
   t.latch_lo <- State_codec.get_int r ~min:(0) ~max:255;
@@ -837,7 +1073,9 @@ let read_state r t =
   t.pal_idx <- State_codec.get_int r ~min:(0) ~max:15;
   t.status0 <- State_codec.get_int r ~min:(0) ~max:255;
   t.status1 <- State_codec.get_int r ~min:(0) ~max:255;
-  t.line <- State_codec.get_int r ~min:(0) ~max:261;
+  let saved_line = State_codec.get_int r ~min:0 ~max:(ntsc_lines + pal_lines - 1) in
+  t.pal <- saved_line >= ntsc_lines;
+  t.line <- if t.pal then saved_line - ntsc_lines else saved_line;
   t.cycle_in_line <- State_codec.get_int r ~min:(0) ~max:227;
   t.tx_dx <- State_codec.get_int r ~min:(0) ~max:511;
   (* ARG and mode can change during a transfer: permit every coordinate
@@ -855,12 +1093,11 @@ let read_state r t =
   t.tx_hm <- State_codec.get_bool r;
   t.cmd_tr <- State_codec.get_bool r;
   t.tx_pending <- State_codec.get_bool r;
-  if State_codec.version r >= 7 then begin
-    t.cmd_bd <- State_codec.get_bool r;
-    t.srch_x <- State_codec.get_int r ~min:(-1024) ~max:2047
-  end else begin
-    t.cmd_bd <- false;
-    t.srch_x <- 0
-  end;
+  t.cmd_bd <- false;
+  t.srch_x <- 0;
   if t.tx_active && (t.tx_nx = 0 || t.tx_anx = 0 || t.tx_anx > t.tx_nx || t.tx_ny = 0) then
     State_codec.fail "invalid active VDP transfer"
+
+let read_search_state r t =
+  t.cmd_bd <- State_codec.get_bool r;
+  t.srch_x <- State_codec.get_int r ~min:(-1024) ~max:2047

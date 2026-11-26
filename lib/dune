@@ -15,7 +15,7 @@
  (name vdpcore)
  (public_name ocaml-msx.vdpcore)
  (wrapped false)
- (modules vdp)
+ (modules vdp sprites)
  (libraries state_codec))
 
 (library

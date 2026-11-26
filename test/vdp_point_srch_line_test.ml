@@ -189,17 +189,20 @@ let state_round_trip () =
   issue t (10, 1, 0, 0, 0, 0, 3, 0x00, 0x60);
   let w = State_codec.writer () in
   Vdp.write_state w t;
+  Vdp.write_search_state w t;
   let state = State_codec.finish w in
   let t2 = Vdp.create () in
-  Vdp.read_state (State_codec.reader state) t2;
+  let r = State_codec.reader state in
+  Vdp.read_state r t2;
+  Vdp.read_search_state r t2;
   check "restored: S#2 BD stays set" (status t2 2 land 0x10 = 0x10);
   check "restored: S#8 = 0x32" (status t2 8 = 0x32);
   check "restored: S#9 = 0xfe" (status t2 9 = 0xfe);
   check "restored: reading S#9 clears BD" (status t2 2 land 0x10 = 0);
-  let head = String.length "OCAML-MSX " + 1 in
+  let head = String.length "OCAML-MSX\000" + 1 in
   let payload = String.sub state (head + 16) (String.length state - head - 16) in
   let v6_payload = String.sub payload 0 (String.length payload - 9) in
-  let v6 = "OCAML-MSX " ^ Digest.string v6_payload ^ v6_payload in
+  let v6 = "OCAML-MSX\000\006" ^ Digest.string v6_payload ^ v6_payload in
   let t3 = Vdp.create () in
   Vdp.read_state (State_codec.reader v6) t3;
   check "format 6: BD clear" (status t3 2 land 0x10 = 0);

@@ -4,8 +4,6 @@
    PPI A(0xA8) 가 페이지→슬롯을, 0xFFFF 가 슬롯3 의 2차를 고른다.
    포트: VDP 0x98-0x9B, PPI 0xA8-0xAB, PSG 0xA0-0xA2, 매퍼 0xFC-0xFF. *)
 
-let cycles_per_frame = 262 * 228
-
 (* RAM 매퍼 포트(0xFC-0xFF) 쓰기 — 세그먼트 스왑 관찰용. 페이지별 쓰기 수. *)
 let mapper_writes : int array = Array.make 4 0
 
@@ -84,10 +82,13 @@ type machine = { ram_kb : int; vram_kb : int; roms : string list }
    segments per window and swaps them when the running code writes a bank
    register. [Flat] is a plain ROM of up to 64KB with no banking. The four here are
    the common ones (openMSX RomKonami / RomKonamiSCC / RomAscii8 / RomAscii16);
-   the SCC sound chip is not modelled, only its banking. [Ram64] is no ROM at
+   the SCC sound chip is not modelled, only its banking. [Neo8] and [Neo16] are
+   the NEO flash carts' mappers (openMSX RomNeo8 / RomNeo16): 16-bit bank
+   registers over 8KB / 16KB windows, so a ROM can be megabytes long. [Ram64] is no ROM at
    all: 64KB of RAM over the whole slot (openMSX's ram64k extension), held in
    [cart] so a save keeps its contents. *)
-type cart_mapper = Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram | Ram64
+type cart_mapper =
+  | Flat | Konami | Konami_scc | Ascii8 | Ascii16 | Ascii8_sram | Neo8 | Neo16 | Ram64
 
 (* The RAM cartridge covers all four 16KB pages of its slot. *)
 let ram_cart_bytes = 0x10000
@@ -136,8 +137,10 @@ type t = {
       [cart] by [plain_rom_first_page]; [set_cart] keeps the two together. *)
   mutable cart_mapper : cart_mapper;
   cart_banks : int array;
-      (** four 8KB bank registers. Konami/SCC/ASCII8 use all four (one per 8KB
-          window); ASCII16 uses [.(0)]/[.(1)] as 16KB banks. *)
+      (** bank registers. Konami/SCC/ASCII8 use [.(0)..(3)], one per 8KB window
+          of 0x4000-0xBFFF; ASCII16 uses [.(0)]/[.(1)] as 16KB banks. NEO8 uses
+          [.(0)..(5)], one per 8KB region of 0x0000-0xBFFF, NEO16 [.(0)..(2)]
+          per 16KB region; a NEO register holds 14 bits. *)
   mutable cart_sram : Bytes.t;
       (** battery RAM for an [Ascii8_sram] (Koei) cart: a bank whose value has
           [cart_sram_bit] set reads/writes here instead of ROM. Empty otherwise. *)
@@ -224,15 +227,17 @@ let rom_or_empty = function "" -> Bytes.make 0x4000 '\000' | s -> Bytes.of_strin
    16KB bank into its two 8KB halves. *)
 let cart_seg8 m w =
   match m.cart_mapper with
-  | Konami | Konami_scc | Ascii8 | Ascii8_sram -> m.cart_banks.(w)
-  | Ascii16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
+  | Konami | Konami_scc | Ascii8 | Ascii8_sram | Neo8 -> m.cart_banks.(w)
+  | Ascii16 | Neo16 -> (m.cart_banks.(w lsr 1) lsl 1) lor (w land 1)
   | Flat | Ram64 -> w
 
 (* The window (0..3) a MegaROM shows at CPU address [a] of its slot, or [None]
    where the cart leaves the bus empty. 0x4000-0xBFFF is windows 0-3 for every
    mapper. Konami mirrors windows 0-1 at 0x0000 and 2-3 at 0xC000, Konami SCC
    the other way round (openMSX RomKonami / RomKonamiSCC bankSwitch); the
-   ASCII mappers leave both pages unmapped. A [Flat] cart has no window. *)
+   ASCII mappers leave both pages unmapped. NEO carts have six 8KB regions over
+   0x0000-0xBFFF, so for them the window is the region (0..5) and 0xC000-0xFFFF
+   stays empty (openMSX RomNeo8 / RomNeo16 reset). A [Flat] cart has no window. *)
 let cart_window m a =
   let page8 = a lsr 13 in
   let inside = page8 >= 2 && page8 < 6 in
@@ -242,7 +247,17 @@ let cart_window m a =
   | Konami_scc ->
     Some (if page8 < 2 then page8 + 2 else if inside then page8 - 2 else page8 - 6)
   | Ascii8 | Ascii16 | Ascii8_sram -> if inside then Some (page8 - 2) else None
+  | Neo8 | Neo16 -> if page8 < 6 then Some page8 else None
   | Flat | Ram64 -> None
+
+(* A NEO register is 14 bits wide: an even address writes its low byte, an odd
+   one the high six bits. *)
+let neo_bank_max = 0x3fff
+
+let neo_bank_write m reg a v =
+  let old = m.cart_banks.(reg) in
+  m.cart_banks.(reg) <-
+    (if a land 1 = 0 then (old land 0x3f00) lor v else (old land 0xff) lor ((v land 0x3f) lsl 8))
 
 (* A write into the cart window selects a bank. Each mapper decodes the target
    address differently; a write that hits no register is ignored (ROM is not
@@ -272,6 +287,17 @@ let cart_bank_write m a v =
      | 0x6000 -> m.cart_banks.(0) <- v
      | 0x7000 -> m.cart_banks.(1) <- v
      | _ -> ())
+  | Neo8 ->
+    (* The register of region r is decoded from A11-A13 alone (openMSX
+       RomNeo8::writeMem): A11-A13 = r + 2, so 0x5000 for 0x0000, 0x5800 for
+       0x2000, 0x6000 for 0x4000 ... 0x7800 for 0xA000, repeated every 0x4000. *)
+    let bbb = (a lsr 11) land 7 in
+    if bbb >= 2 then neo_bank_write m (bbb - 2) a v
+  | Neo16 ->
+    (* 16KB regions: 0x5000 for 0x0000, 0x6000 for 0x4000, 0x7000 for 0x8000
+       (openMSX RomNeo16::writeMem), repeated every 0x4000. *)
+    let bbb = (a lsr 11) land 7 in
+    if bbb >= 2 && bbb land 1 = 0 then neo_bank_write m ((bbb lsr 1) - 1) a v
 
 (* Guess a mapper from the ROM by looking at where its code writes bank
    registers ([ld (nn),a]). A ROM under 64KB is plain, and so is a 64KB one
@@ -742,7 +768,8 @@ let mem_write m addr v =
       | _ -> ()
     end
   else if
-    slot = 2 && a >= 0x4000 && a < 0xc000 && m.cart_mapper <> Flat
+    slot = 2 && m.cart_mapper <> Flat
+    && (a >= 0x4000 && a < 0xc000 || m.cart_mapper = Neo8 || m.cart_mapper = Neo16)
   then begin
     let w = (a lsr 13) - 2 in
     if
@@ -988,7 +1015,7 @@ let create ~machine =
       cart = Bytes.make 0 '\000';
       cart_first_page = 0;
       cart_mapper = Flat;
-      cart_banks = [| 0; 1; 2; 3 |];
+      cart_banks = [| 0; 1; 2; 3; 4; 5 |];
       cart_sram = Bytes.make 0 '\000';
       cart_sram_bit = 0;
       disk = Bytes.make 0 '\000';
@@ -1034,11 +1061,11 @@ let load_cartridge ?mapper t rom =
   t.cart_mapper <- (match mapper with Some m -> m | None -> guess_mapper rom);
   (* Reset the banks linear so a MegaROM boots: segment 0 at 0x4000 holds the
      "AB" header and INIT vector, and the running code sets the selectable banks
-     before it relies on them. *)
-  t.cart_banks.(0) <- 0;
-  t.cart_banks.(1) <- 1;
-  t.cart_banks.(2) <- 2;
-  t.cart_banks.(3) <- 3;
+     before it relies on them. A NEO cart resets every region to block 0
+     (openMSX RomNeo8 / RomNeo16 reset). *)
+  (match t.cart_mapper with
+   | Neo8 | Neo16 -> Array.fill t.cart_banks 0 (Array.length t.cart_banks) 0
+   | _ -> Array.iteri (fun i _ -> t.cart_banks.(i) <- i) t.cart_banks);
   (* A Koei cart gets 32KB of battery RAM (covers KoeiSRAM8 and KoeiSRAM32); the
      SRAM-select bit is the first bit above the ROM's segment range. *)
   (match t.cart_mapper with
@@ -1396,6 +1423,23 @@ let boot_disk t =
       mem_write t (0xfcc5 + i) 0x00;
       mem_write t (0xf340 + i) 0x8b
     done;
+    (* What a real disk ROM's INIT leaves for the BIOS, which the warm-up
+       replay skips (#147). Europa Sensen's boot sector needs both:
+       - DRVTBL (0xFB21): drive count, then the interface's slot id. It halts
+         on "Reset and hold CTRL!" unless the count is 1. This machine has one
+         floppy drive, mounted here in slot 2 (not expanded).
+       - H.PHYD (0xFFA7), the BIOS's physical-disk-I/O hook: RST 30h, the slot
+         byte, the address of DSKIO in the interface ROM, RET. The boot sector
+         loads its program with CALL 0xFFA7 and the standard DSKIO registers.
+       A real ROM (cart_is_disk_rom) writes both itself. *)
+    if not t.cart_is_disk_rom then begin
+      let drvtbl = 0xfb21 and h_phyd = 0xffa7 in
+      mem_write t drvtbl 1;
+      mem_write t (drvtbl + 1) 0x02;
+      List.iteri
+        (fun i b -> mem_write t (h_phyd + i) b)
+        [ 0xf7; 0x02; disk_dskio_entry land 0xff; disk_dskio_entry lsr 8; 0xc9 ]
+    end;
     t.rst30_pending <- [];
     (* KEYBUF 에 스페이스 하나를 미리 넣어둔다 — 룬마스터 1 의 커널은
        워밍업 재생 구간(720 프레임) 안에서 CONIN 을 부르고(실측 ≈409) 빈
@@ -1496,6 +1540,15 @@ let disk_entry_pc = function
   | 0x4013 | 0x4016 | 0x4019 | 0x401c | 0x401f -> true
   | _ -> false
 
+(* True while the byte the CPU would fetch at [addr] is still a power-on fill
+   (0x00 or 0xFF), i.e. nothing was ever planted there. A program that owns
+   page 0 and runs its own code across a BIOS vector address (Europa Sensen's
+   bootstrap executes LD BC,0080 at 0x0156) is not calling the BIOS; its
+   bytes there are not a fill. *)
+let page0_byte_untouched t addr =
+  let b = mem_read t addr in
+  b = 0x00 || b = 0xff
+
 (* RST 30h 트램펄린 — 실기의 디스크 ROM 이 0x0030 에 깔아 두던 인터슬롯
    핸들러 대역. RST 30h 가 push 한 반환주소는 서술자(slot 1 + 주소 2)를
    가리킨다: 서술자를 읽고, 그 자리에 서술자 건너뛴 복귀 주소를 심은 뒤
@@ -1521,6 +1574,32 @@ let serve_rst30 t =
   t.ppi_a <-
     (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
   addr
+
+(* A slot id as RDSLT, WRSLT, CALSLT and ENASLT take it: bits 1..0 the primary
+   slot, and for an expanded slot 3 bit 7 set with bits 3..2 the sub-slot.
+   Slot 0 is not recognised: 0x00 is also what a stream read passes in A. *)
+let is_slot_id a = a >= 1 && (a land 0x80 <> 0 || a land 3 <> 0)
+
+(* Runs [f] with the page holding [addr] showing the slot [slot] names, then
+   puts the slot registers back. *)
+let with_slot_view t ~slot ~addr f =
+  let shift = ((addr lsr 14) land 3) * 2 in
+  let primary = slot land 3 and sub = (slot lsr 2) land 3 in
+  let saved_ppi = t.ppi_a and saved_sl3 = t.slot3_sel in
+  t.ppi_a <- (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor (primary lsl shift);
+  if primary = 3 then
+    t.slot3_sel <- (t.slot3_sel land lnot (3 lsl shift)) lor (sub lsl shift);
+  let r = f () in
+  t.ppi_a <- saved_ppi;
+  t.slot3_sel <- saved_sl3;
+  r
+
+(* Returns from a vector served in OCaml: pops the return address. *)
+let return_from_vector t =
+  let sp = Z80.dump_sp t.cpu in
+  let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+  Z80.set_sp t.cpu ((sp + 2) land 0xffff);
+  Z80.set_pc t.cpu ret
 
 (* CALSLT (BIOS 0x001C) served in OCaml for the warm-up replay, where page 0
    is RAM and the real BIOS entry is not visible. Contract per the C-BIOS
@@ -1550,6 +1629,27 @@ let serve_calslt t =
   end;
   target
 
+(* ENASLT (BIOS 0x0024) served in OCaml for a caller of the warm-up replay
+   that expects the BIOS in page 0 (#147). A = slot id (0x80 | sub << 2 |
+   primary), H = an address in the page to switch. The primary slot is
+   written to that page's field of 0xA8 and, for an expanded slot 3, the
+   sub-slot to the page's field of 0xFFFF. Unlike an RST 30h call nothing is
+   restored on return: the slot change is ENASLT's whole effect. *)
+let serve_enaslt t =
+  let cpu = t.cpu in
+  let slot = Z80.dump_a cpu in
+  let page = (Z80.dump_hl cpu lsr 14) land 3 in
+  let shift = page * 2 in
+  let sp = Z80.dump_sp cpu in
+  let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+  Z80.set_sp cpu ((sp + 2) land 0xffff);
+  t.ppi_a <-
+    (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
+  if slot land 0x80 <> 0 && slot land 3 = 3 && page <> 3 then
+    t.slot3_sel <-
+      (t.slot3_sel land lnot (3 lsl shift)) lor (((slot lsr 2) land 3) lsl shift);
+  ret
+
 (* Serviced in the step loop before the opcode at [pc] runs. Returns true when
    [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
 let disk_trap t pc =
@@ -1564,10 +1664,36 @@ let disk_trap t pc =
     Z80.set_pc t.cpu (serve_rst30 t);
     true
   end
+  else if pc = 0x0024 && t.ppi_a land 3 = 3 && mem_read t 0x0024 = 0xff then begin
+    (* ENASLT, only while nothing was ever planted at the vector. A kernel that
+       owns page 0 (Sangokushi II) writes its own routine there and runs it
+       (enaslt_ram_call_test); an untouched vector still holds the power-on
+       fill, a RST 38h that would recurse forever. Europa Sensen's loader
+       calls ENASLT(0, page 0) expecting the BIOS back in page 0. *)
+    Z80.set_pc t.cpu (serve_enaslt t);
+    true
+  end
   else if pc = 0x001c && t.ppi_a land 3 = 3 then begin
     (* CALSLT: only reachable through empty page-0 RAM (the warm-up replay),
        never from real BIOS -- there page 0 is ROM and 0x001C runs natively. *)
     Z80.set_pc t.cpu (serve_calslt t);
+    true
+  end
+  else if pc = 0x0014 && t.ppi_a land 3 = 3 && is_slot_id (Z80.dump_a t.cpu) then begin
+    (* WRSLT: A = slot id, HL = address, E = byte. Rune Master 1's slot scan
+       (c5ab, run before it loads its own kernel) tests every slot for RAM
+       by writing the complement of what it read and reading it back, through
+       CALL 0x000C / 0x0014. On the real machine page 0 is RAM then, and
+       those two vectors are RDSLT and WRSLT copies the disk ROM's DOS
+       kernel put there (openMSX: the writes at 0x0C and 0x14 come from
+       pc 0x5A91 in the disk ROM). Slot 3-2 passes the test at 0x0000,
+       0x1000, 0x2000 and 0x3000; the scan records it in c702..c705. A scan
+       that finds no RAM leaves the page-1 slot at 0 and the kernel leaves
+       for BASIC, which C-BIOS does not have: the boot restarts in a loop. *)
+    let slot = Z80.dump_a t.cpu and hl = Z80.dump_hl t.cpu in
+    let e = Z80.dump_de t.cpu land 0xff in
+    with_slot_view t ~slot ~addr:hl (fun () -> mem_write t hl e);
+    return_from_vector t;
     true
   end
   else if pc = 0x000c && t.ppi_a land 3 = 3 then begin
@@ -1590,67 +1716,16 @@ let disk_trap t pc =
        HL,BC / LD (0xC70A),HL -- and C709 is (re)computed per call from
        the caller's C (LD A,1 / CP C / JR C,+1 / LD A,C / LD (0xC709),A):
        1 when C>1, else C). Without the advance every call returns the
-       same byte, and the loader's slot probe -- a scan for four
-       consecutive complement pairs (byte2 = ~byte1, at c611) read through
-       raw CALL 0x000C -- can never match, so all 16 probes fail and the
-       kernel reboots in a ~270-frame loop (Rune Master 1 observed). *)
+       same byte. *)
     let off = mem_read t 0xc70a lor (mem_read t 0xc70b lsl 8) in
     let slot_probe = Z80.dump_a t.cpu in
-    if slot_probe >= 1 && (slot_probe land 0x80 <> 0 || slot_probe land 3 <> 0) then begin
-      (* The slot-probe face of the vector: the scanner (c611) calls with
-         A = the candidate slot id (c5f1's 0x80|sub<<2|primary) and HL = the
-         page base, and reads (base + offset) through THAT slot's view --
-         the real c1f5 saves A to C714 (c1bc) and its deep path reads the
-         probed slot, not the DTA. The pairs must be consecutive (the c70A
-         advance) so the complement scan can see fresh RAM's 00 FF
-         pattern. Reading a foreign view: point the page's PPI bits at the
-         primary slot (and slot3's sub-selector) for one read, then
-         restore. *)
+    if is_slot_id slot_probe then begin
+      (* RDSLT: A = slot id, HL = address; the byte comes back in A. The
+         other half of the slot scan WRSLT (0x0014) describes. *)
       let hl = Z80.dump_hl t.cpu in
-      let page = (hl lsr 14) land 3 in
-      let shift = page * 2 in
-      let primary = slot_probe land 3 in
-      let sub = (slot_probe lsr 2) land 3 in
-      let saved_ppi = t.ppi_a and saved_sl3 = t.slot3_sel in
-      let v =
-        if primary = 3 && sub = 2 && Bytes.length t.disk > 0 then
-          (* Reading through the disk interface's own slot: the real
-             vector's deep path (c38f/c3e5/c535 after the c1bc context
-             save) reaches the FDC's data path, not this slot's ROM bytes.
-             The loader's stream position -- the DTA buffer at the c70A
-             offset -- is the closest observable equivalent. The remaining
-             divergence (the c611 complement-pair scan reads kernel
-             scratch here, so all 16 probes fail and the kernel reboots
-             in a ~270-frame loop) is the FDC byte-pump protocol of the
-             real NMS8250 disk ROM: unobservable without that ROM, and
-             C-BIOS's own disk ROM cannot boot this game at all (openMSX
-             21 + cbios_disk.rom falls back to the BASIC screen -- no
-             reference run exists). Diagnostic note: forcing a complement
-             pair here (00/ff by offset parity) unlocks the game past the
-             probe -- it then runs its bytecode VM at 0x74xx with a blank
-             screen, waiting on data conditions -- so this serving is the
-             only blocker, not a structural one. *)
-          mem_read t ((t.disk_dma + off) land 0xffff)
-        else begin
-          t.ppi_a <-
-            (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor (primary lsl shift);
-          if primary = 3 then
-            t.slot3_sel <-
-              (t.slot3_sel land lnot (3 lsl shift))
-              lor (sub lsl shift);
-          let b = mem_read t ((hl + off) land 0xffff) in
-          t.ppi_a <- saved_ppi;
-          t.slot3_sel <- saved_sl3;
-          b
-        end
-      in
-      mem_write t 0xc70a ((off + 1) land 0xff);
-      mem_write t 0xc70b (((off + 1) lsr 8) land 0xff);
+      let v = with_slot_view t ~slot:slot_probe ~addr:hl (fun () -> mem_read t hl) in
       Z80.set_af t.cpu ((v lsl 8) lor Z80.dump_f t.cpu);
-      let sp = Z80.dump_sp t.cpu in
-      let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
-      Z80.set_sp t.cpu ((sp + 2) land 0xffff);
-      Z80.set_pc t.cpu ret;
+      return_from_vector t;
       true
     end
     else begin
@@ -1682,7 +1757,8 @@ let disk_trap t pc =
   else if t.ppi_a land 3 = 3
           && (match pc with
               | 0x009c | 0x009f | 0x00a2 | 0x0156 | 0x00d5 | 0x00d8 | 0x0141 -> true
-              | _ -> false) then begin
+              | _ -> false)
+          && page0_byte_untouched t pc then begin
     (* BIOS fixed-page-0 vectors -- CHSNS 0x009C, CHGET 0x009F, CHPUT 0x00A2,
        and 0x0156 (task-1564): some disk kernels call them with a plain CALL
        instead of CALSLT/RST 30h, assuming page 0 still shows BIOS.
@@ -1700,10 +1776,13 @@ let disk_trap t pc =
        30h's inline descriptor, a plain CALL needs no target/slot to parse,
        so this just flips ppi_a and lets the step loop fetch the real BIOS
        opcode that is now at [pc] in the same cycle (no set_pc, no synthetic
-       18 T-states). No byte-guard on the RAM content: a power-on pattern
-       byte at the vector is not an installed vector -- it is exactly the
-       broken shape this trap exists for, and with page 0 deliberately
-       mapped to RAM, a plain CALL to a fixed BIOS vector has one meaning.
+       18 T-states). The one guard on the RAM content is that the byte at the
+       vector is still a power-on fill ([page0_byte_untouched]): a fill byte
+       is not an installed vector -- it is exactly the broken shape this trap
+       exists for, and with page 0 deliberately mapped to RAM, a plain CALL to
+       a fixed BIOS vector then has one meaning. Any other byte is the
+       program's own code (Europa Sensen's bootstrap runs through 0x0156 as
+       straight-line code), and it keeps running.
 
        SNSMAT 0x0141, GTSTCK 0x00D5 and GTTRIG 0x00D8 (ocaml-msx#51) join the
        same list: all three are fixed page-0 entries, and together they are the
@@ -2026,20 +2105,6 @@ let disk_trap t pc =
           for i = 0 to n - 1 do
             mem_write t i (mem_read t ((t.disk_dma + i) land 0xffff))
           done;
-          (* This kernel hardcodes CALL 0x0014 (Rune Master's load loop at
-             c641 reads sectors through the 0x000C/0x0014 primitive pair),
-             but the 3-byte table's entries land on 0x0015 boundaries, so at
-             0x0014 the copied bytes read c3 c3 8c = JP 0x8CC3 -- empty RAM.
-             A real boot's page 0 also carries the 8-byte-spaced vector set
-             (0x000C/0x0014/0x001C/0x0024, the MSX-DOS layout) alongside
-             this table, and the entry 0x0014 must reach is the table's
-             0x0015 one (Rune Master: JP 0xC38C, its DSKRST + SETDTA(0xC728)
-             wrapper -- itself real code already loaded at 0xC38C). Plant it
-             one byte early. Rune Master II's boot never calls 0x0014, so
-             this is inert there. *)
-          mem_write t 0x0014 (mem_read t ((t.disk_dma + 0x15) land 0xffff));
-          mem_write t 0x0015 (mem_read t ((t.disk_dma + 0x16) land 0xffff));
-          mem_write t 0x0016 (mem_read t ((t.disk_dma + 0x17) land 0xffff))
         end;
         0x00
       | 0x27 -> (
@@ -2118,11 +2183,12 @@ let trap_cycles = 18
 
 let step t ~frames =
   for _ = 1 to frames do
-    (* Frame N ends at CPU T-state N * cycles_per_frame: the cycles the last
+    (* A frame ends where the VDP's frame does: the cycles the last
        instruction ran past the boundary come off the next frame, so N
-       frames are N * 59736 cycles and not N * (59736 + overshoot). Both
-       counts are in the save state. *)
-    let frame_end = (t.frames + 1) * cycles_per_frame in
+       frames are N * 59736 cycles (71364 each while R#9 bit 1 is set, PAL)
+       and not N * (59736 + overshoot). The CPU T-state count and the VDP
+       position are both in the save state. *)
+    let frame_end = Z80.t_states t.cpu + Vdp.cycles_to_frame_end t.vdp in
     while Z80.t_states t.cpu < frame_end do
       (* 인터럽트 선은 VDP 만: NMS8250(PhilipsFDC) 의 WD2793 INTRQ/DRQ 는
          Z80 인터럽트 선에 연결되지 않는다(openMSX PhilipsFDC 정본 주석:
@@ -2136,7 +2202,10 @@ let step t ~frames =
       let irq_used = if Vdp.int_active t.vdp then Z80.interrupt t.cpu else 0 in
       (* The acknowledge comes before the instruction: port cycles count
          from the instruction start. *)
-      if irq_used > 0 then ignore (Vdp.advance t.vdp ~cycles:irq_used);
+      if irq_used > 0 then begin
+        Vdp.interrupt_accepted t.vdp;
+        ignore (Vdp.advance t.vdp ~cycles:irq_used)
+      end;
       let pc0 = Z80.dump_pc t.cpu in
       (match !trace_from with
        | Some (target, n) when pc0 = target && !trace_remaining = 0 ->
@@ -2293,10 +2362,10 @@ let frame_rgb t = Vdp.frame_rgb t.vdp
 
 let mapper_code = function
   | Flat -> 0 | Konami -> 1 | Konami_scc -> 2 | Ascii8 -> 3 | Ascii16 -> 4 | Ascii8_sram -> 5
-  | Ram64 -> 6
+  | Ram64 -> 6 | Neo8 -> 7 | Neo16 -> 8
 let mapper_of_code = function
   | 0 -> Flat | 1 -> Konami | 2 -> Konami_scc | 3 -> Ascii8 | 4 -> Ascii16 | 5 -> Ascii8_sram
-  | 6 -> Ram64
+  | 6 -> Ram64 | 7 -> Neo8 | 8 -> Neo16
   | _ -> State_codec.fail "invalid cartridge mapper"
 
 let serialize t =
@@ -2305,7 +2374,7 @@ let serialize t =
   List.iter (State_codec.put_bytes w)
     [t.ram; t.main_rom; t.logo_rom; t.sub_rom; t.cart; t.cart_sram; t.disk];
   State_codec.put_int w (mapper_code t.cart_mapper);
-  State_codec.put_int_array w t.cart_banks;
+  State_codec.put_int_array w (Array.sub t.cart_banks 0 4);
   State_codec.put_int_array w t.mapper;
   State_codec.put_int_array w t.psg;
   Array.iter (State_codec.put_bool w) t.keys;
@@ -2371,6 +2440,12 @@ let serialize t =
      tick. It follows the CPU state because the tick is a point on the CPU
      clock and is checked against it on restore. *)
   Rtc.write_clock w t.rtc;
+  (* v7: the NEO bank registers of the regions at 0x8000-0x9FFF and 0xA000-0xBFFF
+     ([cart_banks] 4 and 5; 0-3 sit in their v6 place), appended after
+     everything v6 had. *)
+  State_codec.put_int w t.cart_banks.(4);
+  State_codec.put_int w t.cart_banks.(5);
+  Vdp.write_search_state w t.vdp;
   State_codec.finish w
 
 let restore_with_reader reader state =
@@ -2393,10 +2468,10 @@ let restore_with_reader reader state =
     if sram_size <> 0 && (sram_size mod 8192 <> 0 || sram_size land (sram_size - 1) <> 0) then
       State_codec.fail "invalid cartridge SRAM size";
     t.disk <- State_codec.get_bytes r;
-    t.cart_mapper <- mapper_of_code (State_codec.get_int r ~min:0 ~max:6);
+    t.cart_mapper <- mapper_of_code (State_codec.get_int r ~min:0 ~max:8);
     if t.cart_mapper = Ram64 && Bytes.length t.cart <> ram_cart_bytes then
       State_codec.fail "invalid RAM cartridge size";
-    State_codec.fill_int_array r ~min:0 ~max:255 t.cart_banks;
+    for i = 0 to 3 do t.cart_banks.(i) <- State_codec.get_int r ~min:0 ~max:neo_bank_max done;
     State_codec.fill_int_array r ~min:0 ~max:63 t.mapper;
     State_codec.fill_int_array r ~min:0 ~max:255 t.psg;
     Array.iteri (fun i _ -> t.keys.(i) <- State_codec.get_bool r) t.keys;
@@ -2474,8 +2549,11 @@ let restore_with_reader reader state =
       t.cassette <- Some (Cassette.resume tape ~position ~cycle:(Z80.t_states t.cpu))
     end;
     let cycle = Z80.t_states t.cpu in
-    if State_codec.version r >= 6 then Rtc.read_clock r t.rtc ~cycle
-    else Rtc.start_clock t.rtc ~cycle;
+    (if State_codec.version r >= 6 then Rtc.read_clock r t.rtc ~cycle
+     else Rtc.start_clock t.rtc ~cycle);
+    if State_codec.version r >= 7 then
+      for i = 4 to 5 do t.cart_banks.(i) <- State_codec.get_int r ~min:0 ~max:neo_bank_max done;
+    if State_codec.version r >= 8 then Vdp.read_search_state r t.vdp;
     State_codec.end_of_input r;
     Ok t
   with State_codec.Invalid_state message -> Error message

@@ -15,21 +15,38 @@ val io_read : t -> port:int -> int
 (** 0x98 VRAM 읽기(버퍼) / 0x99 status0 — 읽으면 VBlank 비트와
     인터럽트 요청이 지워진다. *)
 
+val interrupt_accepted : t -> unit
+(** CPU 가 VBlank 인터럽트를 받은 시점에 상태 레지스터 선택(R#15)을 0 으로
+    되돌린다. 받지 못한 VBlank(DI 구간)는 선택을 건드리지 않는다. *)
+
 val advance : t -> cycles:int -> bool
-(** 경과 T-state 만큼 스캔라인을 진행한다. VBlank 시작(라인 192)에서
-    반환값이 [true] 가 되고 인터럽트 요청이 걸린다 — 호출자는 Z80 에
-    INT 를 걸고, 스크린 표시 기간 동안엔 이 신호가 유지된다. *)
+(** 경과 T-state 만큼 스캔라인을 진행한다. VBlank 시작(라인 192)과 줄
+    인터럽트(IE1 이 켜졌을 때 R#19 - R#23 줄의 214 사이클, 글자 모드는 203)
+    에서 반환값이 [true] 가 되고 인터럽트 요청이 걸린다 — 호출자는 Z80 에
+    INT 를 걸고, 스크린 표시 기간 동안엔 이 신호가 유지된다. 표시 줄마다 그
+    줄의 표시가 시작되는 사이클(43, 글자 모드 49)에 레지스터와 팔레트를 잡아
+    둔다 — {!frame_rgb} 가 줄마다 그 값으로 그린다. *)
+
+val is_pal : t -> bool
+(** 지금 프레임이 PAL(313줄, R#9 bit1)인가. 프레임이 시작될 때 R#9 의 값을
+    읽어 두므로 프레임 중간에 R#9 를 바꿔도 다음 프레임부터 바뀐다. *)
+
+val cycles_to_frame_end : t -> int
+(** 지금 프레임이 끝날 때까지 남은 사이클. *)
 
 val int_active : t -> bool
 (** 인터럽트 라인 상태 — IE 가 켜져 있고 status0 비트7 이 서 있는 동안. *)
 
 val frame_dims : t -> int * int
 (** Bitmap modes retain native width (SCREEN6/7: 512, SCREEN5/8: 256)
-    and R#9 LN selects 192 or 212 visible lines. *)
+    and R#9 LN selects 192 or 212 visible lines. TEXT2 is 512 wide with the
+    same LN rule; the other modes are 256x192. *)
 
 val frame_rgb : t -> string
 (** 현재 VRAM 을 {!frame_dims} RGB (row-major, 채널 R,G,B) 로 렌더.
-    BLANK(R1 bit6) 꺼짐이면 검은 화면. *)
+    레지스터와 팔레트는 줄마다 {!advance} 가 잡아 둔 값이다(한 번도 잡히지
+    않았으면 지금 값). 모드와 크기는 첫 줄의 값을 따른다. 상태를 복원하면
+    모든 줄이 지금 값이다. BLANK(R1 bit6) 꺼짐이면 검은 화면. *)
 
 val vram : t -> Bytes.t
 (** VRAM 원본 — 하네스 검사용. *)
@@ -81,3 +98,6 @@ val vram_read : t -> int -> int
 val write_state : State_codec.writer -> t -> unit
 
 val read_state : State_codec.reader -> t -> unit
+
+val write_search_state : State_codec.writer -> t -> unit
+val read_search_state : State_codec.reader -> t -> unit

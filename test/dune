@@ -4,6 +4,46 @@
  (libraries vdpcore))
 
 (test
+ (name screen4_test)
+ (modules screen4_test)
+ (libraries vdpcore))
+
+(test
+ (name sprite_flags_test)
+ (modules sprite_flags_test)
+ (libraries vdpcore))
+
+(test
+ (name g7_sprite_test)
+ (modules g7_sprite_test)
+ (libraries vdpcore))
+
+(test
+ (name g5_sprite_test)
+ (modules g5_sprite_test)
+ (libraries vdpcore))
+
+(test
+ (name multicolor_test)
+ (modules multicolor_test)
+ (libraries vdpcore))
+
+(test
+ (name vdp_sprite_mode2_test)
+ (modules vdp_sprite_mode2_test)
+ (libraries vdpcore))
+
+(test
+ (name vdp_vertical_scroll_test)
+ (modules vdp_vertical_scroll_test)
+ (libraries vdpcore))
+
+(test
+ (name vdp_line_state_test)
+ (modules vdp_line_state_test)
+ (libraries vdpcore))
+
+(test
  (name keyboard_test)
  (modules keyboard_test)
  (libraries msx))
@@ -11,6 +51,11 @@
 (test
  (name g2_test)
  (modules g2_test)
+ (libraries vdpcore))
+
+(test
+ (name text1_test)
+ (modules text1_test)
  (libraries vdpcore))
 
 (test
@@ -41,6 +86,11 @@
 (test
  (name disk_test)
  (modules disk_test)
+ (libraries msx))
+
+(test
+ (name disk_drvtbl_test)
+ (modules disk_drvtbl_test)
  (libraries msx))
 
 (test
@@ -94,6 +144,11 @@
  (libraries msx))
 
 (test
+ (name page0_own_code_vector_test)
+ (modules page0_own_code_vector_test)
+ (libraries msx))
+
+(test
  (name direction_hle_call_test)
  (modules direction_hle_call_test)
  (libraries msx))
@@ -109,8 +164,18 @@
  (libraries msx))
 
 (test
+ (name enaslt_untouched_vector_test)
+ (modules enaslt_untouched_vector_test)
+ (libraries msx))
+
+(test
  (name ram_power_on_test)
  (modules ram_power_on_test)
+ (libraries msx))
+
+(test
+ (name slot_rdslt_wrslt_test)
+ (modules slot_rdslt_wrslt_test)
  (libraries msx))
 
 (test
@@ -142,6 +207,11 @@
 (test
  (name frame_clock_test)
  (modules frame_clock_test)
+ (libraries msx))
+
+(test
+ (name pal_frame_test)
+ (modules pal_frame_test)
  (libraries msx))
 
 (test
@@ -184,3 +254,8 @@
  (name rtc_port_test)
  (modules rtc_port_test)
  (libraries msx))
+
+(test
+ (name text2_test)
+ (modules text2_test)
+ (libraries vdpcore))
