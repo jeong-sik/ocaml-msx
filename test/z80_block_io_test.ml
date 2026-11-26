@@ -28,7 +28,7 @@ let poke a bs = String.iteri (fun i c -> Bytes.set ram (a + i) c) bs
 (* Run one ED-prefixed block instruction [op] at 0x0100. *)
 let run ~op ~af ~bc ~hl =
   poke 0x0100 (Printf.sprintf "\xed%c" (Char.chr op));
-  let z = Z80.create ~m1_wait:0 ~read ~write ~port_in:pin ~port_out:pout in
+  let z = Z80.create ~m1_wait:0 ~read:(fun ~at:_ -> read) ~write:(fun ~at:_ -> write) ~port_in:pin ~port_out:pout in
   Z80.set_pc z 0x0100;
   Z80.set_af z af;
   Z80.set_bc z bc;
@@ -75,7 +75,7 @@ let () =
   (* OTIR repeats until B = 0; the last round leaves k = 0 + 0x03 and Z. *)
   Bytes.fill ram 0x9000 3 '\000';
   poke 0x0100 "\xed\xb3";
-  let z = Z80.create ~m1_wait:0 ~read ~write ~port_in:pin ~port_out:pout in
+  let z = Z80.create ~m1_wait:0 ~read:(fun ~at:_ -> read) ~write:(fun ~at:_ -> write) ~port_in:pin ~port_out:pout in
   Z80.set_pc z 0x0100;
   Z80.set_af z 0x0000;
   Z80.set_bc z 0x0398;

@@ -18,7 +18,7 @@ let () =
   (* 0x0000: EXX, EX AF,AF'. *)
   Bytes.set ram 0 '\xd9';
   Bytes.set ram 1 '\x08';
-  let z = Z80.create ~m1_wait:0 ~read ~write ~port_in:(fun ~at:_ _ -> 0xff) ~port_out:(fun ~at:_ _ _ -> ()) in
+  let z = Z80.create ~m1_wait:0 ~read:(fun ~at:_ -> read) ~write:(fun ~at:_ -> write) ~port_in:(fun ~at:_ _ -> 0xff) ~port_out:(fun ~at:_ _ _ -> ()) in
   check "PC starts at 0" (Z80.dump_pc z = 0);
   check "SP is 0xFFFF" (Z80.dump_sp z = 0xffff);
   check "AF is 0xFFFF" (Z80.dump_a z = 0xff && Z80.dump_f z = 0xff);

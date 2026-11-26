@@ -32,7 +32,7 @@ let flags_after ?(port = 0xff) ~a ~f (code, instructions) =
   Bytes.fill ram 0 0x10000 '\000';
   let prologue = [ 0x31; 0x00; 0xf0; 0x01; f; a; 0xc5; 0xf1 ] in
   List.iteri (fun i b -> write i b) (prologue @ code);
-  let z = Z80.create ~m1_wait:0 ~read ~write ~port_in:(fun ~at:_ _ -> port) ~port_out:(fun ~at:_ _ _ -> ()) in
+  let z = Z80.create ~m1_wait:0 ~read:(fun ~at:_ -> read) ~write:(fun ~at:_ -> write) ~port_in:(fun ~at:_ _ -> port) ~port_out:(fun ~at:_ _ _ -> ()) in
   for _ = 1 to 4 + instructions do ignore (Z80.step z) done;
   Z80.dump_f z
 

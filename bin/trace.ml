@@ -26,7 +26,7 @@ let () =
   close_in ic;
   String.iteri (fun i c -> Bytes.set mem (0x100 + i) c) s;
   let z =
-    Z80.create ~m1_wait:0 ~read:mem_read ~write:mem_write
+    Z80.create ~m1_wait:0 ~read:(fun ~at:_ a -> mem_read a) ~write:(fun ~at:_ a v -> mem_write a v)
       ~port_in:(fun ~at:_ _ -> 0xff)
       ~port_out:(fun ~at:_ _ _ -> ())
   in
