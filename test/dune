@@ -154,6 +154,11 @@
  (libraries msx))
 
 (test
+ (name enaslt_untouched_vector_test)
+ (modules enaslt_untouched_vector_test)
+ (libraries msx))
+
+(test
  (name ram_power_on_test)
  (modules ram_power_on_test)
  (libraries msx))

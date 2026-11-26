@@ -1594,6 +1594,27 @@ let serve_calslt t =
   end;
   target
 
+(* ENASLT (BIOS 0x0024) served in OCaml for a caller of the warm-up replay
+   that expects the BIOS in page 0 (#147). A = slot id (0x80 | sub << 2 |
+   primary), H = an address in the page to switch. The primary slot is
+   written to that page's field of 0xA8 and, for an expanded slot 3, the
+   sub-slot to the page's field of 0xFFFF. Unlike an RST 30h call nothing is
+   restored on return: the slot change is ENASLT's whole effect. *)
+let serve_enaslt t =
+  let cpu = t.cpu in
+  let slot = Z80.dump_a cpu in
+  let page = (Z80.dump_hl cpu lsr 14) land 3 in
+  let shift = page * 2 in
+  let sp = Z80.dump_sp cpu in
+  let ret = mem_read t sp lor (mem_read t ((sp + 1) land 0xffff) lsl 8) in
+  Z80.set_sp cpu ((sp + 2) land 0xffff);
+  t.ppi_a <-
+    (t.ppi_a land (lnot (3 lsl shift) land 0xff)) lor ((slot land 3) lsl shift);
+  if slot land 0x80 <> 0 && slot land 3 = 3 && page <> 3 then
+    t.slot3_sel <-
+      (t.slot3_sel land lnot (3 lsl shift)) lor (((slot lsr 2) land 3) lsl shift);
+  ret
+
 (* Serviced in the step loop before the opcode at [pc] runs. Returns true when
    [pc] is a disk BIOS entry the trap handled (moving the CPU state on). *)
 let disk_trap t pc =
@@ -1606,6 +1627,15 @@ let disk_trap t pc =
   if Bytes.length t.disk = 0 || not t.hle_disk then false
   else if pc = disk_rst30_entry && t.ppi_a land 3 = 3 then begin
     Z80.set_pc t.cpu (serve_rst30 t);
+    true
+  end
+  else if pc = 0x0024 && t.ppi_a land 3 = 3 && mem_read t 0x0024 = 0xff then begin
+    (* ENASLT, only while nothing was ever planted at the vector. A kernel that
+       owns page 0 (Sangokushi II) writes its own routine there and runs it
+       (enaslt_ram_call_test); an untouched vector still holds the power-on
+       fill, a RST 38h that would recurse forever. Europa Sensen's loader
+       calls ENASLT(0, page 0) expecting the BIOS back in page 0. *)
+    Z80.set_pc t.cpu (serve_enaslt t);
     true
   end
   else if pc = 0x001c && t.ppi_a land 3 = 3 then begin
