@@ -20,7 +20,7 @@ let rejection name expected state =
 (* Recompute the envelope after payload edits: these cases must reach the
    decoder, rather than merely fail the corruption checksum. *)
 let edit_payload state edit =
-  let magic = "OCAML-MSX\000\007" in
+  let magic = "OCAML-MSX\000\008" in
   let offset = String.length magic + 16 in
   let payload = String.sub state offset (String.length state - offset) |> edit in
   magic ^ Digest.string payload ^ payload
@@ -164,16 +164,23 @@ let () =
   Msx.mem_write copy 0x6000 6;
   Msx.mem_write copy 0x5000 7;
   check "NEO8 bank registers do not alias the original" (seg t 0x4000 = 0x105 && seg t 0x0000 = 9);
-  (* A format 6 state ends before the NEO registers: it restores, and the
-     machine saves back as the same bytes it had before. *)
-  let plain = fresh () in
-  let s7 = Msx.serialize plain in
-  let head = String.length "OCAML-MSX\000\007" in
-  let payload6 = String.sub s7 (head + 16) (String.length s7 - head - 16 - 16) in
-  let s6 = "OCAML-MSX\000\006" ^ Digest.string payload6 ^ payload6 in
-  (match Msx.restore ~state:s6 with
-   | Ok m -> check "a format 6 state restores" (Msx.serialize m = s7)
-   | Error e -> failwith ("format 6 state: " ^ e));
+  (* The older payloads end before the fields added by later formats. *)
+  let check_legacy version added_bytes machine =
+    let current = Msx.serialize machine in
+    let header_size = String.length "OCAML-MSX\000\008" + 16 in
+    let payload =
+      String.sub current header_size (String.length current - header_size - added_bytes)
+    in
+    let state = "OCAML-MSX\000" ^ String.make 1 (Char.chr version)
+      ^ Digest.string payload ^ payload in
+    match Msx.restore ~state with
+    | Ok m ->
+        check (Printf.sprintf "a format %d state restores" version)
+          (Msx.serialize m = current)
+    | Error e -> failwith e
+  in
+  check_legacy 6 25 (fresh ());
+  check_legacy 7 9 t;
   let t = fresh () in
   Msx.load_disk ~interface_rom:false t (String.init 737280 (fun i -> Char.chr (i land 255)));
   same "mounted disk bytes restored" t (restored t);

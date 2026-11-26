@@ -44,6 +44,10 @@ type t = {
   mutable tx_dy : int;
   mutable tx_ny : int;
   mutable cmd_tr : bool;
+  (* SRCH 가 경계를 찾으면 서고 S#9 를 읽으면 내려가는 S#2 bit4(BD), 그리고
+     S#8/S#9 가 돌려주는 마지막 SRCH 의 X(openMSX 의 ASX). *)
+  mutable cmd_bd : bool;
+  mutable srch_x : int;
   (* CMR 발행 전 R#44 쓰기 — 명령 시작 시 첫 픽셀로 소비된다
      (openMSX transfer 플래그는 명령 밖에서도 세운다). *)
   mutable tx_pending : bool;
@@ -110,6 +114,8 @@ let create () =
     tx_dy = 0;
     tx_ny = 0;
     cmd_tr = false;
+    cmd_bd = false;
+    srch_x = 0;
     tx_pending = false;
     wlog = Array.make 65536 (0, 0, 0);
     wlog_i = 0;
@@ -265,9 +271,64 @@ let clip_y ~reverse ~y ~ny =
   let n = if ny = 0 then 1024 else ny in
   if reverse then min n (y + 1) else n
 
+(* SRCH: (SX, SY) 에서 한 줄을 훑어 R#44 의 색과 같은 점(EQ=0) 또는 다른 점
+   (EQ=1)을 찾는다. 찾으면 BD 를 세운다. 줄 끝(X 가 폭을 넘거나 음수)에서
+   멈추면 BD 는 그대로다. 멈춘 X 는 S#8/S#9 로 읽힌다(openMSX
+   VDPCmdEngine::executeSrch). *)
+let srch t ~mxs ~arg ~sx ~sy =
+  let cl = t.regs.(44) land pixel_mask t in
+  let tx = if arg land 4 <> 0 then -1 else 1 in
+  let want_different = arg land 2 <> 0 in
+  let width = (bitmap_layout t).width in
+  let rec scan x =
+    if (point t mxs x sy = cl) <> want_different then begin
+      t.cmd_bd <- true;
+      x
+    end else
+      let x = x + tx in
+      if x land width <> 0 then x else scan x
+  in
+  t.srch_x <- scan sx
+
+(* LINE: NX 는 긴 변, NY 는 짧은 변이고 MAJ(ARG bit0)가 긴 변의 축(0 = X)이다.
+   브레젠험 오차 ASX 로 긴 변을 한 칸씩 가며 NX + 1 개를 찍는다
+   (openMSX VDPCmdEngine::executeLine, 실기로 확인한 종료 판정 순서). *)
+let line t ~mxd ~arg ~op ~dx ~dy =
+  let cl = t.regs.(44) land pixel_mask t in
+  let width = (bitmap_layout t).width in
+  let nx = reg16 t 40 41 and ny = reg_y t 42 43 in
+  let tx = if arg land 4 <> 0 then -1 else 1
+  and ty = if arg land 8 <> 0 then -1 else 1 in
+  let major_y = arg land 1 <> 0 in
+  (* ASX 는 32비트 부호 없는 값이라 NX = 0 이면 (0 - 1) 이 0xFFFFFFFF 가 된다. *)
+  let rec draw ~adx ~dy ~asx ~anx =
+    pset t mxd adx dy op cl;
+    let finished = anx = nx in
+    if not major_y then begin
+      let adx = adx + tx in
+      if finished || adx land width <> 0 then ()
+      else begin
+        let asx, dy, stop =
+          if asx < ny then (asx + nx, dy + ty, ty < 0 && dy + ty < 0)
+          else (asx, dy, false) in
+        if not stop then
+          draw ~adx ~dy ~asx:((asx - ny) land 1023) ~anx:(anx + 1)
+      end
+    end else begin
+      let dy = dy + ty in
+      if ty < 0 && dy < 0 then ()
+      else begin
+        let asx, adx = if asx < ny then (asx + nx, adx + tx) else (asx, adx) in
+        let asx = (asx - ny) land 1023 in
+        if finished || adx land width <> 0 then ()
+        else draw ~adx ~dy ~asx ~anx:(anx + 1)
+      end
+    end
+  in
+  draw ~adx:dx ~dy ~asx:(((nx - 1) land 0xffffffff) lsr 1) ~anx:0
+
 (* 블록 명령 실행 — 즉시 완료 (CE 는 관찰되지 않는다). CPU 동기 전송
-   (LMMC/HMMC) 은 R#44 쓰기 구동 transfer_byte 로, POINT/SRCH/LINE/
-   LMCM 은 아직 없다. *)
+   (LMMC/HMMC) 은 R#44 쓰기 구동 transfer_byte 로, LMCM 은 아직 없다. *)
 let exec_command t =
   let cmd = t.regs.(46) lsr 4 and op = t.regs.(46) land 15 in
   let arg = t.regs.(45) in
@@ -289,7 +350,10 @@ let exec_command t =
     if copy then min dest (clip_y ~reverse:reverse_y ~y:sy ~ny) else dest in
   let step_x n = (if reverse_x then -n else n) * (if byte then pixels_per_byte t else 1) in
   let step_y n = if reverse_y then -n else n in
-  if cmd = 5 then pset t mxd dx dy op t.regs.(44)
+  if cmd = 4 then t.regs.(44) <- point t mxs sx sy
+  else if cmd = 5 then pset t mxd dx dy op t.regs.(44)
+  else if cmd = 6 then srch t ~mxs ~arg ~sx ~sy
+  else if cmd = 7 then line t ~mxd ~arg ~op ~dx ~dy
   else if cmd = 8 || cmd = 9 || cmd = 0xc || cmd = 0xd || cmd = 0xe then
     for row = 0 to ny - 1 do
       for col = 0 to nx - 1 do
@@ -506,10 +570,16 @@ let io_read t ~port =
            lor (if t.cmd_tr || t.tx_active then 0x80 else 0)
            lor (if vertical_retrace t then 0x40 else 0)
            lor (if horizontal_retrace t then 0x20 else 0))
-          lor 0x1e
+          lor (if t.cmd_bd then 0x10 else 0)
+          lor 0x0e
         in
         if not t.tx_active then t.cmd_tr <- false;
         v
+      | 7 -> t.regs.(44)
+      | 8 -> t.srch_x land 0xff
+      | 9 ->
+        t.cmd_bd <- false;
+        ((t.srch_x lsr 8) land 1) lor 0xfe
       | _ -> 0xff
     in
     t.latch_first <- true;
@@ -983,8 +1053,11 @@ let write_state w t =
   State_codec.put_bool w t.tx_active;
   State_codec.put_bool w t.tx_hm;
   State_codec.put_bool w t.cmd_tr;
-  State_codec.put_bool w t.tx_pending;
-  ()
+  State_codec.put_bool w t.tx_pending
+
+let write_search_state w t =
+  State_codec.put_bool w t.cmd_bd;
+  State_codec.put_int w t.srch_x
 
 let read_state r t =
   State_codec.fill_int_array r ~min:0 ~max:255 t.regs;
@@ -1020,5 +1093,11 @@ let read_state r t =
   t.tx_hm <- State_codec.get_bool r;
   t.cmd_tr <- State_codec.get_bool r;
   t.tx_pending <- State_codec.get_bool r;
+  t.cmd_bd <- false;
+  t.srch_x <- 0;
   if t.tx_active && (t.tx_nx = 0 || t.tx_anx = 0 || t.tx_anx > t.tx_nx || t.tx_ny = 0) then
     State_codec.fail "invalid active VDP transfer"
+
+let read_search_state r t =
+  t.cmd_bd <- State_codec.get_bool r;
+  t.srch_x <- State_codec.get_int r ~min:(-1024) ~max:2047
