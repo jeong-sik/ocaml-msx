@@ -104,6 +104,11 @@
  (libraries vdpcore))
 
 (test
+ (name vdp_command_registers_test)
+ (modules vdp_command_registers_test)
+ (libraries vdpcore))
+
+(test
  (name state_test)
  (modules state_test)
  (libraries msx))
