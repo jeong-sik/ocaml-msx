@@ -207,9 +207,10 @@ let () =
   | Ok restored ->
     motor restored true;
     check "saved with the motor off" (levels restored 16 = original);
-    (* The tape position is followed only by the RTC clock (format 6: three
-       ints of 8 bytes); a restore takes it only up to the end of the tape. *)
-    let rtc_clock_bytes = 3 * 8 in
+    (* The tape position is followed only by the RTC clock (three ints of 8
+       bytes) and the two NEO bank registers (format 7); a restore takes it only
+       up to the end of the tape. *)
+    let rtc_clock_bytes = 5 * 8 in
     let forge position =
       let head = String.length "OCAML-MSX\000" + 1 in
       let payload =

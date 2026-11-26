@@ -27,12 +27,20 @@ val advance : t -> cycles:int -> bool
     줄의 표시가 시작되는 사이클(43, 글자 모드 49)에 레지스터와 팔레트를 잡아
     둔다 — {!frame_rgb} 가 줄마다 그 값으로 그린다. *)
 
+val is_pal : t -> bool
+(** 지금 프레임이 PAL(313줄, R#9 bit1)인가. 프레임이 시작될 때 R#9 의 값을
+    읽어 두므로 프레임 중간에 R#9 를 바꿔도 다음 프레임부터 바뀐다. *)
+
+val cycles_to_frame_end : t -> int
+(** 지금 프레임이 끝날 때까지 남은 사이클. *)
+
 val int_active : t -> bool
 (** 인터럽트 라인 상태 — IE 가 켜져 있고 status0 비트7 이 서 있는 동안. *)
 
 val frame_dims : t -> int * int
 (** Bitmap modes retain native width (SCREEN6/7: 512, SCREEN5/8: 256)
-    and R#9 LN selects 192 or 212 visible lines. *)
+    and R#9 LN selects 192 or 212 visible lines. TEXT2 is 512 wide with the
+    same LN rule; the other modes are 256x192. *)
 
 val frame_rgb : t -> string
 (** 현재 VRAM 을 {!frame_dims} RGB (row-major, 채널 R,G,B) 로 렌더.

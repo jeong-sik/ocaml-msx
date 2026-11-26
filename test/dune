@@ -54,6 +54,11 @@
  (libraries vdpcore))
 
 (test
+ (name text1_test)
+ (modules text1_test)
+ (libraries vdpcore))
+
+(test
  (name mode_test)
  (modules mode_test)
  (libraries msx))
@@ -81,6 +86,11 @@
 (test
  (name disk_test)
  (modules disk_test)
+ (libraries msx))
+
+(test
+ (name disk_drvtbl_test)
+ (modules disk_drvtbl_test)
  (libraries msx))
 
 (test
@@ -180,8 +190,18 @@
  (libraries msx))
 
 (test
+ (name pal_frame_test)
+ (modules pal_frame_test)
+ (libraries msx))
+
+(test
  (name vdp_reg_test)
  (modules vdp_reg_test)
+ (libraries vdpcore))
+
+(test
+ (name vdp_s2_retrace_test)
+ (modules vdp_s2_retrace_test)
  (libraries vdpcore))
 
 (test
@@ -214,3 +234,8 @@
  (name rtc_port_test)
  (modules rtc_port_test)
  (libraries msx))
+
+(test
+ (name text2_test)
+ (modules text2_test)
+ (libraries vdpcore))

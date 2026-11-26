@@ -21,6 +21,7 @@ type t = {
   mutable status1 : int;
   mutable line : int;
   mutable cycle_in_line : int;
+  mutable pal : bool;
   (* 표시 줄마다 그 줄의 표시가 시작될 때의 레지스터와 팔레트. 화면은 프레임
      끝의 값이 아니라 줄마다 이 값으로 그린다 (openMSX 는 레지스터 쓰기 시각
      까지의 픽셀을 옛 값으로 그린다). 줄 y 의 값은 line_regs.(y * reg_count ..)
@@ -53,7 +54,9 @@ type t = {
   mutable cmd_log : (int * int * int * int) list;
 }
 
-let lines_per_frame = 262
+let ntsc_lines = 262
+let pal_lines = 313
+let frame_lines t = if t.pal then pal_lines else ntsc_lines
 let cycles_per_line = 228
 let visible_lines t = if t.regs.(9) land 0x80 = 0 then 192 else 212
 
@@ -92,6 +95,7 @@ let create () =
     status1 = 0;
     line = 0;
     cycle_in_line = 0;
+    pal = false;
     line_regs = Array.make (max_snap_lines * reg_count) 0;
     line_pal = Array.make (max_snap_lines * 16) 0;
     line_seen = Array.make max_snap_lines false;
@@ -151,6 +155,37 @@ let display_mode t =
   | 0x01 -> Text1
   | 0x09 -> Text2
   | code -> Undefined code
+
+(* S#2 HR (bit 5) and VR (bit 6), after openMSX VDP.cc peekStatusReg case 2.
+   A line runs from one right border to the next in this model, so HR is the
+   first stretch of every line: openMSX getHR is 1 for HBLANK_LEN_GFX = 312
+   ticks after the right border, HBLANK_LEN_TXT = 404 in the text modes
+   (DisplayMode::isTextMode: TEXT1, TEXT2 and TEXT1Q, code 0x05, which
+   [display_mode] leaves Undefined). One Z80 cycle is 6 VDP ticks, so that is
+   52 and 67.3 cycles.
+
+   VR is 1 from the display end to one line before the next display start:
+   openMSX [ticksThisFrame < displayStart - TICKS_PER_LINE || ticksThisFrame
+   >= displayEnd]. Here it rises with S#0 F at the end of the last display
+   line and drops 48 cycles into the last line of the frame (1368 - 1282 +
+   202 = 288 ticks). openMSX raises it 48 cycles later than this model's F
+   (issue #63). *)
+let hr_cycles_graphic = 52
+let hr_cycles_text = 68
+let vr_fall_cycle = 48
+
+let text_timing t =
+  match display_mode t with
+  | Text1 | Text2 | Undefined 0x05 -> true
+  | Multicolor | Graphic1 | Graphic2 | Graphic3 | Graphic4 | Graphic5
+  | Graphic6 | Graphic7 | Undefined _ -> false
+
+let horizontal_retrace t =
+  t.cycle_in_line < (if text_timing t then hr_cycles_text else hr_cycles_graphic)
+
+let vertical_retrace t =
+  t.line >= visible_lines t
+  && not (t.line = frame_lines t - 1 && t.cycle_in_line >= vr_fall_cycle)
 
 let display_mode_to_string = function
   | Text1 -> "TEXT1"
@@ -468,8 +503,10 @@ let io_read t ~port =
            read next") — 완료 감지는 그다음 읽기부터 TR=0 && CE=0. *)
         let v =
           ((if t.cmd_ce then 1 else 0)
-           lor (if t.cmd_tr || t.tx_active then 0x80 else 0))
-          lor 0x7e
+           lor (if t.cmd_tr || t.tx_active then 0x80 else 0)
+           lor (if vertical_retrace t then 0x40 else 0)
+           lor (if horizontal_retrace t then 0x20 else 0))
+          lor 0x1e
         in
         if not t.tx_active then t.cmd_tr <- false;
         v
@@ -574,7 +611,10 @@ let advance t ~cycles =
       t.int_pending <- true;
       hit := true
     end;
-    if t.line >= lines_per_frame then t.line <- 0;
+    if t.line >= frame_lines t then begin
+      t.line <- 0;
+      t.pal <- t.regs.(9) land 0x02 <> 0
+    end;
     line_events ~from:0 ~upto:t.cycle_in_line
   done;
   !hit
@@ -598,6 +638,9 @@ let cmd_history t = List.rev t.cmd_log
 let regs t = t.regs
 let status0 t = t.status0
 let line_now t = (t.line, t.cycle_in_line)
+let is_pal t = t.pal
+let cycles_to_frame_end t =
+  ((frame_lines t - t.line) * cycles_per_line) - t.cycle_in_line
 
 let write_log t =
   let n = min t.wlog_i 65536 in
@@ -671,6 +714,7 @@ let dims_of t =
   match display_mode t with
   | Graphic4 | Graphic5 | Graphic6 | Graphic7 ->
       ((bitmap_layout t).width, if t.regs.(9) land 0x80 = 0 then 192 else 212)
+  | Text2 -> (512, if t.regs.(9) land 0x80 = 0 then 192 else 212)
   | _ -> (256, 192)
 
 (* 줄 [lo, hi) 를 t 의 레지스터·팔레트로 img 에 그린다. 모드·해상도는 호출자가
@@ -738,6 +782,35 @@ let render_lines t img ~w ~lo ~hi =
         | _ -> One
       in
       render_sprites t ~lo ~hi ~dot put_sprite
+    end
+    else if display_mode t = Text2 then begin
+      (* TEXT2: 80 columns of 6×8 cells in a 512-wide frame, 16px of R#7
+         background on each side. The name table is 80 bytes a row at
+         (R#2 bits 6-2) × 0x400; with LN (R#9 bit 7) the 212 lines show 26.5
+         rows, the last one cut. The blink colour table (R#3, R#10, R#12,
+         R#13) is not drawn. *)
+      let nt = (r.(2) land 0x7c) lsl 10 in
+      let pt = (r.(4) land 0x3f) lsl 11 in
+      let fg = (r.(7) lsr 4) land 0xf and bg = r.(7) land 0xf in
+      for y = lo to hi - 1 do
+        for x = 0 to 15 do put x y bg done;
+        for x = w - 16 to w - 1 do put x y bg done
+      done;
+      for row = lo / 8 to (hi - 1) / 8 do
+        for col = 0 to 79 do
+          let ch = vr (nt + row * 80 + col) in
+          for py = 0 to 7 do
+            let y = row * 8 + py in
+            if y >= lo && y < hi then begin
+              let pat = vr (pt + ch * 8 + ((py + r.(23)) land 7)) in
+              for px = 0 to 5 do
+                let x = 16 + col * 6 + px in
+                if (pat lsr (7 - px)) land 1 = 1 then put x y fg else put x y bg
+              done
+            end
+          done
+        done
+      done
     end
     else if mode_text t then begin
       (* TEXT1: 40×24, 6×8 셀 — 좌우 8px 는 R7 배경색. *)
@@ -893,7 +966,9 @@ let write_state w t =
   State_codec.put_int w t.pal_idx;
   State_codec.put_int w t.status0;
   State_codec.put_int w t.status1;
-  State_codec.put_int w t.line;
+  (* Legacy states encode an NTSC line directly. The PAL range stores the
+     current frame latch independently of the next frame's R#9 setting. *)
+  State_codec.put_int w (if t.pal then ntsc_lines + t.line else t.line);
   State_codec.put_int w t.cycle_in_line;
   State_codec.put_int w t.tx_dx;
   State_codec.put_int w t.tx_adx;
@@ -925,7 +1000,9 @@ let read_state r t =
   t.pal_idx <- State_codec.get_int r ~min:(0) ~max:15;
   t.status0 <- State_codec.get_int r ~min:(0) ~max:255;
   t.status1 <- State_codec.get_int r ~min:(0) ~max:255;
-  t.line <- State_codec.get_int r ~min:(0) ~max:261;
+  let saved_line = State_codec.get_int r ~min:0 ~max:(ntsc_lines + pal_lines - 1) in
+  t.pal <- saved_line >= ntsc_lines;
+  t.line <- if t.pal then saved_line - ntsc_lines else saved_line;
   t.cycle_in_line <- State_codec.get_int r ~min:(0) ~max:227;
   t.tx_dx <- State_codec.get_int r ~min:(0) ~max:511;
   (* ARG and mode can change during a transfer: permit every coordinate
