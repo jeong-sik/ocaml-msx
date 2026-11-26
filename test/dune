@@ -234,3 +234,8 @@
  (name text2_test)
  (modules text2_test)
  (libraries vdpcore))
+
+(test
+ (name z80_ldai_irq_test)
+ (modules z80_ldai_irq_test)
+ (libraries z80core))

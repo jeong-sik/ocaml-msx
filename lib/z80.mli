@@ -78,3 +78,7 @@ val dump_sp : t -> int
 val write_state : State_codec.writer -> t -> unit
 
 val read_state : State_codec.reader -> t -> unit
+
+(** The LD A,I/R interrupt window, appended to the v8 machine payload. *)
+val write_irq_window : State_codec.writer -> t -> unit
+val read_irq_window : State_codec.reader -> t -> unit
