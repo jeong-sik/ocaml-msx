@@ -169,6 +169,11 @@
  (libraries msx))
 
 (test
+ (name slot_rdslt_wrslt_test)
+ (modules slot_rdslt_wrslt_test)
+ (libraries msx))
+
+(test
  (name core_identity_test)
  (modules core_identity_test)
  (libraries core_digest msx_core_identity))
