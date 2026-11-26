@@ -29,6 +29,11 @@
  (libraries vdpcore))
 
 (test
+ (name vdp_sprite_mode2_test)
+ (modules vdp_sprite_mode2_test)
+ (libraries vdpcore))
+
+(test
  (name vdp_vertical_scroll_test)
  (modules vdp_vertical_scroll_test)
  (libraries vdpcore))
